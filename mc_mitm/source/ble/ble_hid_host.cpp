@@ -26,6 +26,7 @@
 #include "../mcmitm_initialization.hpp"
 #include "../bluetooth_mitm/bluetooth/bluetooth_ble.hpp"
 #include "../controllers/controller_management.hpp"
+#include "../controllers/stadia_ble_controller.hpp"
 #include "../controllers/xbox_one_ble_controller.hpp"
 
 namespace ams::ble {
@@ -87,16 +88,75 @@ namespace ams::ble {
             };
 
             State state = State::Vacant;
+            BleControllerType controller_type = BleControllerType::Unknown;
             u32 conn_id = InvalidConnId;
             u8 client_if = InvalidClientIf;
             u16 negotiated_max_interval = 0;
             bluetooth::Address address = {};
             gatt::HidService hid = {};
-            std::shared_ptr<controller::XboxOneBleController> controller = nullptr;
+            std::shared_ptr<controller::EmulatedSwitchController> controller = nullptr;
         };
 
         constinit os::SdkMutex g_slots_lock;
         BleDeviceSlot g_host_slots[MaxBleControllers];
+
+        struct RememberedControllerType {
+            bluetooth::Address address = {};
+            BleControllerType type = BleControllerType::Unknown;
+            bool valid = false;
+        };
+        constexpr size_t MaxRememberedTypes = 16;
+        constinit os::SdkMutex g_remembered_lock;
+        RememberedControllerType g_remembered_types[MaxRememberedTypes] = {};
+        size_t g_remembered_next = 0;
+
+        void RememberControllerType(const bluetooth::Address &address, BleControllerType type) {
+            if (type == BleControllerType::Unknown) {
+                return;
+            }
+            std::scoped_lock lk(g_remembered_lock);
+            for (auto &entry : g_remembered_types) {
+                if (entry.valid && AddressEqual(entry.address, address)) {
+                    entry.type = type;
+                    return;
+                }
+            }
+            g_remembered_types[g_remembered_next] = { address, type, true };
+            g_remembered_next = (g_remembered_next + 1) % MaxRememberedTypes;
+        }
+
+        BleControllerType RecallControllerType(const bluetooth::Address &address) {
+            std::scoped_lock lk(g_remembered_lock);
+            for (const auto &entry : g_remembered_types) {
+                if (entry.valid && AddressEqual(entry.address, address)) {
+                    return entry.type;
+                }
+            }
+            return BleControllerType::Unknown;
+        }
+
+        BleControllerType ResolveControllerType(const BleDeviceSlot &slot) {
+            if (slot.hid.has_pnp_id) {
+                if ((slot.hid.vendor_id == controller::stadia::VendorId) && (slot.hid.product_id == controller::stadia::ProductId)) {
+                    return BleControllerType::Stadia;
+                }
+                if (slot.hid.vendor_id == 0x045e) {
+                    return BleControllerType::XboxOne;
+                }
+            }
+            if (slot.controller_type != BleControllerType::Unknown) {
+                return slot.controller_type;
+            }
+            const auto recalled = RecallControllerType(slot.address);
+            if (recalled != BleControllerType::Unknown) {
+                return recalled;
+            }
+            if (slot.hid.device_name[0]) {
+                if (StartsWithIgnoreCase(slot.hid.device_name, "Stadia")) return BleControllerType::Stadia;
+                if (std::strncmp(slot.hid.device_name, "Xbox", 4) == 0) return BleControllerType::XboxOne;
+            }
+            return BleControllerType::XboxOne;
+        }
 
         size_t GetConnectedCount() {
             std::scoped_lock lk(g_slots_lock);
@@ -173,7 +233,7 @@ namespace ams::ble {
                     // Keep the controller alive until dispatch finishes, including during disconnect.
                     if (auto controller = events::GetActiveController(notify.conn_id)) {
                         const u64 start_tick = profile::RecordReportStart();
-                        static_cast<void>(controller->HandleInputReport(notify.data, std::min<size_t>(notify.size, sizeof(notify.data))));
+                        static_cast<void>(controller->HandleBleInputReport(notify.data, std::min<size_t>(notify.size, sizeof(notify.data))));
                         profile::RecordReportEnd(start_tick);
                     }
                 } else if (!((notify.op_type == GattNotifyType_WriteCharacteristic) && IsUuid16(notify.char_uuid, GattCharReport))) {
@@ -304,7 +364,7 @@ namespace ams::ble {
             R_SUCCEED();
         }
 
-        Result Scan(bluetooth::Address *out_address, TimeSpan duration) {
+        Result Scan(bluetooth::Address *out_address, BleControllerType *out_type, TimeSpan duration) {
             events::SetScanning(true);
             ON_SCOPE_EXIT { events::SetScanning(false); };
 
@@ -348,10 +408,11 @@ namespace ams::ble {
                 if (scan.status != BleScanStatus_NewDevice) return false;
                 ++advertisements;
                 const auto summary = ParseAdvertisements(scan.ad_list, scan.count);
+                BleControllerType candidate_type = BleControllerType::Unknown;
                 const char *decision = "candidate";
                 if (scan.result != 0) { ++failed; decision = "scan-error"; }
                 else if (!IsBleAdvertisement(summary, scan.device_type)) { ++rejected_transport; decision = "classic"; }
-                else if (!IsXboxCandidate(summary)) { ++rejected_identity; decision = "identity"; }
+                else if (!IsSupportedBleCandidate(summary, &candidate_type)) { ++rejected_identity; decision = "identity"; }
                 else if (IsAddressConnected(scan.address) || PairingBackoffActive(scan.address)) { ++unavailable; decision = "active-or-backoff"; }
                 const bool candidate = std::strcmp(decision, "candidate") == 0;
 
@@ -389,6 +450,15 @@ namespace ams::ble {
                 (e.info.scan_result.status == BleScanStatus_NewDevice), svc::ResultTimedOut());
 
             *out_address = e.info.scan_result.address;
+            if (out_type) {
+                const auto summary = ParseAdvertisements(e.info.scan_result.ad_list, e.info.scan_result.count);
+                *out_type = IdentifyCandidate(summary);
+                if (*out_type != BleControllerType::Unknown) {
+                    RememberControllerType(*out_address, *out_type);
+                } else {
+                    *out_type = RecallControllerType(*out_address);
+                }
+            }
             events::LogAddress("found controller", *out_address);
 
             if (log::IsEnabled()) {
@@ -437,8 +507,20 @@ namespace ams::ble {
                 log::Write("slot %u: no output Report characteristic, rumble unavailable", slot_index);
             }
 
-            auto controller = std::make_shared<controller::XboxOneBleController>(
-                slot.address, slot.conn_id, slot.hid.service.id, slot.hid.service.is_primary, slot.hid.output_report.id, slot.hid.has_output_report);
+            const BleControllerType controller_type = ResolveControllerType(slot);
+            slot.controller_type = controller_type;
+            RememberControllerType(slot.address, controller_type);
+
+            std::shared_ptr<controller::EmulatedSwitchController> controller;
+            if (controller_type == BleControllerType::Stadia) {
+                controller = std::make_shared<controller::StadiaBleController>(
+                    slot.address, slot.conn_id, slot.hid.service.id, slot.hid.service.is_primary,
+                    slot.hid.output_report.id, slot.hid.has_output_report, slot.hid.output_write_with_response);
+            } else {
+                controller = std::make_shared<controller::XboxOneBleController>(
+                    slot.address, slot.conn_id, slot.hid.service.id, slot.hid.service.is_primary,
+                    slot.hid.output_report.id, slot.hid.has_output_report);
+            }
 
             {
                 std::scoped_lock lk(g_slots_lock);
@@ -453,20 +535,26 @@ namespace ams::ble {
                 if (AddressEqual(failure.address, slot.address)) failure = {};
             }
 
-            u8 neutral[sizeof(controller::XboxOneInputReport0x01)] = { 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80 };
-            static_cast<void>(controller->HandleInputReport(neutral, sizeof(neutral)));
+            if (controller_type == BleControllerType::Stadia) {
+                const u8 neutral[sizeof(controller::stadia::StadiaInputReport0x03)] = { 0x08, 0x00, 0x00, 0x80, 0x80, 0x80, 0x80, 0x00, 0x00, 0x00 };
+                static_cast<void>(controller->HandleBleInputReport(neutral, sizeof(neutral)));
+            } else {
+                const u8 neutral[sizeof(controller::XboxOneInputReport0x01)] = { 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80 };
+                static_cast<void>(controller->HandleBleInputReport(neutral, sizeof(neutral)));
+            }
             events::RegisterSlotController(slot_index, slot.conn_id, controller);
 
             // Request low-latency parameters and rebalance active BLE slots
             slot.negotiated_max_interval = 0;
             RebalanceConnectionParameters();
 
-            log::Write("slot %u: controller presented to system (conn_id=%u, total active=%zu)", slot_index, slot.conn_id, GetConnectedCount());
+            log::Write("slot %u: %s controller presented to system (conn_id=%u, total active=%zu)",
+                slot_index, controller_type == BleControllerType::Stadia ? "Stadia" : "Xbox", slot.conn_id, GetConnectedCount());
         }
 
         void DismissSlot(u32 slot_index, bool close_transport) {
             events::WaitForSleepPreparation();
-            std::shared_ptr<controller::XboxOneBleController> controller;
+            std::shared_ptr<controller::EmulatedSwitchController> controller;
             bluetooth::Address address = {};
             u32 conn_id = InvalidConnId;
             bool already_disconnect_pending = false;
@@ -494,8 +582,8 @@ namespace ams::ble {
             }
 
             if (controller) {
-                // Ensure any in-flight HandleInputReport / HandleOutputDataReport on another core has finished
-                controller->Disconnect();
+                // Ensure any in-flight HandleBleInputReport / HandleOutputDataReport on another core has finished
+                controller->DisconnectBle();
             }
 
             // Cancel the client request and remove notification registrations before
@@ -597,23 +685,28 @@ namespace ams::ble {
             bluetooth::Address address;
             u32 conn_id = InvalidConnId;
             u32 session_generation = events::GetClientRegistrationGeneration();
+            BleControllerType scanned_type = BleControllerType::Unknown;
             bool connected = Adopt(&address, &conn_id);
 
-            if (!connected) {
+            if (connected) {
+                scanned_type = RecallControllerType(address);
+            } else {
                 const bool another_controller_connected = (events::GetActiveConnectionCount() > 0) || (controller::GetConnectedControllerCount() > 0);
                 const TimeSpan scan_duration = TimeSpan::FromSeconds(another_controller_connected ? 2 : 5);
-                Result rc = Scan(&address, scan_duration);
+                Result rc = Scan(&address, &scanned_type, scan_duration);
                 if (events::ConsumeControllerCountChanged()) {
                     RebalanceConnectionParameters();
                 }
                 if (Adopt(&address, &conn_id)) {
                     connected = true;
+                    scanned_type = RecallControllerType(address);
                 } else if (R_SUCCEEDED(rc)) {
                     if (IsAddressConnected(address, slot)) {
                         return;
                     }
                     slot = FindSlotForAddress(address, slot);
                     g_host_slots[slot].state = BleDeviceSlot::State::Connecting;
+                    g_host_slots[slot].controller_type = scanned_type;
                     g_host_slots[slot].address = address;
                     const u8 client_if = events::GetClientIfForSlot(slot);
                     g_host_slots[slot].client_if = client_if;
@@ -640,6 +733,7 @@ namespace ams::ble {
 
             if (g_host_slots[slot].state == BleDeviceSlot::State::Vacant) slot = FindSlotForAddress(address, slot);
             g_host_slots[slot].conn_id = conn_id;
+            g_host_slots[slot].controller_type = scanned_type;
             g_host_slots[slot].address = address;
             g_host_slots[slot].state = BleDeviceSlot::State::Discovering;
             if (!events::IsAddressActive(address)) {

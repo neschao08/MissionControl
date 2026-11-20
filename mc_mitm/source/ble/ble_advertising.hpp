@@ -72,6 +72,41 @@ namespace ams::ble {
         return device_type != 0 || (summary.flags & 0x04);
     }
 
+    enum class BleControllerType : u8 {
+        Unknown = 0,
+        XboxOne,
+        Stadia,
+    };
+
+    inline bool StartsWithIgnoreCase(const char *str, const char *prefix) {
+        while (*prefix) {
+            unsigned char a = static_cast<unsigned char>(*str++);
+            unsigned char b = static_cast<unsigned char>(*prefix++);
+            if (a >= 'A' && a <= 'Z') a = static_cast<unsigned char>(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z') b = static_cast<unsigned char>(b - 'A' + 'a');
+            if (a != b) return false;
+        }
+        return true;
+    }
+
+    inline BleControllerType IdentifyCandidate(const AdvertisementSummary &summary) {
+        if (summary.name[0]) {
+            if (StartsWithIgnoreCase(summary.name, "Stadia")) return BleControllerType::Stadia;
+            if (std::strncmp(summary.name, "Xbox", 4) == 0) return BleControllerType::XboxOne;
+        }
+        return BleControllerType::Unknown;
+    }
+
+    inline bool IsSupportedBleCandidate(const AdvertisementSummary &summary, BleControllerType *out_type = nullptr) {
+        const auto type = IdentifyCandidate(summary);
+        if (out_type) *out_type = type;
+        if (type != BleControllerType::Unknown) return true;
+
+        // Xbox (and some BLE gamepads) can put their name in a separate scan response.
+        // Preserve the appearance fallback when no name is present; DIS PnP ID / GAP name resolves the vendor later.
+        return !summary.name[0] && summary.has_appearance && summary.appearance == 0x03c4;
+    }
+
     inline bool IsXboxCandidate(const AdvertisementSummary &summary) {
         if (summary.name[0]) return std::strncmp(summary.name, "Xbox", 4) == 0;
 

@@ -41,6 +41,8 @@ namespace ams::controller {
 
             virtual Result HandleOutputDataReport(const u8 *report_buffer, size_t size) override;
             virtual Result InjectInputReport(const u8 *report_buffer, size_t size);
+            virtual Result HandleBleInputReport(const u8 *data, size_t size) { AMS_UNUSED(data, size); R_THROW(sf::ResultNotSupported()); }
+            virtual void DisconnectBle() { }
 
         protected:
             void Reset();

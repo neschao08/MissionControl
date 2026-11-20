@@ -24,7 +24,7 @@ namespace ams::ble::gatt {
      * per slot across connections and only replaced when the stack reports a fresh discovery.
      */
 
-    constexpr size_t MaxAttributes = 64;
+    constexpr size_t MaxAttributes = 128;
 
     struct AttributeTable {
         bluetooth::Address address;
@@ -37,6 +37,11 @@ namespace ams::ble::gatt {
         BtdrvGattAttribute service;
         BtdrvGattAttribute output_report;
         bool has_output_report;
+        bool output_write_with_response;
+        u16 vendor_id;
+        u16 product_id;
+        bool has_pnp_id;
+        char device_name[0x20];
     };
 
     // Event sink, see events::SetSink

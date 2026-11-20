@@ -18,7 +18,7 @@
 #include <atomic>
 
 namespace ams::controller {
-    class XboxOneBleController;
+    class EmulatedSwitchController;
 }
 
 namespace ams::ble::events {
@@ -61,9 +61,9 @@ namespace ams::ble::events {
     bool TakeSlotBondComplete(u32 slot);
 
     /* Bounded four-slot lookup; the returned reference protects in-flight dispatch during teardown. */
-    void RegisterSlotController(u32 slot, u32 conn_id, std::shared_ptr<controller::XboxOneBleController> ctrl);
+    void RegisterSlotController(u32 slot, u32 conn_id, std::shared_ptr<controller::EmulatedSwitchController> ctrl);
     void UnregisterSlotController(u32 slot);
-    std::shared_ptr<controller::XboxOneBleController> GetActiveController(u32 conn_id);
+    std::shared_ptr<controller::EmulatedSwitchController> GetActiveController(u32 conn_id);
 
     u16 GetTargetMaxConnectionInterval(size_t active_count);
     u16 RequestLowLatencyConnectionParameters(const bluetooth::Address &address, size_t active_count = 0);

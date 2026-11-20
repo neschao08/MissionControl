@@ -33,7 +33,11 @@ namespace ams::ble {
     constexpr u8 GattNotifyType_WriteCharacteristic = BtdrvGattOperationType_CharacteristicWrite;
     constexpr u8 GattNotifyType_Notification        = BtdrvGattOperationType_Notification;
 
-    /* Bluetooth SIG assigned numbers for HID over GATT (HOGP) */
+    /* Bluetooth SIG assigned numbers for HID over GATT (HOGP), DIS & GAP */
+    constexpr u16 GattServiceGap           = 0x1800;
+    constexpr u16 GattCharDeviceName       = 0x2A00;
+    constexpr u16 GattServiceDeviceInfo    = 0x180A;
+    constexpr u16 GattCharPnpId            = 0x2A50;
     constexpr u16 GattServiceHid           = 0x1812;
     constexpr u16 GattCharHidInformation   = 0x2A4A;
     constexpr u16 GattCharReportMap        = 0x2A4B;

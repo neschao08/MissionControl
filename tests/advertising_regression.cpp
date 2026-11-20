@@ -70,5 +70,38 @@ int main() {
             (void)ParseAdvertisements(ads, 255);
         }
     }
+    // Stadia controller advertisements (captured StadiaQPRV-4967)
+    ads[0] = Name("StadiaQPRV-4967");
+    summary = ParseAdvertisements(ads, 1);
+    BleControllerType detected = BleControllerType::Unknown;
+    assert(IsSupportedBleCandidate(summary, &detected));
+    assert(detected == BleControllerType::Stadia);
+    assert(!IsXboxCandidate(summary));
+
+    ads[0] = Name("stadia-1234");
+    summary = ParseAdvertisements(ads, 1);
+    assert(IsSupportedBleCandidate(summary, &detected));
+    assert(detected == BleControllerType::Stadia);
+
+    ads[0] = Name("Xbox Wireless Controller");
+    summary = ParseAdvertisements(ads, 1);
+    assert(IsSupportedBleCandidate(summary, &detected));
+    assert(detected == BleControllerType::XboxOne);
+
+    // Nameless gamepad falls back to appearance 0x03c4 and leaves vendor resolution to GATT DIS/GAP
+    BtdrvBleAdvertisement nameless[2] = {
+        {1, BtdrvAdType_Flags, {0x06}},
+        {2, BtdrvAdType_Appearance, {0xc4, 0x03}},
+    };
+    summary = ParseAdvertisements(nameless, 2);
+    assert(IsSupportedBleCandidate(summary, &detected));
+    assert(detected == BleControllerType::Unknown);
+
+    // Non-Xbox/Stadia named controllers must be rejected
+    ads[0] = Name("Pro Controller");
+    summary = ParseAdvertisements(ads, 1);
+    assert(!IsSupportedBleCandidate(summary, &detected));
+    assert(detected == BleControllerType::Unknown);
+
     std::cout << "BLE advertisement selection regressions passed\n";
 }

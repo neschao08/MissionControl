@@ -38,9 +38,11 @@ namespace ams::controller {
 
             // Payload of a notification from the HID input Report characteristic
             Result HandleInputReport(const u8 *data, size_t size);
+            Result HandleBleInputReport(const u8 *data, size_t size) override { R_RETURN(this->HandleInputReport(data, size)); }
             Result HandleOutputDataReport(const u8 *report_buffer, size_t size) override;
 
             void Disconnect();
+            void DisconnectBle() override { this->Disconnect(); }
 
         protected:
             void ParseInputReport(const u8 *report_buffer, size_t size) override;

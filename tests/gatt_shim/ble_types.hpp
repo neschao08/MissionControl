@@ -45,6 +45,8 @@ constexpr int BtdrvBleEventType_ClientNotify = 3;
 namespace ams::bluetooth { struct Address { u8 data[6]; }; }
 namespace ams::ble {
 constexpr u32 MaxBleControllers = 4, InvalidSlot = UINT32_MAX, InvalidConnId = UINT32_MAX;
+constexpr u16 GattServiceGap = 0x1800, GattCharDeviceName = 0x2a00;
+constexpr u16 GattServiceDeviceInfo = 0x180a, GattCharPnpId = 0x2a50;
 constexpr u16 GattServiceHid = 0x1812, GattCharReport = 0x2a4d, GattCharHidInformation = 0x2a4a, GattCharReportMap = 0x2a4b, GattDescClientCharConfig = 0x2902;
 inline bool IsUuid16(BtdrvGattAttributeUuid uuid, u16 value) { return uuid.value == value; }
 inline bool AddressEqual(const bluetooth::Address &a, const bluetooth::Address &b) { return std::memcmp(&a, &b, sizeof(a)) == 0; }
@@ -53,7 +55,7 @@ struct EventRecord {
     struct {
         struct { u32 result = 0, conn_id = 0, count = 0; BtdrvGattAttribute attr_list[10]; } client_cache_save;
         struct { u32 result = 0, conn_id = 0; u16 mtu = 0; } client_configure_mtu;
-        struct { u32 result = 0, conn_id = 0; u8 op_type = 0; BtdrvGattAttributeUuid char_uuid = {}; } client_notify;
+        struct { u32 result = 0, conn_id = 0; u8 op_type = 0; BtdrvGattAttributeUuid char_uuid = {}; u16 size = 0; u8 data[0x200] = {}; } client_notify;
     } info;
 };
 }

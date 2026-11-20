@@ -19,7 +19,7 @@
 #include "ble_controller_routes.hpp"
 #include "../mcmitm_config.hpp"
 #include "../controllers/controller_management.hpp"
-#include "../controllers/xbox_one_ble_controller.hpp"
+#include "../controllers/emulated_switch_controller.hpp"
 #include <atomic>
 
 namespace ams::ble::events {
@@ -33,7 +33,7 @@ namespace ams::ble::events {
         // a CreateBond that succeeded, and at once when pairing failed and the stack drops the link.
         constexpr u32 CoreConnectionType_Suspended = 3;
 
-        ControllerRoutes<controller::XboxOneBleController, os::SdkMutex, MaxBleControllers> g_routes;
+        ControllerRoutes<controller::EmulatedSwitchController, os::SdkMutex, MaxBleControllers> g_routes;
 
         constexpr size_t RingSize = 64;
         constinit EventRecord g_ring[RingSize];
@@ -270,7 +270,7 @@ namespace ams::ble::events {
         return complete;
     }
 
-    void RegisterSlotController(u32 slot, u32 conn_id, std::shared_ptr<controller::XboxOneBleController> ctrl) {
+    void RegisterSlotController(u32 slot, u32 conn_id, std::shared_ptr<controller::EmulatedSwitchController> ctrl) {
         if (slot < MaxBleControllers) g_routes.Register(slot, conn_id, std::move(ctrl));
     }
 
@@ -278,7 +278,7 @@ namespace ams::ble::events {
         if (slot < MaxBleControllers) g_routes.Unregister(slot);
     }
 
-    std::shared_ptr<controller::XboxOneBleController> GetActiveController(u32 conn_id) {
+    std::shared_ptr<controller::EmulatedSwitchController> GetActiveController(u32 conn_id) {
         return g_routes.Find(conn_id);
     }
 

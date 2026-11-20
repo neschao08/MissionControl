@@ -1,6 +1,7 @@
 // Compile the production GATT implementation unchanged against a timed IPC shim.
 #include "ble_gatt.cpp"
 #include <cassert>
+#include <cstring>
 #include <iostream>
 #include <vector>
 using namespace ams::ble;
@@ -21,12 +22,27 @@ static unsigned notification_registrations;
 static bool cccd_completed;
 static u32 cccd_failure;
 
+static std::vector<u8> pnp_id_payload;
+static std::vector<u8> device_name_payload;
+static bool fail_pnp_read = false;
+
 static void Complete(u32 conn_id, u8 operation, BtdrvGattAttributeUuid uuid) {
     if (events::disconnect_on_wait) events::Schedule(EventRecord{events::Disconnect, {}}, 1);
     if (events::sleep_on_wait) events::Schedule(EventRecord{events::RadioOff, {}}, 1);
     EventRecord event{};
     event.type = BtdrvBleEventType_ClientNotify;
     event.info.client_notify = {events::failure, conn_id, operation, uuid};
+    if (operation == BtdrvGattOperationType_CharacteristicRead && uuid.value == GattCharPnpId && !pnp_id_payload.empty()) {
+        if (fail_pnp_read) {
+            event.info.client_notify.result = 9;
+        } else {
+            event.info.client_notify.size = static_cast<u16>(pnp_id_payload.size());
+            std::memcpy(event.info.client_notify.data, pnp_id_payload.data(), pnp_id_payload.size());
+        }
+    } else if (operation == BtdrvGattOperationType_CharacteristicRead && uuid.value == GattCharDeviceName && !device_name_payload.empty()) {
+        event.info.client_notify.size = static_cast<u16>(device_name_payload.size());
+        std::memcpy(event.info.client_notify.data, device_name_payload.data(), device_name_payload.size());
+    }
     const bool cccd = operation == BtdrvGattOperationType_DescriptorWrite;
     if (cccd) event.info.client_notify.result = cccd_failure;
     if (events::completed && (!cccd || cccd_completed)) events::Schedule(event, completion_delay);
@@ -127,6 +143,9 @@ static void Reset(DiscoveryMode next = DiscoveryMode::AfterSettling) {
     query_times.clear();
     read_uuids.clear();
     mtu_connections.clear();
+    pnp_id_payload.clear();
+    device_name_payload.clear();
+    fail_pnp_read = false;
 }
 
 static void AssertSubscribed(u32 slot, u32 conn_id) {
@@ -289,6 +308,48 @@ int main() {
     cccd_completed = true;
     cccd_failure = 26;
     assert(gatt::Subscribe(0, 260, &hid).value == 8);
+
+    // Stadia DIS PnP ID + output WriteWithResponse selection + >64 attribute capacity
+    Reset(DiscoveryMode::Never);
+    pnp_id_payload = {0x02, 0xD1, 0x18, 0x00, 0x94, 0x00, 0x01};
+    {
+        auto &tbl = gatt::g_slots[0].table;
+        tbl.address = a;
+        u16 h = 1;
+        // Pad GAP + DIS near handle 80 (>64 old limit) to verify MaxAttributes = 128
+        tbl.attributes[tbl.count++] = {BtdrvGattAttributeType_Service, h++, 10, 0, true, {{GattServiceGap}}};
+        tbl.attributes[tbl.count++] = {BtdrvGattAttributeType_Characteristic, h++, 0, 0, true, {{GattCharDeviceName}}};
+        for (int i = 0; i < 65; ++i) {
+            tbl.attributes[tbl.count++] = {BtdrvGattAttributeType_Characteristic, h++, 0, 0, true, {{0x2A99}}};
+        }
+        const u16 dis_start = h++;
+        tbl.attributes[tbl.count++] = {BtdrvGattAttributeType_Service, dis_start, static_cast<u16>(dis_start + 1), 0, true, {{GattServiceDeviceInfo}}};
+        tbl.attributes[tbl.count++] = {BtdrvGattAttributeType_Characteristic, static_cast<u16>(dis_start + 1), 0, 0, true, {{GattCharPnpId}}};
+        const u16 hid_start = static_cast<u16>(dis_start + 2);
+        tbl.attributes[tbl.count++] = {BtdrvGattAttributeType_Service, hid_start, static_cast<u16>(hid_start + 10), 0, true, {{GattServiceHid}}};
+        tbl.attributes[tbl.count++] = {BtdrvGattAttributeType_Characteristic, static_cast<u16>(hid_start + 1), 0, 0, true, {{GattCharHidInformation}}};
+        tbl.attributes[tbl.count++] = {BtdrvGattAttributeType_Characteristic, static_cast<u16>(hid_start + 2), 0, 0, true, {{GattCharReportMap}}};
+        // Input report with Notify + Write (less preferred for output) followed by dedicated Write-only output report
+        tbl.attributes[tbl.count++] = {BtdrvGattAttributeType_Characteristic, static_cast<u16>(hid_start + 3), 0, BtdrvGattCharacteristicProperty_Notify | BtdrvGattCharacteristicProperty_Write, true, {{GattCharReport}}};
+        tbl.attributes[tbl.count++] = {BtdrvGattAttributeType_Descriptor, static_cast<u16>(hid_start + 4), 0, 0, true, {{GattDescClientCharConfig}}};
+        const u16 out_handle = static_cast<u16>(hid_start + 5);
+        tbl.attributes[tbl.count++] = {BtdrvGattAttributeType_Characteristic, out_handle, 0, BtdrvGattCharacteristicProperty_Write, true, {{GattCharReport}}};
+
+        gatt::HidService stadia_hid{};
+        assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &stadia_hid)));
+        assert(stadia_hid.has_pnp_id && stadia_hid.vendor_id == 0x18D1 && stadia_hid.product_id == 0x9400);
+        assert(stadia_hid.has_output_report && stadia_hid.output_report.handle == out_handle);
+        assert(stadia_hid.output_write_with_response == true);
+
+        // Best-effort PnP ID failure falls back to GAP Device Name without failing Subscribe
+        fail_pnp_read = true;
+        const char name[] = "StadiaQPRV-4967";
+        device_name_payload.assign(name, name + sizeof(name) - 1);
+        gatt::HidService fallback_hid{};
+        assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &fallback_hid)));
+        assert(!fallback_hid.has_pnp_id);
+        assert(std::strcmp(fallback_hid.device_name, "StadiaQPRV-4967") == 0);
+    }
 
     std::cout << "GATT discovery/authentication/completion isolation/cache/cancellation regressions passed\n";
 }

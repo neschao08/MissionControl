@@ -13,6 +13,7 @@
 !/tests/sleep_shim/
 !/tests/pairing_regression.cpp
 !/tests/pairing_shim/
+!/tests/stadia_regression.cpp
 dist/
 mc_mitm/build/
 mc_mitm/out/

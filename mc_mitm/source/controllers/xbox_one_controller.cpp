@@ -15,11 +15,21 @@
  */
 #include "xbox_one_controller.hpp"
 #include <stratosphere.hpp>
+#include <algorithm>
+#include "xbox_stick.hpp"
 
 namespace ams::controller {
 
+    Result XboxOneController::Initialize() {
+        // Settings apply to both Classic and BLE Xbox controllers, with optional
+        // per-address overrides so one worn stick need not affect every player.
+        m_stick_config = mitm::GetGlobalConfig()->xbox;
+        mitm::LoadXboxConfiguration((GetControllerDirectory(m_address) + "/config.ini").c_str(), &m_stick_config);
+        R_RETURN(EmulatedSwitchController::Initialize());
+    }
+
     Result XboxOneController::SetVibration(const SwitchMotorData *motor_data) {
-        XboxOneReportData report;
+        XboxOneReportData report = {};
         report.id = 0x03;
         report.output0x03.enable             = 0x3;
         report.output0x03.magnitude_strong   = static_cast<u8>(100 * std::max(motor_data->left_motor.low_band_amp, motor_data->right_motor.low_band_amp));
@@ -32,10 +42,12 @@ namespace ams::controller {
     }
 
     void XboxOneController::ParseInputReport(const u8 *report_buffer, size_t size) {
+        if (size < 2) return;
         auto report = reinterpret_cast<const XboxOneReportData *>(report_buffer);
 
         switch(report->id) {
             case 0x01:
+                if (size < 1 + sizeof(XboxOneInputReport0x01) - 1) return;
                 this->MapInputReport0x01(report, size >= sizeof(XboxOneInputReport0x01) + 1); break;
             case 0x02:
                 this->MapInputReport0x02(report); break;
@@ -51,15 +63,20 @@ namespace ams::controller {
         auto left_trigger  = AnalogTrigger(src->input0x01.left_trigger);
         auto right_trigger = AnalogTrigger(src->input0x01.right_trigger);
 
-        m_left_stick.SetValuesFrom(
+        const auto [lx, ly] = xbox::ApplyRadialDeadzone(
             src->input0x01.left_stick.GetX(),
-            src->input0x01.left_stick.GetYInverted()
+            src->input0x01.left_stick.GetYInverted(),
+            m_stick_config.left_stick_deadzone
         );
 
-        m_right_stick.SetValuesFrom(
+        const auto [rx, ry] = xbox::ApplyRadialDeadzone(
             src->input0x01.right_stick.GetX(),
-            src->input0x01.right_stick.GetYInverted()
+            src->input0x01.right_stick.GetYInverted(),
+            m_stick_config.right_stick_deadzone
         );
+
+        m_left_stick.SetValuesFrom(lx, ly);
+        m_right_stick.SetValuesFrom(rx, ry);
 
         SwitchButtons button_state = m_buttons;
         button_state.Assign(SwitchButton::ZR,     right_trigger.GetNormalizedValue() > m_trigger_threshold);

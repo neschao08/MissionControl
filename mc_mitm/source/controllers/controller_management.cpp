@@ -16,6 +16,8 @@
 #include "controller_management.hpp"
 #include <stratosphere.hpp>
 #include "../utils.hpp"
+#include "../btm_mitm/btm_device_condition.hpp"
+#include "../ble/ble_events.hpp"
 
 namespace ams::controller {
 
@@ -42,6 +44,7 @@ namespace ams::controller {
 
         constinit os::SdkMutex g_controller_lock;
         std::vector<std::shared_ptr<SwitchController>> g_controllers;
+        std::vector<bluetooth::Address> g_virtual_devices;
 
     }
 
@@ -334,6 +337,8 @@ namespace ams::controller {
             // Try to disconnect the controller
             btdrvCloseHidConnection(controller->Address());
         }
+
+        ble::events::NotifyControllerCountChanged();
     }
 
     void RemoveHandler(bluetooth::Address address) {
@@ -342,6 +347,7 @@ namespace ams::controller {
         for (auto it = g_controllers.begin(); it < g_controllers.end(); ++it) {
             if (utils::BluetoothAddressCompare((*it)->Address(), address)) {
                 g_controllers.erase(it);
+                ble::events::NotifyControllerCountChanged();
                 return;
             }
         }
@@ -357,6 +363,66 @@ namespace ams::controller {
         }
 
         return nullptr;
+    }
+
+    void AttachVirtualController(std::shared_ptr<SwitchController> controller) {
+        // Finish settings/storage initialization before either HID output lookups
+        // or device-list polling can expose the controller to another thread.
+        // Storage failure still permits using the controller with defaults.
+        static_cast<void>(controller->Initialize());
+
+        {
+            std::scoped_lock lk(g_controller_lock);
+            for (auto it = g_controllers.begin(); it < g_controllers.end(); ++it) {
+                if (utils::BluetoothAddressCompare((*it)->Address(), controller->Address())) {
+                    g_controllers.erase(it);
+                    break;
+                }
+            }
+            for (auto it = g_virtual_devices.begin(); it < g_virtual_devices.end(); ++it) {
+                if (utils::BluetoothAddressCompare(*it, controller->Address())) {
+                    g_virtual_devices.erase(it);
+                    break;
+                }
+            }
+            g_controllers.push_back(controller);
+            g_virtual_devices.push_back(controller->Address());
+        }
+
+        // Let hid know there is a new device to pick up
+        mitm::btm::condition::Signal();
+    }
+
+    void DetachVirtualController(bluetooth::Address address) {
+        RemoveHandler(address);
+
+        {
+            std::scoped_lock lk(g_controller_lock);
+            for (auto it = g_virtual_devices.begin(); it < g_virtual_devices.end(); ++it) {
+                if (utils::BluetoothAddressCompare(*it, address)) {
+                    g_virtual_devices.erase(it);
+                    break;
+                }
+            }
+        }
+
+        mitm::btm::condition::Signal();
+    }
+
+    size_t GetVirtualDevices(bluetooth::Address *out, size_t max) {
+        std::scoped_lock lk(g_controller_lock);
+
+        size_t count = std::min(max, g_virtual_devices.size());
+        for (size_t i = 0; i < count; ++i) {
+            out[i] = g_virtual_devices[i];
+        }
+
+        return count;
+    }
+
+    size_t GetConnectedControllerCount() {
+        std::scoped_lock lk(g_controller_lock);
+        return g_controllers.size();
     }
 
 }

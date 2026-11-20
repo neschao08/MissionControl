@@ -1,7 +1,18 @@
 .assets/
 .vscode/
 .patches/
-tests/
+/tests/*
+!/tests/Makefile
+!/tests/ble_regression.cpp
+!/tests/advertising_regression.cpp
+!/tests/gatt_regression.cpp
+!/tests/gatt_shim/
+!/tests/profile_regression.cpp
+!/tests/profile_shim/
+!/tests/sleep_regression.cpp
+!/tests/sleep_shim/
+!/tests/pairing_regression.cpp
+!/tests/pairing_shim/
 dist/
 mc_mitm/build/
 mc_mitm/out/
@@ -19,3 +30,4 @@ mc_mitm/out/
 *.til
 *.orig
 mc_mitm/source/mcmitm_version.cpp
+build_libnx/

@@ -38,6 +38,14 @@ jobs:
             apt-get update && apt-get install -y zip
           fi
 
+      - name: Cache libnx and libstratosphere build outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            build_libnx
+            lib/Atmosphere-libs/libstratosphere/lib
+          key: ${{ runner.os }}-switch-libs-${{ hashFiles('lib/libnx/**', 'lib/Atmosphere-libs/**') }}
+
       - name: Build MissionControl dist package
         run: |
           source /etc/profile.d/devkit-env.sh 2>/dev/null || true

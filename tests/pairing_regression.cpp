@@ -126,5 +126,26 @@ int main() {
     Reset(); events::Schedule(events::Sleep, 200); assert(!pairing::PrepareSecurity(0, Target));
     Reset(); events::disconnected = true; assert(!pairing::PrepareSecurity(0, Target)); assert(bonds == 0);
     Reset(); events::radio = false; assert(!pairing::PrepareSecurity(0, Target)); assert(bonds == 0);
+
+    // Stadia-style early core connection indication (< 50ms): wait for 1500ms SMP settle on live link
+    Reset(); new_bond = false;
+    events::Schedule(events::Bond, 3);
+    assert(pairing::PrepareSecurity(0, Target));
+    assert(bonds == 1 && events::now_ms == 1503);
+
+    // Early indication followed by a second core connection indication: finish 500ms after the second
+    Reset(); new_bond = false;
+    events::Schedule(events::Bond, 3);
+    events::Schedule(events::Bond, 300);
+    assert(pairing::PrepareSecurity(0, Target));
+    assert(bonds == 1 && events::now_ms == 800);
+
+    // Disconnect during early bond settle fails promptly
+    Reset(); new_bond = false;
+    events::Schedule(events::Bond, 3);
+    events::Schedule(BtdrvBleEventType_ClientConnection, 200, refused);
+    assert(!pairing::PrepareSecurity(0, Target));
+    assert(bonds == 1 && events::now_ms == 200);
+
     std::cout << "BLE production reconnect/pairing regressions passed\n";
 }

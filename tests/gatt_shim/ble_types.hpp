@@ -39,6 +39,7 @@ constexpr int BtdrvGattCharacteristicProperty_WriteNoResponse = 4;
 constexpr int BtdrvGattAuthReqType_NoMitm = 1;
 constexpr int BtdrvGattOperationType_CharacteristicRead = 0;
 constexpr int BtdrvGattOperationType_DescriptorWrite = 3;
+constexpr int BtdrvGattOperationType_Notification = 4;
 constexpr int BtdrvBleEventType_ClientCacheSave = 1;
 constexpr int BtdrvBleEventType_ClientConfigureMtu = 2;
 constexpr int BtdrvBleEventType_ClientNotify = 3;
@@ -55,7 +56,7 @@ struct EventRecord {
     struct {
         struct { u32 result = 0, conn_id = 0, count = 0; BtdrvGattAttribute attr_list[10]; } client_cache_save;
         struct { u32 result = 0, conn_id = 0; u16 mtu = 0; } client_configure_mtu;
-        struct { u32 result = 0, conn_id = 0; u8 op_type = 0; BtdrvGattAttributeUuid char_uuid = {}; u16 size = 0; u8 data[0x200] = {}; } client_notify;
+        struct { u32 result = 0, conn_id = 0; u8 op_type = 0; BtdrvGattAttributeUuid char_uuid = {}; BtdrvGattAttributeUuid desc_uuid = {}; u16 size = 0; u8 data[0x200] = {}; } client_notify;
     } info;
 };
 }

@@ -240,6 +240,8 @@ namespace ams::ble {
                         const u64 start_tick = profile::RecordReportStart();
                         static_cast<void>(controller->HandleBleInputReport(notify.data, std::min<size_t>(notify.size, sizeof(notify.data))));
                         profile::RecordReportEnd(start_tick);
+                    } else {
+                        events::PushRecord(g_le_hid_record);
                     }
                 } else if (!((notify.op_type == GattNotifyType_WriteCharacteristic) && IsUuid16(notify.char_uuid, GattCharReport))) {
                     events::NoteGattResult(notify.conn_id, notify.op_type, notify.char_uuid, notify.result);

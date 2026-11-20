@@ -20,6 +20,8 @@ static u64 completion_delay;
 static int auth_refusals;
 static unsigned notification_registrations;
 static bool cccd_completed;
+static bool cccd_use_desc_uuid;
+static bool cccd_complete_via_notification;
 static u32 cccd_failure;
 
 static std::vector<u8> pnp_id_payload;
@@ -44,14 +46,30 @@ static void Complete(u32 conn_id, u8 operation, BtdrvGattAttributeUuid uuid) {
         std::memcpy(event.info.client_notify.data, device_name_payload.data(), device_name_payload.size());
     }
     const bool cccd = operation == BtdrvGattOperationType_DescriptorWrite;
-    if (cccd) event.info.client_notify.result = cccd_failure;
+    if (cccd) {
+        event.info.client_notify.result = cccd_failure;
+        if (cccd_use_desc_uuid) {
+            event.info.client_notify.char_uuid = {};
+            event.info.client_notify.desc_uuid = {GattDescClientCharConfig};
+        } else if (cccd_complete_via_notification) {
+            event.info.client_notify.op_type = BtdrvGattOperationType_Notification;
+            event.info.client_notify.char_uuid = {GattCharReport};
+        }
+    }
     if (events::completed && (!cccd || cccd_completed)) events::Schedule(event, completion_delay);
     if (unrelated_completions) {
         auto noise = event;
         noise.info.client_notify.result = 0;
+        noise.info.client_notify.desc_uuid = {};
         ++noise.info.client_notify.conn_id; events::Schedule(noise, 1);
-        noise = event; ++noise.info.client_notify.op_type; events::Schedule(noise, 2);
-        noise = event; ++noise.info.client_notify.char_uuid.value; events::Schedule(noise, 3);
+        noise = event;
+        noise.info.client_notify.desc_uuid = {};
+        noise.info.client_notify.op_type = (operation == BtdrvGattOperationType_DescriptorWrite) ? 1 : static_cast<u8>(operation + 1);
+        events::Schedule(noise, 2);
+        noise = event;
+        noise.info.client_notify.desc_uuid = {};
+        ++noise.info.client_notify.char_uuid.value;
+        events::Schedule(noise, 3);
     }
 }
 
@@ -139,6 +157,8 @@ static void Reset(DiscoveryMode next = DiscoveryMode::AfterSettling) {
     completion_delay = 20;
     auth_refusals = 0;
     cccd_completed = true;
+    cccd_use_desc_uuid = false;
+    cccd_complete_via_notification = false;
     cccd_failure = 0;
     query_times.clear();
     read_uuids.clear();
@@ -152,9 +172,9 @@ static void AssertSubscribed(u32 slot, u32 conn_id) {
     gatt::HidService hid{};
     assert(R_SUCCEEDED(gatt::Subscribe(slot, conn_id, &hid)));
     assert(hid.has_output_report && hid.output_report.handle == 4);
-    assert(read_uuids.size() >= 2);
-    assert(read_uuids[read_uuids.size() - 2] == GattCharHidInformation);
-    assert(read_uuids.back() == GattCharReportMap);
+    assert(!read_uuids.empty());
+    assert(std::find(read_uuids.begin(), read_uuids.end(), GattCharHidInformation) != read_uuids.end());
+    assert(std::find(read_uuids.begin(), read_uuids.end(), GattCharReportMap) == read_uuids.end());
 }
 
 int main() {
@@ -201,7 +221,7 @@ int main() {
         if (!timeout) mtu_result = {7};
         assert(R_SUCCEEDED(gatt::Discover(0, 260, a)));
         AssertSubscribed(0, 260);
-        assert(events::now_ms == (timeout ? 7560u : 2560u));
+        assert(events::now_ms == (timeout ? 7540u : 2540u));
     }
 
     // A different controller's MTU response must not finish this setup wait.
@@ -264,7 +284,7 @@ int main() {
     assert(gatt::Subscribe(1, 774, &hid).value == 7);
     register_result = {0};
     events::completed = false;
-    assert(gatt::Subscribe(1, 774, &hid).value == 2);
+    assert(R_SUCCEEDED(gatt::Subscribe(1, 774, &hid))); // live link proceeds when HID Info/CCCD completions time out
     events::completed = true;
     events::disconnected = true;
     assert(gatt::Subscribe(1, 774, &hid).value == 4);
@@ -278,15 +298,15 @@ int main() {
 
     // Reconnect security can take a full pairing exchange. Noise from the two
     // active pads, a different operation, or a different characteristic cannot
-    // finish our authenticated read. The CCCD must finish too.
+    // finish our authenticated read. The CCCD waits up to 2s on a live link.
     Reset(); assert(R_SUCCEEDED(gatt::Discover(0, 260, a)));
     unrelated_completions = true;
     completion_delay = 1500;
     const auto started = events::now_ms;
     AssertSubscribed(0, 260);
-    assert(events::now_ms == started + 4500);
+    assert(events::now_ms == started + 3000);
     events::completed = false;
-    assert(gatt::Subscribe(0, 260, &hid).value == 2);
+    assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &hid)));
     events::completed = true;
     events::failure = 26;
     assert(gatt::Subscribe(0, 260, &hid).value == 8);
@@ -304,10 +324,20 @@ int main() {
     Reset(); assert(R_SUCCEEDED(gatt::Discover(0, 260, a)));
     unrelated_completions = true;
     cccd_completed = false;
-    assert(gatt::Subscribe(0, 260, &hid).value == 2); // reads alone cannot present a controller
+    assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &hid))); // unrelated noise alone times out CCCD cleanly on live link
     cccd_completed = true;
     cccd_failure = 26;
     assert(gatt::Subscribe(0, 260, &hid).value == 8);
+
+    // CCCD wait also accepts desc_uuid == 0x2902 or incoming Report Notification
+    Reset(); assert(R_SUCCEEDED(gatt::Discover(0, 260, a)));
+    cccd_failure = 0;
+    cccd_use_desc_uuid = true;
+    AssertSubscribed(0, 260);
+    cccd_use_desc_uuid = false;
+    cccd_complete_via_notification = true;
+    AssertSubscribed(0, 260);
+    cccd_complete_via_notification = false;
 
     // Stadia DIS PnP ID + output WriteWithResponse selection + >64 attribute capacity
     Reset(DiscoveryMode::Never);
@@ -349,6 +379,15 @@ int main() {
         assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &fallback_hid)));
         assert(!fallback_hid.has_pnp_id);
         assert(std::strcmp(fallback_hid.device_name, "StadiaQPRV-4967") == 0);
+
+        // When HID Information read times out on a live link, skip Report Map and best-effort PnP/name reads
+        read_uuids.clear();
+        events::completed = false;
+        gatt::HidService timeout_hid{};
+        assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &timeout_hid)));
+        assert(read_uuids.size() == 1 && read_uuids[0] == GattCharHidInformation);
+        assert(timeout_hid.has_output_report && timeout_hid.output_report.handle == out_handle);
+        events::completed = true;
     }
 
     std::cout << "GATT discovery/authentication/completion isolation/cache/cancellation regressions passed\n";

@@ -108,8 +108,46 @@ namespace ams::ble::pairing {
             return false;
         }
 
+        // Some stacks/controllers (e.g. Stadia BLE) emit an initial core connection
+        // indication (type=3) synchronously during or within 50ms of CreateBond while
+        // SMP / ConnectionUpdate is still in flight. Wait for a second indication or a
+        // 1.5s settling window before touching authenticated GATT characteristics.
+        bool early_bond = events::TakeSlotBondComplete(slot);
+        if (!early_bond) {
+            events::WaitFor(events::InvalidType, TimeSpan::FromMilliSeconds(50), nullptr, [&](const EventRecord &) {
+                early_bond = events::TakeSlotBondComplete(slot);
+                return early_bond || events::IsSlotDisconnected(slot) || !events::IsRadioEnabled();
+            });
+        }
+        if (events::IsSlotDisconnected(slot) || !events::IsRadioEnabled()) {
+            log::Write("slot %u: pairing aborted immediately after CreateBond (disconnected=%u reason=0x%04x radio=%u)",
+                slot, events::IsSlotDisconnected(slot), events::GetSlotDisconnectReason(slot), events::IsRadioEnabled());
+            return false;
+        }
+
+        if (early_bond) {
+            log::Write("slot %u: early core connection indication during CreateBond; waiting 1500ms for SMP settle", slot);
+            bool second_bond = false;
+            events::WaitFor(events::InvalidType, TimeSpan::FromMilliSeconds(1500), nullptr, [&](const EventRecord &) {
+                second_bond = events::TakeSlotBondComplete(slot);
+                return second_bond || events::IsSlotDisconnected(slot) || !events::IsRadioEnabled();
+            });
+            if (second_bond && !events::IsSlotDisconnected(slot) && events::IsRadioEnabled()) {
+                events::WaitFor(events::InvalidType, TimeSpan::FromMilliSeconds(500), nullptr, [&](const EventRecord &) {
+                    return events::IsSlotDisconnected(slot) || !events::IsRadioEnabled();
+                });
+            }
+            if (!events::IsSlotDisconnected(slot) && events::IsRadioEnabled()) {
+                log::Write("slot %u: link alive after early bond settle; verifying encrypted GATT access", slot);
+                return true;
+            }
+            log::Write("slot %u: pairing failed during early bond settle (second=%u disconnected=%u reason=0x%04x radio=%u)",
+                slot, second_bond, events::IsSlotDisconnected(slot), events::GetSlotDisconnectReason(slot), events::IsRadioEnabled());
+            return false;
+        }
+
         bool bonded = false;
-        events::WaitFor(events::InvalidType, TimeSpan::FromSeconds(10), nullptr, [&](const EventRecord &) {
+        events::WaitFor(events::InvalidType, TimeSpan::FromMilliSeconds(9950), nullptr, [&](const EventRecord &) {
             bonded = bonded || events::TakeSlotBondComplete(slot);
             return bonded || events::IsSlotDisconnected(slot) || !events::IsRadioEnabled();
         });

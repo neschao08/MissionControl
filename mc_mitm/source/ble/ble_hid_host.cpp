@@ -217,6 +217,11 @@ namespace ams::ble {
 
                 rc = btdrvGetLeHidEventInfo(&g_le_hid_record.info, sizeof(g_le_hid_record.info), &g_le_hid_record.type);
                 if (R_FAILED(rc)) {
+                    static u32 error_logs = 0;
+                    if (error_logs < 5) {
+                        ++error_logs;
+                        log::Write("btdrvGetLeHidEventInfo rc=0x%x", rc.GetValue());
+                    }
                     continue;
                 }
 

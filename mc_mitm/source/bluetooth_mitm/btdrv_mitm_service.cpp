@@ -196,9 +196,14 @@ namespace ams::mitm::bluetooth {
     Result BtdrvMitmService::RegisterBleHidEvent(sf::OutCopyHandle out_handle) {
         // hid consumes the LE HID event stream itself, and since the event info is a single slot that resets on
         // read, it wins most of the notifications from a controller we present to it and drops them as garbage.
-        // While the BLE host is enabled, give system processes an event that never fires so the reports only
-        // reach the host, which translates them.
-        if (!ams::ble::IsEnabled()) {
+        // While the BLE host is enabled, give system Hid/Btm processes an event that never fires so the reports
+        // only reach our host thread, which translates them, while letting mc.mitm itself use the real event.
+        const bool is_system_consumer = (m_client_info.program_id == ncm::SystemProgramId::Hid) || (m_client_info.program_id == ncm::SystemProgramId::Btm);
+        const bool intercept = ams::ble::IsEnabled() && is_system_consumer;
+        ams::ble::log::Write("RegisterBleHidEvent program_id=0x%016llx -> %s",
+            static_cast<unsigned long long>(m_client_info.program_id.value),
+            intercept ? "placeholder" : "forward");
+        if (!intercept) {
             R_THROW(sm::mitm::ResultShouldForwardToSession());
         }
 

@@ -63,6 +63,39 @@ namespace ams::mitm::btm {
             total_out.SetValue(total);
         }
 
+        template <typename T>
+        void AppendVirtualDeviceInfos(T *device_info, size_t max_size, sf::Out<s32> &total_out) {
+            bluetooth::Address virtual_devices[4];
+            const size_t virtual_count = controller::GetVirtualDevices(virtual_devices, util::size(virtual_devices));
+
+            s32 total = total_out.GetValue();
+            const s32 existing_count = total;
+            for (size_t i = 0; (i < virtual_count) && (static_cast<size_t>(total) < max_size); ++i) {
+                bool already_present = false;
+                for (s32 j = 0; j < existing_count; ++j) {
+                    if (std::memcmp(&device_info[j].addr, &virtual_devices[i], sizeof(bluetooth::Address)) == 0) {
+                        already_present = true;
+                        break;
+                    }
+                }
+                if (already_present) {
+                    continue;
+                }
+
+                auto device = &device_info[total++];
+                std::memset(device, 0, sizeof(*device));
+                device->addr = virtual_devices[i];
+                device->class_of_device = { 0x00, 0x25, 0x08 };
+                std::memset(device->link_key.link_key, 0xAA, sizeof(device->link_key.link_key));
+                device->key_type = 0;
+                device->profile = BtmProfile_Hid;
+                device->profile_info.hid.vid = 0x057e;
+                device->profile_info.hid.pid = 0x2009;
+                std::strncpy(device->name, controller::ProControllerName, sizeof(device->name) - 1);
+            }
+            total_out.SetValue(total);
+        }
+
     }
 
     Result BtmMitmService::AcquireDeviceConditionEvent(sf::OutCopyHandle out_handle) {
@@ -117,6 +150,10 @@ namespace ams::mitm::btm {
             }
         }
 
+        if ((profile == BtmProfile_Hid) || (profile == BtmProfile_None)) {
+            AppendVirtualDeviceInfos(device_info, out.GetSize(), total_out);
+        }
+
         R_SUCCEED();
     }
 
@@ -130,7 +167,11 @@ namespace ams::mitm::btm {
                 std::strncpy(device->name, controller::LicensedProControllerName, sizeof(device->name) - 1);
             }
         }
-        
+
+        if ((profile == BtmProfile_Hid) || (profile == BtmProfile_None)) {
+            AppendVirtualDeviceInfos(device_info, out.GetSize(), total_out);
+        }
+
         R_SUCCEED();
     }
 

@@ -37,6 +37,7 @@ namespace ams::controller {
             void ProcessGetDeviceInfo(const SwitchHidCommand *command, SwitchHidCommandResponse *response);
             void ProcessSetDataFormat(const SwitchHidCommand *command, SwitchHidCommandResponse *response);
             void ProcessLRButtonDetection(const SwitchHidCommand *command, SwitchHidCommandResponse *response);
+            void ProcessReset(const SwitchHidCommand *command, SwitchHidCommandResponse *response);
             void ProcessClearPairingInfo(const SwitchHidCommand *command, SwitchHidCommandResponse *response);
             void ProcessShipment(const SwitchHidCommand *command, SwitchHidCommandResponse *response);
             void ProcessSerialFlashRead(const SwitchHidCommand *command, SwitchHidCommandResponse *response);

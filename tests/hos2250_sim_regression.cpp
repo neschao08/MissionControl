@@ -89,6 +89,7 @@ namespace {
             for (auto &s : events::slots) s = {};
             events::queue.clear();
             events::radio = true;
+            events::notif_dirty = false;
             events::now_ms = 0;
             next_conn_id = 3;
             conns.clear();
@@ -504,6 +505,12 @@ Result btdrvReadGattCharacteristic(u32 conn_id, bool, const BtdrvGattId *, const
 Result btdrvRegisterGattNotification(u32 conn_id, bool, const BtdrvGattId *, const BtdrvGattId *) {
     auto *c = g_sim.FindConnById(conn_id);
     if (!c) return {4};
+    // Faithful bt_nso 0x6408 -> 0x640c model: if g_gatt_manager already has a stale entry for
+    // client_if (e.g. left over from result=26 or sleep disconnect), bt_nso returns 0 WITHOUT
+    // calling BSA_GattcRegisterNotification (0x19200) unless Unregister pre-cleaned it!
+    if (g_sim.gatt_manager_notif_table[c->client_if]) {
+        return {0};
+    }
     g_sim.gatt_manager_notif_table[c->client_if] = true;
     c->notif_registered = true;
     return {0};
@@ -871,11 +878,12 @@ static void Test9_StadiaProactiveSlaveSecReq30sTimeoutAndCmd6Fix() {
     assert(g_sim.conns[cid3].connected && !events::IsSlotDisconnected(0));
 }
 
-static void Test10_ZeroUnregisterAndHidInfoGateClearOnReconnect() {
-    // v10 fix verified against real StadiaQPRV-4967 firmware & HOS 22.5.0 bt_nso:
-    //   1. NEVER call btdrvUnregisterGattNotification (calling it on bt_nso breaks notification table / causes 0 input).
-    //   2. ALWAYS read 0x2A4A (GattCharHidInformation) before CCCD=0x0001 to clear Stadia fw [GattServer+0x1975].
-    //   3. Zero 0x2a671 GATT_OPERATION_BUSY across result=26 and result=0 reconnects.
+static void Test10_DirtyNotifPreCleanAndHidInfoGateClearOnReconnect() {
+    // v11 fix verified against real StadiaQPRV-4967 firmware & HOS 22.5.0 bt_nso:
+    //   1. Clean first connect NEVER calls btdrvUnregisterGattNotification (unregister_count == 0).
+    //   2. Dirty disconnect (result=26) or sleep/wake leaves g_gatt_manager dirty -> Subscribe pre-cleans once.
+    //   3. ALWAYS read 0x2A4A (GattCharHidInformation) before CCCD=0x0001 to clear Stadia fw [GattServer+0x1975].
+    //   4. Zero 0x2a671 GATT_OPERATION_BUSY across result=26, sleep, and result=0 reconnects.
     g_sim.Reset();
     g_sim.ips_cmd6_enabled = true;
     g_sim.peer_behaviors[BtNsoSim::AddrKey(StadiaAddr)] = PeripheralBehavior::StadiaProactiveSlaveSecReq;
@@ -893,14 +901,15 @@ static void Test10_ZeroUnregisterAndHidInfoGateClearOnReconnect() {
     assert(g_sim.unregister_count == 0);
     assert(g_sim.busy_0x2a671_count == 0);
 
-    // Conn #1 ends with result=26 -> Unsubscribe is a safe no-op and NEVER calls btdrvUnregisterGattNotification
+    // Conn #1 ends with result=26 -> leaves g_gatt_manager_notif_table[6] == true; Unsubscribe stays no-op
     g_sim.DisconnectConn(cid1, 0x0008, /*disc_result=*/26);
     events::Pump(TimeSpan::FromMilliSeconds(50));
     gatt::Unsubscribe(0, cid1);
     gatt::ResetSlot(0);
+    assert(g_sim.gatt_manager_notif_table[6] == true);
     assert(g_sim.unregister_count == 0);
 
-    // Conn #2 (flags=0x06 auto-reconnect with preserved LTK)
+    // Conn #2 (flags=0x06 auto-reconnect with preserved LTK) -> pre-cleans once, then truly registers + reads 0x2A4A
     u32 cid2 = InvalidConnId;
     assert(R_SUCCEEDED(pairing::Connect(0, 6, StadiaAddr, &cid2, TimeSpan::FromSeconds(15), false)));
     assert(R_SUCCEEDED(gatt::Discover(0, cid2, StadiaAddr)));
@@ -910,10 +919,10 @@ static void Test10_ZeroUnregisterAndHidInfoGateClearOnReconnect() {
     assert(g_sim.conns[cid2].notif_registered);
     assert(g_sim.conns[cid2].stadia_gate_cleared);
     assert(!g_sim.conns[cid2].cccd_disabled_first && g_sim.conns[cid2].cccd_enabled);
-    assert(g_sim.unregister_count == 0);
+    assert(g_sim.unregister_count == 1);
     assert(g_sim.busy_0x2a671_count == 0);
 
-    // Conn #2 ends with result=0 -> Conn #3 (flags=0x05) also reads 0x2A4A & works cleanly with 0 Unregister
+    // Conn #2 ends cleanly with result=0 -> Conn #3 requires NO extra Unregister (stays at 1)
     g_sim.DisconnectConn(cid2, 0x0008, /*disc_result=*/0);
     events::Pump(TimeSpan::FromMilliSeconds(50));
     gatt::ResetSlot(0);
@@ -926,9 +935,28 @@ static void Test10_ZeroUnregisterAndHidInfoGateClearOnReconnect() {
     assert(R_SUCCEEDED(gatt::Subscribe(0, cid3, &hid3, gatt::SubscribeAuthMode::PlainOnlyAfterBond)));
     assert(g_sim.conns[cid3].notif_registered);
     assert(g_sim.conns[cid3].stadia_gate_cleared);
-    assert(g_sim.hid_info_read_count == 3);
-    assert(g_sim.unregister_count == 0);
+    assert(g_sim.unregister_count == 1);
     assert(!g_sim.conns[cid3].cccd_disabled_first && g_sim.conns[cid3].cccd_enabled);
+    assert(g_sim.busy_0x2a671_count == 0);
+
+    // Sleep/wake transition leaves bt_nso notification table dirty -> Conn #4 pre-cleans once more (count=2)
+    g_sim.DisconnectConn(cid3, 0x0013, /*disc_result=*/0);
+    events::Pump(TimeSpan::FromMilliSeconds(50));
+    gatt::ResetSlot(0);
+    g_sim.gatt_manager_notif_table[6] = true;
+    events::notif_dirty = true;
+
+    u32 cid4 = InvalidConnId;
+    assert(R_SUCCEEDED(pairing::Connect(0, 6, StadiaAddr, &cid4, TimeSpan::FromSeconds(15), false)));
+    assert(R_SUCCEEDED(gatt::Discover(0, cid4, StadiaAddr)));
+    assert(pairing::PrepareSecurityWithStrategy(0, StadiaAddr, pairing::SecurityStrategy::BleSecurityGrant));
+    gatt::HidService hid4{};
+    assert(R_SUCCEEDED(gatt::Subscribe(0, cid4, &hid4, gatt::SubscribeAuthMode::PlainOnlyAfterBond)));
+    assert(g_sim.conns[cid4].notif_registered);
+    assert(g_sim.conns[cid4].stadia_gate_cleared);
+    assert(g_sim.hid_info_read_count == 4);
+    assert(g_sim.unregister_count == 2);
+    assert(!g_sim.conns[cid4].cccd_disabled_first && g_sim.conns[cid4].cccd_enabled);
     assert(g_sim.busy_0x2a671_count == 0);
 }
 
@@ -942,6 +970,6 @@ int main() {
     Test7_CoexistenceXboxAndStadiaSimultaneous();
     Test8_StressReconnectDisconnectSleep50Cycles();
     Test9_StadiaProactiveSlaveSecReq30sTimeoutAndCmd6Fix();
-    Test10_ZeroUnregisterAndHidInfoGateClearOnReconnect();
+    Test10_DirtyNotifPreCleanAndHidInfoGateClearOnReconnect();
     std::cout << "HOS 22.5.0 bt_nso simulator end-to-end regressions (10 scenarios, 50 stress cycles + 120s soak) passed\n";
 }

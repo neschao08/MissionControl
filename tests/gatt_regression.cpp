@@ -216,7 +216,15 @@ int main() {
     AssertSubscribed(0, 260);
     assert(unregister_count == 0); // clean first connect: NEVER Unregister before Register (v7/v8/v10 zero-input regression)
     gatt::Unsubscribe(0, 260);
-    assert(unregister_count == 0); // v10: never call btdrvUnregisterGattNotification even on Unsubscribe
+    assert(unregister_count == 0); // v10/v11: never call btdrvUnregisterGattNotification during Unsubscribe
+
+    // After a dirty (result != 0) or sleep disconnect, Subscribe purges the stale bt_nso entry once before Register.
+    Reset();
+    events::notif_dirty = true;
+    assert(R_SUCCEEDED(gatt::Discover(0, 260, a)));
+    AssertSubscribed(0, 260);
+    assert(unregister_count == 1);
+    assert(!events::notif_dirty);
 
     Reset(DiscoveryMode::AfterMtu);
     assert(R_SUCCEEDED(gatt::Discover(0, 260, a)));

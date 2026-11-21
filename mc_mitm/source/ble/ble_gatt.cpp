@@ -458,8 +458,11 @@ namespace ams::ble::gatt {
 
             R_UNLESS(!events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled(), ResultNoConnection());
 
-            // Match upstream stek_ble_gatt: never call btdrvUnregisterGattNotification before Register
-            // or during teardown, as real hardware (v7-v9) showed it corrupts bt_nso's notification state.
+            if (events::TakeNotifTableDirty()) {
+                const Result unreg_rc = btdrvUnregisterGattNotification(conn_id, service.is_primary, &service.id, &attr.id);
+                log::Write("btdrvUnregisterGattNotification(pre-clean) slot=%u handle=0x%04x rc=0x%x", slot_index, attr.handle, unreg_rc.GetValue());
+            }
+
             Result rc = btdrvRegisterGattNotification(conn_id, service.is_primary, &service.id, &attr.id);
             log::Write("btdrvRegisterGattNotification slot=%u handle=0x%04x rc=0x%x", slot_index, attr.handle, rc.GetValue());
             R_TRY(rc);

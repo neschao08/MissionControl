@@ -94,6 +94,7 @@ namespace ams::ble::events {
 
         constinit s64 g_inquiry_started_tick = 0;
         constinit u32 g_pairing_window_generation = 0;
+        constinit std::atomic<bool> g_notif_table_dirty = false;
 
         constinit Sink g_sink = nullptr;
 
@@ -386,6 +387,7 @@ namespace ams::ble::events {
                         if (type == BtdrvBleEventType_ClientRegistration) {
                             const u8 cif = info->client_registration.client_if;
                             if ((info->client_registration.result == 0) && (info->client_registration.status == 1)) {
+                                g_notif_table_dirty.store(false, std::memory_order_release);
                                 ++g_client_registration_generation;
                                 g_spare_client_if = cif;
                                 bool found = false;
@@ -439,6 +441,9 @@ namespace ams::ble::events {
             if (type == BtdrvBleEventType_ClientConnection) {
                 auto &connection = info->client_connection;
                 const bool connected = (connection.result == 0) && (connection.status == BleConnectionStatus_Connected);
+                if (!connected && (connection.result != 0)) {
+                    g_notif_table_dirty.store(true, std::memory_order_release);
+                }
                 if (!connected && g_adopted && connection.conn_id == g_adopted_conn_id) g_adopted = false;
 
                 if (!connected && (connection.conn_id == InvalidConnId) && (connection.client_if == InvalidClientIf)) {
@@ -748,6 +753,10 @@ namespace ams::ble::events {
         return os::GetSystemTick().ToTimeSpan().GetMilliSeconds();
     }
 
+    bool TakeNotifTableDirty() {
+        return g_notif_table_dirty.exchange(false, std::memory_order_acq_rel);
+    }
+
     void SetRadioEnabled(bool enabled) {
         std::scoped_lock lk(g_lock);
         g_power_awake = enabled;
@@ -758,6 +767,7 @@ namespace ams::ble::events {
             g_radio_enabled = true;
             g_radio_event.Signal();
         } else {
+            g_notif_table_dirty.store(true, std::memory_order_release);
             g_radio_enabled = false;
             g_radio_event.Clear();
             g_ring_event.Signal();
@@ -771,6 +781,7 @@ namespace ams::ble::events {
 
     bool BeginSleep() {
         std::scoped_lock lk(g_lock);
+        g_notif_table_dirty.store(true, std::memory_order_release);
         g_preparing_sleep = true;
         g_sleep_cleanup_pending = true;
         g_sleep_prepared_event.Clear();

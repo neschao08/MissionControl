@@ -16,6 +16,7 @@
 #pragma once
 #include <switch.h>
 #include <stratosphere.hpp>
+#include "../bluetooth_mitm/bluetooth/bluetooth_types.hpp"
 
 namespace ams::ble {
 
@@ -35,5 +36,6 @@ namespace ams::ble {
 
     void Launch();
     void WaitFinished();
+    bool RequestDisconnect(const bluetooth::Address &address);
 
 }

@@ -15,6 +15,7 @@
  */
 #include "switch_hid_command_processor.hpp"
 #include "emulated_switch_controller.hpp"
+#include "../ble/ble_hid_host.hpp"
 #include "../mcmitm_config.hpp"
 #include "../utils.hpp"
 
@@ -28,6 +29,7 @@ namespace ams::controller {
             case SwitchHidCommandId::GetDeviceInfo:          this->ProcessGetDeviceInfo(command, &response);          break;
             case SwitchHidCommandId::SetDataFormat:          this->ProcessSetDataFormat(command, &response);          break;
             case SwitchHidCommandId::LRButtonDetection:      this->ProcessLRButtonDetection(command, &response);      break;
+            case SwitchHidCommandId::Reset:                  this->ProcessReset(command, &response);                  break;
             case SwitchHidCommandId::ClearPairingInfo:       this->ProcessClearPairingInfo(command, &response);       break;
             case SwitchHidCommandId::Shipment:               this->ProcessShipment(command, &response);               break;
             case SwitchHidCommandId::SerialFlashRead:        this->ProcessSerialFlashRead(command, &response);        break;
@@ -109,6 +111,15 @@ namespace ams::controller {
 
         response->response_id = SwitchHidCommandId::LRButtonElapsedTime;
         response->request_id  = SwitchHidCommandId::LRButtonDetection;
+    }
+
+    void SwitchHidCommandProcessor::ProcessReset(const SwitchHidCommand *command, SwitchHidCommandResponse *response) {
+        if (command->reset.mode == 0) {
+            static_cast<void>(ams::ble::RequestDisconnect(m_controller->Address()));
+        }
+
+        response->response_id = SwitchHidCommandId::Ack;
+        response->request_id  = SwitchHidCommandId::Reset;
     }
 
     void SwitchHidCommandProcessor::ProcessClearPairingInfo(const SwitchHidCommand *command, SwitchHidCommandResponse *response) {

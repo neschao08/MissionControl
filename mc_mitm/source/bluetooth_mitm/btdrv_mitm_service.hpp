@@ -24,6 +24,7 @@
     AMS_SF_METHOD_INFO(C, H, 9,     Result, StopInquiry,                      (),                                                                                       ())                                                             \
     AMS_SF_METHOD_INFO(C, H, 15,    Result, GetEventInfo,                     (sf::Out<ams::bluetooth::EventType> out_type, const sf::OutPointerBuffer &out_buffer),    (out_type, out_buffer))                                         \
     AMS_SF_METHOD_INFO(C, H, 16,    Result, InitializeHid,                    (sf::OutCopyHandle out_handle, u16 version),                                              (out_handle, version))                                          \
+    AMS_SF_METHOD_INFO(C, H, 18,    Result, CloseHidConnection,               (ams::bluetooth::Address address),                                                        (address))                                                      \
     AMS_SF_METHOD_INFO(C, H, 19,    Result, WriteHidData,                     (ams::bluetooth::Address address, const sf::InPointerBuffer &buffer),                     (address, buffer))                                              \
     AMS_SF_METHOD_INFO(C, H, 20,    Result, WriteHidData2,                    (ams::bluetooth::Address address, const sf::InPointerBuffer &buffer),                     (address, buffer))                                              \
     AMS_SF_METHOD_INFO(C, H, 27,    Result, GetHidEventInfo,                  (sf::Out<ams::bluetooth::HidEventType> out_type, const sf::OutPointerBuffer &out_buffer), (out_type, out_buffer))                                         \
@@ -67,6 +68,7 @@ namespace ams::mitm::bluetooth {
             Result StopInquiry();
             Result GetEventInfo(sf::Out<ams::bluetooth::EventType> out_type, const sf::OutPointerBuffer &out_buffer);
             Result InitializeHid(sf::OutCopyHandle out_handle, u16 version);
+            Result CloseHidConnection(ams::bluetooth::Address address);
             Result WriteHidData(ams::bluetooth::Address address, const sf::InPointerBuffer &buffer);
             Result WriteHidData2(ams::bluetooth::Address address, const sf::InPointerBuffer &buffer);
             Result GetHidEventInfo(sf::Out<ams::bluetooth::HidEventType> out_type, const sf::OutPointerBuffer &out_buffer);

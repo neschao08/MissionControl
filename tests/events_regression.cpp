@@ -152,5 +152,25 @@ int main() {
     os::g_tick_ms += 13000;
     assert(!events::ClassicActivityWithin(TimeSpan::FromSeconds(12)));
 
+    // Dirty notification table flag: set on non-zero disconnect (result=26) or radio disable (sleep), cleared by ClientRegistration
+    events::TakeNotifTableDirty();
+    events::SetRadioEnabled(true);
+    events::SetSlotConnection(0, stadia_addr, 888);
+    BtdrvBleEventInfo dirty_disc{};
+    dirty_disc.client_connection.result = 26;
+    dirty_disc.client_connection.status = BleConnectionStatus_Disconnected;
+    dirty_disc.client_connection.conn_id = 888;
+    dirty_disc.client_connection.address = stadia_addr;
+    dirty_disc.client_connection.reason = 0x0008;
+    assert(events::OnBleEvent(BtdrvBleEventType_ClientConnection, &dirty_disc) == true);
+    assert(events::TakeNotifTableDirty() == true);
+    assert(events::TakeNotifTableDirty() == false);
+
+    events::SetRadioEnabled(false);
+    assert(events::TakeNotifTableDirty() == true);
+    events::SetRadioEnabled(true);
+    EmitClientReg(6, 1);
+    assert(events::TakeNotifTableDirty() == false);
+
     std::cout << "BLE production events (dual-path dispatch, rumble filter, descending client_if) regressions passed\n";
 }

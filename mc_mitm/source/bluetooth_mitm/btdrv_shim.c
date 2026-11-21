@@ -34,6 +34,10 @@ Result btdrvInitializeHidFwd(Service* srv, Handle *out_handle, u16 version) {
     );
 }
 
+Result btdrvCloseHidConnectionFwd(Service* srv, BtdrvAddress address) {
+    return serviceMitmDispatchIn(srv, 18, address);
+}
+
 Result btdrvWriteHidDataFwd(Service* srv, BtdrvAddress address, const BtdrvHidReport *report) {
     return serviceMitmDispatchIn(srv, 19, address,
         .buffer_attrs = { SfBufferAttr_FixedSize | SfBufferAttr_HipcPointer | SfBufferAttr_In },

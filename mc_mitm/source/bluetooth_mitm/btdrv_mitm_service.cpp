@@ -105,6 +105,13 @@ namespace ams::mitm::bluetooth {
         R_SUCCEED();
     }
 
+    Result BtdrvMitmService::CloseHidConnection(ams::bluetooth::Address address) {
+        if (ams::ble::RequestDisconnect(address)) {
+            R_SUCCEED();
+        }
+        R_RETURN(btdrvCloseHidConnectionFwd(m_forward_service.get(), address));
+    }
+
     Result BtdrvMitmService::WriteHidData(ams::bluetooth::Address address, const sf::InPointerBuffer &buffer) {
         auto report = reinterpret_cast<const ams::bluetooth::HidReport *>(buffer.GetPointer());
 

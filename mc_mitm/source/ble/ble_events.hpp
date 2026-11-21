@@ -80,6 +80,7 @@ namespace ams::ble::events {
     void NoteGattResult(u32 conn_id, u8 notify_type, const BtdrvGattAttributeUuid &char_uuid, u32 result);
     u32 GetGattFailure(u32 slot_index);       // last non-zero result since ClearGattFailure
     void ClearGattFailure(u32 slot_index);
+    bool TakeNotifTableDirty();
 
     // A link that came up for an address the host tried to reach while no target is set (a cancelled request
     // completing anyway) is held for the host to take over

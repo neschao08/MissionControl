@@ -14,6 +14,8 @@ static int unregister_count;
 static u64 connected_at;
 static std::vector<u64> query_times;
 static std::vector<u16> read_uuids;
+static std::vector<int> read_auths;
+static std::vector<int> cccd_auths;
 static std::vector<u32> mtu_connections;
 static bool unrelated_completions;
 static u64 completion_delay;
@@ -23,23 +25,30 @@ static bool cccd_completed;
 static bool cccd_use_desc_uuid;
 static bool cccd_complete_via_notification;
 static u32 cccd_failure;
+static u32 cccd_plain_failure;
+static bool fail_pnp_timeout = false;
 
 static std::vector<u8> pnp_id_payload;
 static std::vector<u8> device_name_payload;
 static bool fail_pnp_read = false;
 
-static void Complete(u32 conn_id, u8 operation, BtdrvGattAttributeUuid uuid) {
+static void Complete(u32 conn_id, u8 operation, BtdrvGattAttributeUuid uuid, int auth = BtdrvGattAuthReqType_NoMitm) {
     if (events::disconnect_on_wait) events::Schedule(EventRecord{events::Disconnect, {}}, 1);
     if (events::sleep_on_wait) events::Schedule(EventRecord{events::RadioOff, {}}, 1);
     EventRecord event{};
     event.type = BtdrvBleEventType_ClientNotify;
     event.info.client_notify = {events::failure, conn_id, operation, uuid};
-    if (operation == BtdrvGattOperationType_CharacteristicRead && uuid.value == GattCharPnpId && !pnp_id_payload.empty()) {
-        if (fail_pnp_read) {
-            event.info.client_notify.result = 9;
-        } else {
-            event.info.client_notify.size = static_cast<u16>(pnp_id_payload.size());
-            std::memcpy(event.info.client_notify.data, pnp_id_payload.data(), pnp_id_payload.size());
+    if (operation == BtdrvGattOperationType_CharacteristicRead && uuid.value == GattCharPnpId) {
+        if (fail_pnp_timeout) {
+            return;
+        }
+        if (!pnp_id_payload.empty()) {
+            if (fail_pnp_read) {
+                event.info.client_notify.result = 9;
+            } else {
+                event.info.client_notify.size = static_cast<u16>(pnp_id_payload.size());
+                std::memcpy(event.info.client_notify.data, pnp_id_payload.data(), pnp_id_payload.size());
+            }
         }
     } else if (operation == BtdrvGattOperationType_CharacteristicRead && uuid.value == GattCharDeviceName && !device_name_payload.empty()) {
         event.info.client_notify.size = static_cast<u16>(device_name_payload.size());
@@ -47,11 +56,12 @@ static void Complete(u32 conn_id, u8 operation, BtdrvGattAttributeUuid uuid) {
     }
     const bool cccd = operation == BtdrvGattOperationType_DescriptorWrite;
     if (cccd) {
-        event.info.client_notify.result = cccd_failure;
+        event.info.client_notify.result = (auth == BtdrvGattAuthReqType_None && cccd_plain_failure != 0)
+            ? cccd_plain_failure : cccd_failure;
         if (cccd_use_desc_uuid) {
             event.info.client_notify.char_uuid = {};
             event.info.client_notify.desc_uuid = {GattDescClientCharConfig};
-        } else if (cccd_complete_via_notification) {
+        } else if (cccd_complete_via_notification && event.info.client_notify.result == 0) {
             event.info.client_notify.op_type = BtdrvGattOperationType_Notification;
             event.info.client_notify.char_uuid = {GattCharReport};
         }
@@ -125,17 +135,20 @@ Result btdrvConfigureAttMtu(u32 conn_id, u16 mtu) {
     return mtu_result;
 }
 Result btdrvReadGattCharacteristic(u32 conn_id, bool, const BtdrvGattId *, const BtdrvGattId *attr, int auth) {
-    assert(auth == BtdrvGattAuthReqType_NoMitm);
+    assert(auth == BtdrvGattAuthReqType_None || auth == BtdrvGattAuthReqType_NoMitm);
     read_uuids.push_back(attr->uuid.value);
-    if (auth_refusals > 0) { --auth_refusals; return ResultInsufficientAuthentication(); }
-    Complete(conn_id, BtdrvGattOperationType_CharacteristicRead, attr->uuid);
+    read_auths.push_back(auth);
+    if (auth == BtdrvGattAuthReqType_NoMitm && auth_refusals > 0) { --auth_refusals; return ResultInsufficientAuthentication(); }
+    Complete(conn_id, BtdrvGattOperationType_CharacteristicRead, attr->uuid, auth);
     return {0};
 }
 Result btdrvRegisterGattNotification(u32, bool, const BtdrvGattId *, const BtdrvGattId *) { ++notification_registrations; return register_result; }
 Result btdrvUnregisterGattNotification(u32, bool, const BtdrvGattId *, const BtdrvGattId *) { ++unregister_count; return {0}; }
 Result btdrvWriteGattDescriptor(u32 conn_id, bool, const BtdrvGattId *, const BtdrvGattId *attr, const BtdrvGattId *, const u8 *data, size_t size, int auth) {
-    assert(auth == BtdrvGattAuthReqType_NoMitm && size == 2 && data[0] == 1 && data[1] == 0);
-    Complete(conn_id, BtdrvGattOperationType_DescriptorWrite, attr->uuid);
+    assert((auth == BtdrvGattAuthReqType_None || auth == BtdrvGattAuthReqType_NoMitm) && size == 2 && data[0] == 1 && data[1] == 0);
+    cccd_auths.push_back(auth);
+    if (auth == BtdrvGattAuthReqType_NoMitm && auth_refusals > 0) { --auth_refusals; return ResultInsufficientAuthentication(); }
+    Complete(conn_id, BtdrvGattOperationType_DescriptorWrite, attr->uuid, auth);
     return {0};
 }
 
@@ -160,12 +173,16 @@ static void Reset(DiscoveryMode next = DiscoveryMode::AfterSettling) {
     cccd_use_desc_uuid = false;
     cccd_complete_via_notification = false;
     cccd_failure = 0;
+    cccd_plain_failure = 0;
     query_times.clear();
     read_uuids.clear();
+    read_auths.clear();
+    cccd_auths.clear();
     mtu_connections.clear();
     pnp_id_payload.clear();
     device_name_payload.clear();
     fail_pnp_read = false;
+    fail_pnp_timeout = false;
 }
 
 static void AssertSubscribed(u32 slot, u32 conn_id) {
@@ -283,8 +300,11 @@ int main() {
     register_result = {7};
     assert(gatt::Subscribe(1, 774, &hid).value == 7);
     register_result = {0};
+    events::queue.clear();
     events::completed = false;
-    assert(R_SUCCEEDED(gatt::Subscribe(1, 774, &hid))); // live link proceeds when HID Info/CCCD completions time out
+    cccd_auths.clear();
+    assert(gatt::Subscribe(1, 774, &hid).value == 2); // zero-0x2a671 rule: HID Info timeout aborts before sending CCCD
+    assert(cccd_auths.empty());
     events::completed = true;
     events::disconnected = true;
     assert(gatt::Subscribe(1, 774, &hid).value == 4);
@@ -306,7 +326,7 @@ int main() {
     AssertSubscribed(0, 260);
     assert(events::now_ms == started + 3000);
     events::completed = false;
-    assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &hid)));
+    assert(gatt::Subscribe(0, 260, &hid).value == 2); // timeout must not proceed into BUSY
     events::completed = true;
     events::failure = 26;
     assert(gatt::Subscribe(0, 260, &hid).value == 8);
@@ -324,7 +344,7 @@ int main() {
     Reset(); assert(R_SUCCEEDED(gatt::Discover(0, 260, a)));
     unrelated_completions = true;
     cccd_completed = false;
-    assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &hid))); // unrelated noise alone times out CCCD cleanly on live link
+    assert(gatt::Subscribe(0, 260, &hid).value == 2); // unrelated noise alone fails CCCD with timeout
     cccd_completed = true;
     cccd_failure = 26;
     assert(gatt::Subscribe(0, 260, &hid).value == 8);
@@ -380,14 +400,67 @@ int main() {
         assert(!fallback_hid.has_pnp_id);
         assert(std::strcmp(fallback_hid.device_name, "StadiaQPRV-4967") == 0);
 
-        // When HID Information read times out on a live link, skip Report Map and best-effort PnP/name reads
+        // Best-effort PnP ID timeout must stop immediately without sending GAP Device Name (zero 0x2a671)
         read_uuids.clear();
+        fail_pnp_read = false;
+        fail_pnp_timeout = true;
+        gatt::HidService pnp_timeout_hid{};
+        assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &pnp_timeout_hid)));
+        assert(read_uuids == std::vector<u16>({GattCharHidInformation, GattCharPnpId}));
+        assert(!pnp_timeout_hid.has_pnp_id && pnp_timeout_hid.device_name[0] == '\0');
+        fail_pnp_timeout = false;
+
+        // When HID Information read times out in StandardNoMitm, abort immediately without sending CCCD
+        read_uuids.clear();
+        cccd_auths.clear();
         events::completed = false;
         gatt::HidService timeout_hid{};
-        assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &timeout_hid)));
+        assert(gatt::Subscribe(0, 260, &timeout_hid).value == 2);
         assert(read_uuids.size() == 1 && read_uuids[0] == GattCharHidInformation);
-        assert(timeout_hid.has_output_report && timeout_hid.output_report.handle == out_handle);
+        assert(cccd_auths.empty());
         events::completed = true;
+
+        // PlainThenNoMitm (Stadia Stage 0): skips 0x2A4A, tries plaintext CCCD first; succeeds with write_auth_req=None
+        read_uuids.clear(); read_auths.clear(); cccd_auths.clear();
+        gatt::HidService plain_ok{};
+        assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &plain_ok, gatt::SubscribeAuthMode::PlainThenNoMitm)));
+        assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_None}));
+        assert(plain_ok.write_auth_req == BtdrvGattAuthReqType_None);
+        assert(plain_ok.has_output_report && plain_ok.output_report.handle == out_handle);
+        assert(std::find(read_uuids.begin(), read_uuids.end(), GattCharHidInformation) == read_uuids.end());
+        assert(!read_auths.empty() && read_auths[0] == BtdrvGattAuthReqType_None);
+
+        // PlainThenNoMitm: plaintext CCCD gets ATT 0x05 (Insufficient Auth -> GATT IDLE), escalates to NoMitm -> succeeds!
+        read_uuids.clear(); read_auths.clear(); cccd_auths.clear();
+        cccd_plain_failure = 5;
+        gatt::HidService escalated{};
+        assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &escalated, gatt::SubscribeAuthMode::PlainThenNoMitm)));
+        assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_None, BtdrvGattAuthReqType_NoMitm}));
+        assert(escalated.write_auth_req == BtdrvGattAuthReqType_NoMitm);
+        assert(!read_auths.empty() && read_auths[0] == BtdrvGattAuthReqType_NoMitm);
+        cccd_plain_failure = 0;
+
+        // PlainThenNoMitm: plaintext CCCD times out -> must NOT escalate into 0x2a671 BUSY
+        cccd_auths.clear();
+        cccd_completed = false;
+        gatt::HidService plain_to{};
+        assert(gatt::Subscribe(0, 260, &plain_to, gatt::SubscribeAuthMode::PlainThenNoMitm).value == 2);
+        assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_None}));
+        cccd_completed = true;
+
+        // PlainOnlyAfterBond (Stadia Stage 1 & 2): skips 0x2A4A, writes CCCD with None only, never escalates to NoMitm
+        read_uuids.clear(); cccd_auths.clear();
+        gatt::HidService after_bond{};
+        assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &after_bond, gatt::SubscribeAuthMode::PlainOnlyAfterBond)));
+        assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_None}));
+        assert(after_bond.write_auth_req == BtdrvGattAuthReqType_None);
+        assert(std::find(read_uuids.begin(), read_uuids.end(), GattCharHidInformation) == read_uuids.end());
+
+        cccd_auths.clear();
+        cccd_plain_failure = 5;
+        assert(gatt::Subscribe(0, 260, &after_bond, gatt::SubscribeAuthMode::PlainOnlyAfterBond).value == 8);
+        assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_None}));
+        cccd_plain_failure = 0;
     }
 
     std::cout << "GATT discovery/authentication/completion isolation/cache/cancellation regressions passed\n";

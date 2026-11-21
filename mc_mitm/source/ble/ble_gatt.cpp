@@ -98,9 +98,9 @@ namespace ams::ble::gatt {
             return false;
         }
 
-        Result WaitForOperation(u32 slot, u32 conn_id, u8 operation, u16 characteristic, TimeSpan timeout, EventRecord *out_event = nullptr, bool *out_timed_out = nullptr) {
-            if (out_timed_out) {
-                *out_timed_out = false;
+        Result WaitForOperation(u32 slot, u32 conn_id, u8 operation, u16 characteristic, TimeSpan timeout, EventRecord *out_event = nullptr, u32 *out_gatt_status = nullptr) {
+            if (out_gatt_status) {
+                *out_gatt_status = 0;
             }
             EventRecord event = {};
             const bool completed = events::WaitFor(events::InvalidType, timeout, &event, [&](const EventRecord &record) {
@@ -123,15 +123,14 @@ namespace ams::ble::gatt {
             R_UNLESS(!events::IsSlotDisconnected(slot) && events::IsRadioEnabled(), ResultNoConnection());
             if (!completed) {
                 log::Write("slot %u: GATT completion timeout conn_id=%u op=%u char=0x%04x", slot, conn_id, operation, characteristic);
-                if (out_timed_out) {
-                    *out_timed_out = true;
-                    R_SUCCEED();
-                }
                 R_THROW(svc::ResultTimedOut());
             }
             // An unrelated notification or a different pad's completion is not
             // evidence that this request (and its encryption) succeeded.
             if (event.info.client_notify.result != 0) {
+                if (out_gatt_status) {
+                    *out_gatt_status = event.info.client_notify.result;
+                }
                 log::Write("slot %u: GATT completion failed conn_id=%u op=%u char=0x%04x result=%u", slot, conn_id, operation, characteristic, event.info.client_notify.result);
                 R_THROW(svc::ResultInvalidState());
             }
@@ -139,6 +138,22 @@ namespace ams::ble::gatt {
                 *out_event = event;
             }
             R_SUCCEED();
+        }
+
+        Result WriteCccdWithAuth(u32 slot_index, u32 conn_id, const BtdrvGattAttribute &service, const BtdrvGattAttribute &chr, const BtdrvGattAttribute &cccd, u8 auth_req, TimeSpan timeout, u32 *out_gatt_status = nullptr) {
+            const u8 enable_notifications[2] = { 0x01, 0x00 };
+            Result rc = ResultSuccess();
+            for (int attempt = 0; ; ++attempt) {
+                R_UNLESS(!events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled(), ResultNoConnection());
+                rc = btdrvWriteGattDescriptor(conn_id, service.is_primary, &service.id, &chr.id, &cccd.id, enable_notifications, sizeof(enable_notifications), auth_req);
+                log::Write("btdrvWriteGattDescriptor(CCCD) slot=%u handle=0x%04x auth=%u rc=0x%x", slot_index, cccd.handle, auth_req, rc.GetValue());
+                if ((auth_req != BtdrvGattAuthReqType_NoMitm) || !ResultInsufficientAuthentication::Includes(rc) || (attempt >= 4) || events::IsSlotDisconnected(slot_index) || !events::IsRadioEnabled()) {
+                    break;
+                }
+                events::Pump(TimeSpan::FromSeconds(1));
+            }
+            R_TRY(rc);
+            R_RETURN(WaitForOperation(slot_index, conn_id, BtdrvGattOperationType_DescriptorWrite, GattCharReport, timeout, nullptr, out_gatt_status));
         }
 
         const BtdrvGattAttribute *FindCharacteristic(u32 slot_index, const BtdrvGattAttribute &service, u16 uuid16) {
@@ -155,18 +170,25 @@ namespace ams::ble::gatt {
             return nullptr;
         }
 
-        bool ReadCharacteristicBestEffort(u32 slot_index, u32 conn_id, u16 service_uuid, u16 char_uuid, u8 *out_data, size_t max_size, size_t *out_size) {
+        bool ReadCharacteristicBestEffort(u32 slot_index, u32 conn_id, u16 service_uuid, u16 char_uuid, u8 auth_req, u8 *out_data, size_t max_size, size_t *out_size, bool *out_timed_out = nullptr) {
+            if (out_timed_out) {
+                *out_timed_out = false;
+            }
             const auto *service = FindService(slot_index, service_uuid);
             if (!service) return false;
             const auto *chr = FindCharacteristic(slot_index, *service, char_uuid);
             if (!chr) return false;
 
-            const Result rc = btdrvReadGattCharacteristic(conn_id, service->is_primary, &service->id, &chr->id, BtdrvGattAuthReqType_NoMitm);
-            log::Write("btdrvReadGattCharacteristic(0x%04x) slot=%u handle=0x%04x rc=0x%x", char_uuid, slot_index, chr->handle, rc.GetValue());
+            const Result rc = btdrvReadGattCharacteristic(conn_id, service->is_primary, &service->id, &chr->id, auth_req);
+            log::Write("btdrvReadGattCharacteristic(0x%04x) slot=%u handle=0x%04x auth=%u rc=0x%x", char_uuid, slot_index, chr->handle, auth_req, rc.GetValue());
             if (R_FAILED(rc)) return false;
 
             EventRecord event = {};
-            if (R_FAILED(WaitForOperation(slot_index, conn_id, BtdrvGattOperationType_CharacteristicRead, char_uuid, TimeSpan::FromSeconds(2), &event))) {
+            const Result wait_rc = WaitForOperation(slot_index, conn_id, BtdrvGattOperationType_CharacteristicRead, char_uuid, TimeSpan::FromSeconds(2), &event);
+            if (R_FAILED(wait_rc)) {
+                if (out_timed_out && svc::ResultTimedOut::Includes(wait_rc)) {
+                    *out_timed_out = true;
+                }
                 return false;
             }
 
@@ -282,14 +304,14 @@ namespace ams::ble::gatt {
         return rediscovered;
     }
 
-    Result Subscribe(u32 slot_index, u32 conn_id, HidService *out) {
+    Result Subscribe(u32 slot_index, u32 conn_id, HidService *out, SubscribeAuthMode auth_mode) {
         if (slot_index >= MaxBleControllers) {
             R_THROW(svc::ResultInvalidArgument());
         }
 
         R_UNLESS(!events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled(), ResultNoConnection());
         if (!HasHidInputReport(slot_index)) {
-            // Called after CreateBond. Retry the cache query now that link
+            // Called after pairing/security setup. Retry the cache query now that link
             // setup/security has progressed, instead of disconnecting beforehand.
             Result rc = btdrvGetGattAttribute(g_slots[slot_index].table.address, conn_id);
             log::Write("btdrvGetGattAttribute after pairing slot=%u rc=0x%x", slot_index, rc.GetValue());
@@ -321,60 +343,56 @@ namespace ams::ble::gatt {
         out->output_report = {};
         out->has_output_report = false;
         out->output_write_with_response = false;
+        out->write_auth_req = (auth_mode == SubscribeAuthMode::StandardNoMitm)
+            ? static_cast<u8>(BtdrvGattAuthReqType_NoMitm)
+            : static_cast<u8>(BtdrvGattAuthReqType_None);
         out->vendor_id = 0;
         out->product_id = 0;
         out->has_pnp_id = false;
         std::memset(out->device_name, 0, sizeof(out->device_name));
 
-        // Authenticated reads request encryption (pairing first if needed).
-        // Skip long GattCharReportMap (0x2A4B) which precedes HID Information on Stadia
-        // and stalls BSA without completing; use short GattCharHidInformation (0x2A4A) only.
-        bool found_hid_info = false;
-        bool hid_info_timed_out = false;
-        for (size_t i = 0; i < count; ++i) {
-            const auto attr = s.table.attributes[i];
-            if ((attr.type != BtdrvGattAttributeType_Characteristic) || !IsWithinService(attr, service)) {
-                continue;
-            }
+        // Never issue another GATT op after a timeout on the same conn_id: bt_nso keeps the
+        // client channel busy (0x2a671 GATT_OPERATION_BUSY) until the timed-out op settles or disconnects.
+        if (auth_mode == SubscribeAuthMode::StandardNoMitm) {
+            // Authenticated reads request encryption (pairing first if needed).
+            // Skip long GattCharReportMap (0x2A4B); use short GattCharHidInformation (0x2A4A) only.
+            bool found_hid_info = false;
+            for (size_t i = 0; i < count; ++i) {
+                const auto attr = s.table.attributes[i];
+                if ((attr.type != BtdrvGattAttributeType_Characteristic) || !IsWithinService(attr, service)) {
+                    continue;
+                }
 
-            // The stack drops the link itself when encryption fails
-            R_UNLESS(!events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled(), ResultNoConnection());
+                // The stack drops the link itself when encryption fails
+                R_UNLESS(!events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled(), ResultNoConnection());
 
-            if (IsUuid16(attr.id.uuid, GattCharHidInformation)) {
-                found_hid_info = true;
-                Result rc;
-                for (int attempt = 0; ; ++attempt) {
-                    R_UNLESS(!events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled(), ResultNoConnection());
-                    rc = btdrvReadGattCharacteristic(conn_id, service.is_primary, &service.id, &attr.id, BtdrvGattAuthReqType_NoMitm);
-                    log::Write("btdrvReadGattCharacteristic slot=%u handle=0x%04x rc=0x%x", slot_index, attr.handle, rc.GetValue());
-                    // Refused locally while the pad's connection parameter update is in flight; it clears within a second or two
-                    if (!ResultInsufficientAuthentication::Includes(rc) || (attempt >= 4) || events::IsSlotDisconnected(slot_index)) {
-                        break;
+                if (IsUuid16(attr.id.uuid, GattCharHidInformation)) {
+                    found_hid_info = true;
+                    Result rc = ResultSuccess();
+                    for (int attempt = 0; ; ++attempt) {
+                        R_UNLESS(!events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled(), ResultNoConnection());
+                        rc = btdrvReadGattCharacteristic(conn_id, service.is_primary, &service.id, &attr.id, BtdrvGattAuthReqType_NoMitm);
+                        log::Write("btdrvReadGattCharacteristic slot=%u handle=0x%04x rc=0x%x", slot_index, attr.handle, rc.GetValue());
+                        // Refused locally while the pad's connection parameter update is in flight; it clears within a second or two
+                        if (!ResultInsufficientAuthentication::Includes(rc) || (attempt >= 4) || events::IsSlotDisconnected(slot_index) || !events::IsRadioEnabled()) {
+                            break;
+                        }
+                        events::Pump(TimeSpan::FromSeconds(1));
                     }
-                    events::Pump(TimeSpan::FromSeconds(1));
-                }
-                R_TRY(rc);
-                bool timed_out = false;
-                R_TRY(WaitForOperation(slot_index, conn_id, BtdrvGattOperationType_CharacteristicRead,
-                    GattCharHidInformation, TimeSpan::FromSeconds(2), nullptr, &timed_out));
-                if (timed_out) {
-                    hid_info_timed_out = true;
-                    log::Write("slot %u: HID Information read timed out on live link; continuing to CCCD", slot_index);
+                    R_TRY(rc);
+                    R_TRY(WaitForOperation(slot_index, conn_id, BtdrvGattOperationType_CharacteristicRead,
+                        GattCharHidInformation, TimeSpan::FromSeconds(5)));
                 }
             }
+            R_UNLESS(found_hid_info, svc::ResultNotFound());
         }
-        R_UNLESS(found_hid_info, svc::ResultNotFound());
 
-        Result result = svc::ResultNotFound();
+        // First scan writable Report characteristics for rumble output without sending any GATT traffic.
         for (size_t i = 0; i < count; ++i) {
             const auto attr = s.table.attributes[i];
             if ((attr.type != BtdrvGattAttributeType_Characteristic) || !IsWithinService(attr, service) || !IsUuid16(attr.id.uuid, GattCharReport)) {
                 continue;
             }
-
-            R_UNLESS(!events::IsSlotDisconnected(slot_index), ResultNoConnection());
-
-            // Rumble goes to the writable Report; prefer a non-Notify output Report characteristic when multiple exist.
             if (attr.property & (BtdrvGattCharacteristicProperty_Write | BtdrvGattCharacteristicProperty_WriteNoResponse)) {
                 const bool is_non_notify = (attr.property & BtdrvGattCharacteristicProperty_Notify) == 0;
                 const bool current_is_notify = out->has_output_report && ((out->output_report.property & BtdrvGattCharacteristicProperty_Notify) != 0);
@@ -384,7 +402,18 @@ namespace ams::ble::gatt {
                     out->output_write_with_response = (attr.property & BtdrvGattCharacteristicProperty_WriteNoResponse) == 0;
                 }
             }
+        }
 
+        u8 active_auth = (auth_mode == SubscribeAuthMode::StandardNoMitm)
+            ? static_cast<u8>(BtdrvGattAuthReqType_NoMitm)
+            : static_cast<u8>(BtdrvGattAuthReqType_None);
+
+        Result result = svc::ResultNotFound();
+        for (size_t i = 0; i < count; ++i) {
+            const auto attr = s.table.attributes[i];
+            if ((attr.type != BtdrvGattAttributeType_Characteristic) || !IsWithinService(attr, service) || !IsUuid16(attr.id.uuid, GattCharReport)) {
+                continue;
+            }
             if (!(attr.property & BtdrvGattCharacteristicProperty_Notify)) {
                 continue;
             }
@@ -394,39 +423,50 @@ namespace ams::ble::gatt {
                 continue;
             }
 
+            R_UNLESS(!events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled(), ResultNoConnection());
+
             Result rc = btdrvRegisterGattNotification(conn_id, service.is_primary, &service.id, &attr.id);
             log::Write("btdrvRegisterGattNotification slot=%u handle=0x%04x rc=0x%x", slot_index, attr.handle, rc.GetValue());
-
             R_TRY(rc);
 
-            const u8 enable_notifications[2] = { 0x01, 0x00 };
-            rc = btdrvWriteGattDescriptor(conn_id, service.is_primary, &service.id, &attr.id, &cccd->id, enable_notifications, sizeof(enable_notifications), BtdrvGattAuthReqType_NoMitm);
-            log::Write("btdrvWriteGattDescriptor(CCCD) slot=%u handle=0x%04x rc=0x%x", slot_index, cccd->handle, rc.GetValue());
-            R_TRY(rc);
-            bool cccd_timed_out = false;
-            R_TRY(WaitForOperation(slot_index, conn_id, BtdrvGattOperationType_DescriptorWrite, GattCharReport, TimeSpan::FromSeconds(2), nullptr, &cccd_timed_out));
-            if (cccd_timed_out) {
-                log::Write("slot %u: CCCD write timed out on live link; continuing", slot_index);
+            u32 gatt_status = 0;
+            const TimeSpan initial_timeout = (auth_mode == SubscribeAuthMode::PlainThenNoMitm && active_auth == BtdrvGattAuthReqType_None)
+                ? TimeSpan::FromSeconds(3)
+                : (active_auth == BtdrvGattAuthReqType_NoMitm && auth_mode == SubscribeAuthMode::PlainThenNoMitm)
+                    ? TimeSpan::FromSeconds(8)
+                    : TimeSpan::FromSeconds(5);
+
+            rc = WriteCccdWithAuth(slot_index, conn_id, service, attr, *cccd, active_auth, initial_timeout, &gatt_status);
+            if (R_FAILED(rc) && (auth_mode == SubscribeAuthMode::PlainThenNoMitm) &&
+                (active_auth == BtdrvGattAuthReqType_None) && (gatt_status != 0) &&
+                !events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled()) {
+                // ATT Error Response resets bt_nso GATT channel back to IDLE (6), so escalating to
+                // NoMitm here safely triggers BTM_SetEncryption(sec_act=2) -> SMP_Pair without 0x2a671 BUSY.
+                log::Write("slot %u: plaintext CCCD returned ATT status=%u (GATT IDLE); escalating to NoMitm on-demand SMP", slot_index, gatt_status);
+                active_auth = BtdrvGattAuthReqType_NoMitm;
+                rc = WriteCccdWithAuth(slot_index, conn_id, service, attr, *cccd, active_auth, TimeSpan::FromSeconds(8));
             }
+            R_TRY(rc);
+
+            out->write_auth_req = active_auth;
             result = ResultSuccess();
         }
 
         if (R_SUCCEEDED(result)) {
-            if (!hid_info_timed_out) {
-                // Best-effort device identification (PnP ID / GAP Device Name); failure does not abort setup.
-                u8 pnp_buf[16] = {};
-                size_t pnp_len = 0;
-                if (ReadCharacteristicBestEffort(slot_index, conn_id, GattServiceDeviceInfo, GattCharPnpId, pnp_buf, sizeof(pnp_buf), &pnp_len) && pnp_len >= 7) {
-                    out->vendor_id = static_cast<u16>(pnp_buf[1] | (pnp_buf[2] << 8));
-                    out->product_id = static_cast<u16>(pnp_buf[3] | (pnp_buf[4] << 8));
-                    out->has_pnp_id = true;
-                    log::Write("slot %u: PnP ID vid=0x%04x pid=0x%04x", slot_index, out->vendor_id, out->product_id);
-                } else if (ReadCharacteristicBestEffort(slot_index, conn_id, GattServiceGap, GattCharDeviceName, reinterpret_cast<u8 *>(out->device_name), sizeof(out->device_name) - 1, &pnp_len)) {
-                    out->device_name[std::min(pnp_len, sizeof(out->device_name) - 1)] = '\0';
-                    log::Write("slot %u: GAP device name='%s'", slot_index, out->device_name);
-                }
-            } else {
-                log::Write("slot %u: skipping PnP/name reads after HID Info timeout", slot_index);
+            // Best-effort device identification (PnP ID / GAP Device Name); failure does not abort setup.
+            // Stop immediately if a read times out so we never follow a timed-out op with another GATT request.
+            u8 pnp_buf[16] = {};
+            size_t pnp_len = 0;
+            bool read_timed_out = false;
+            if (ReadCharacteristicBestEffort(slot_index, conn_id, GattServiceDeviceInfo, GattCharPnpId, out->write_auth_req, pnp_buf, sizeof(pnp_buf), &pnp_len, &read_timed_out) && pnp_len >= 7) {
+                out->vendor_id = static_cast<u16>(pnp_buf[1] | (pnp_buf[2] << 8));
+                out->product_id = static_cast<u16>(pnp_buf[3] | (pnp_buf[4] << 8));
+                out->has_pnp_id = true;
+                log::Write("slot %u: PnP ID vid=0x%04x pid=0x%04x", slot_index, out->vendor_id, out->product_id);
+            } else if (!read_timed_out && !events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled() &&
+                       ReadCharacteristicBestEffort(slot_index, conn_id, GattServiceGap, GattCharDeviceName, out->write_auth_req, reinterpret_cast<u8 *>(out->device_name), sizeof(out->device_name) - 1, &pnp_len, &read_timed_out)) {
+                out->device_name[std::min(pnp_len, sizeof(out->device_name) - 1)] = '\0';
+                log::Write("slot %u: GAP device name='%s'", slot_index, out->device_name);
             }
             R_UNLESS(!events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled(), ResultNoConnection());
         }

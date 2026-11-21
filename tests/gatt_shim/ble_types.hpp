@@ -15,7 +15,10 @@ struct Result { int value; int GetValue() const { return value; } };
 inline Result ResultSuccess() { return {0}; }
 namespace svc {
 inline Result ResultInvalidArgument() { return {1}; }
-inline Result ResultTimedOut() { return {2}; }
+struct ResultTimedOut : Result {
+    ResultTimedOut() : Result{2} {}
+    static bool Includes(Result r) { return r.value == 2; }
+};
 inline Result ResultNotFound() { return {3}; }
 inline Result ResultInvalidState() { return {8}; }
 }
@@ -36,6 +39,7 @@ constexpr int BtdrvGattAttributeType_Descriptor = 3;
 constexpr int BtdrvGattCharacteristicProperty_Notify = 1;
 constexpr int BtdrvGattCharacteristicProperty_Write = 2;
 constexpr int BtdrvGattCharacteristicProperty_WriteNoResponse = 4;
+constexpr int BtdrvGattAuthReqType_None = 0;
 constexpr int BtdrvGattAuthReqType_NoMitm = 1;
 constexpr int BtdrvGattOperationType_CharacteristicRead = 0;
 constexpr int BtdrvGattOperationType_DescriptorWrite = 3;

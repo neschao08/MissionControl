@@ -45,6 +45,8 @@ namespace ams::ble::events {
         os::Event g_radio_event(os::EventClearMode_ManualClear);
         os::Event g_sleep_prepared_event(os::EventClearMode_ManualClear);
         std::atomic<bool> g_controller_count_changed{false};
+        std::atomic<u64> g_input_report_count{0};
+        std::atomic<u64> g_slot_input_report_counts[MaxBleControllers] = {};
 
         /* Guarded by g_lock */
         constinit bool g_active = false;
@@ -144,6 +146,18 @@ namespace ams::ble::events {
                 g_ring_write = next;
             }
             g_ring_event.Signal();
+        }
+
+        u8 GetClientIfForSlotLocked(u32 slot) {
+            if (g_client_if_count == 0) {
+                return g_spare_client_if;
+            }
+            // Allocate from highest registered client_if downward (e.g. 6, 5, 4, 3)
+            // to stay clear of btm's primary client_if=3.
+            if (slot < g_client_if_count) {
+                return g_available_client_ifs[g_client_if_count - 1 - slot];
+            }
+            return g_available_client_ifs[g_client_if_count - 1];
         }
 
     }
@@ -282,120 +296,179 @@ namespace ams::ble::events {
         return g_routes.Find(conn_id);
     }
 
-    bool OnBleEvent(bluetooth::BleEventType type, const bluetooth::BleEventInfo *info) {
-        std::scoped_lock lk(g_lock);
-
-        if (!g_active) {
-            return false;
+    u64 GetSlotInputReportCount(u32 slot) {
+        if (slot >= MaxBleControllers) {
+            return 0;
         }
+        return g_slot_input_report_counts[slot].load(std::memory_order_acquire);
+    }
 
+    void NoteReceivedInputReport(const char *path, u32 conn_id, const u8 *data, size_t size) {
+        const u32 slot = FindSlotByConnId(conn_id);
+        if (slot < MaxBleControllers) {
+            g_slot_input_report_counts[slot].fetch_add(1, std::memory_order_acq_rel);
+        }
+        const u64 seq = g_input_report_count.fetch_add(1, std::memory_order_acq_rel) + 1;
+        if (seq <= 3 && log::IsEnabled()) {
+            const u8 b0 = size > 0 ? data[0] : 0;
+            const u8 b1 = size > 1 ? data[1] : 0;
+            const u8 b2 = size > 2 ? data[2] : 0;
+            const u8 b3 = size > 3 ? data[3] : 0;
+            log::Write("ble input #%llu [%s] conn_id=%u len=%zu head=%02x %02x %02x %02x",
+                static_cast<unsigned long long>(seq), path, conn_id, size, b0, b1, b2, b3);
+        }
+    }
+
+    bool OnBleEvent(bluetooth::BleEventType type, const bluetooth::BleEventInfo *info) {
         bool ours = false;
-        if (g_owns_ble) {
-            switch (type) {
-                case BtdrvBleEventType_ClientRegistration:
-                case BtdrvBleEventType_ServerRegistration:
-                    ours = g_registering;
-                    if (type == BtdrvBleEventType_ClientRegistration) {
-                        const u8 cif = info->client_registration.client_if;
-                        if ((info->client_registration.result == 0) && (info->client_registration.status == 1)) {
-                            ++g_client_registration_generation;
-                            g_spare_client_if = cif;
-                            bool found = false;
-                            for (size_t i = 0; i < g_client_if_count; ++i) {
-                                if (g_available_client_ifs[i] == cif) {
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            if (!found && (g_client_if_count < MaxClientIfs)) {
-                                g_available_client_ifs[g_client_if_count++] = cif;
-                            }
-                        } else if (info->client_registration.status == 0) {
-                            if (cif == InvalidClientIf) {
-                                g_client_if_count = 0;
-                                g_spare_client_if = InvalidClientIf;
-                                for (size_t i = 0; i < MaxClientIfs; ++i) {
-                                    g_available_client_ifs[i] = InvalidClientIf;
-                                }
-                            } else {
+        bool is_input_report_notify = false;
+        {
+            std::scoped_lock lk(g_lock);
+
+            if (!g_active) {
+                return false;
+            }
+
+            if (g_owns_ble) {
+                switch (type) {
+                    case BtdrvBleEventType_ClientRegistration:
+                    case BtdrvBleEventType_ServerRegistration:
+                        ours = g_registering;
+                        if (type == BtdrvBleEventType_ClientRegistration) {
+                            const u8 cif = info->client_registration.client_if;
+                            if ((info->client_registration.result == 0) && (info->client_registration.status == 1)) {
+                                ++g_client_registration_generation;
+                                g_spare_client_if = cif;
+                                bool found = false;
                                 for (size_t i = 0; i < g_client_if_count; ++i) {
                                     if (g_available_client_ifs[i] == cif) {
-                                        for (size_t j = i; j + 1 < g_client_if_count; ++j) {
-                                            g_available_client_ifs[j] = g_available_client_ifs[j + 1];
-                                        }
-                                        g_available_client_ifs[--g_client_if_count] = InvalidClientIf;
+                                        found = true;
                                         break;
+                                    }
+                                }
+                                if (!found && (g_client_if_count < MaxClientIfs)) {
+                                    g_available_client_ifs[g_client_if_count++] = cif;
+                                }
+                            } else if (info->client_registration.status == 0) {
+                                if (cif == InvalidClientIf) {
+                                    g_client_if_count = 0;
+                                    g_spare_client_if = InvalidClientIf;
+                                    for (size_t i = 0; i < MaxClientIfs; ++i) {
+                                        g_available_client_ifs[i] = InvalidClientIf;
+                                    }
+                                } else {
+                                    for (size_t i = 0; i < g_client_if_count; ++i) {
+                                        if (g_available_client_ifs[i] == cif) {
+                                            for (size_t j = i; j + 1 < g_client_if_count; ++j) {
+                                                g_available_client_ifs[j] = g_available_client_ifs[j + 1];
+                                            }
+                                            g_available_client_ifs[--g_client_if_count] = InvalidClientIf;
+                                            break;
+                                        }
                                     }
                                 }
                             }
                         }
+                        break;
+                    case BtdrvBleEventType_ScanResult:
+                        ours = g_scanning;
+                        break;
+                    case BtdrvBleEventType_ScanFilter:
+                        ours = g_expected_filter_events > 0;
+                        if (ours) {
+                            --g_expected_filter_events;
+                        } else if (info->scan_filter.result != 0) {
+                            return false;
+                        }
+                        break;
+                    default:
+                        ours = IsConnectionFamily(type);
+                        break;
+                }
+            }
+
+            if (type == BtdrvBleEventType_ClientConnection) {
+                auto &connection = info->client_connection;
+                const bool connected = (connection.result == 0) && (connection.status == BleConnectionStatus_Connected);
+                if (!connected && g_adopted && connection.conn_id == g_adopted_conn_id) g_adopted = false;
+
+                if (!connected && (connection.conn_id == InvalidConnId) && (connection.client_if == InvalidClientIf)) {
+                    // Stack-wide BLE teardown/reset (e.g. result=55 status=2 client_if=255 conn_id=0xFFFFFFFF)
+                    for (size_t s = 0; s < MaxBleControllers; ++s) {
+                        if (g_slots[s].active) {
+                            g_slots[s].disconnected = true;
+                            g_slots[s].disconnect_reason = connection.reason ? connection.reason : connection.result;
+                            UnregisterSlotController(static_cast<u32>(s));
+                        }
                     }
-                    break;
-                case BtdrvBleEventType_ScanResult:
-                    ours = g_scanning;
-                    break;
-                case BtdrvBleEventType_ScanFilter:
-                    ours = g_expected_filter_events > 0;
-                    if (ours) {
-                        --g_expected_filter_events;
-                    } else if (info->scan_filter.result != 0) {
-                        return false;
+                    g_adopted = false;
+                } else {
+                    u32 slot = FindSlotByAddressInternal(connection.address);
+                    if (slot == InvalidSlot) {
+                        slot = FindSlotByConnIdInternal(connection.conn_id);
                     }
-                    break;
-                default:
-                    ours = IsConnectionFamily(type);
-                    break;
+
+                    if (slot != InvalidSlot) {
+                        if (!connected && ((g_slots[slot].conn_id == InvalidConnId) || (connection.conn_id == g_slots[slot].conn_id))) {
+                            g_slots[slot].disconnected = true;
+                            g_slots[slot].disconnect_reason = connection.reason;
+                            UnregisterSlotController(slot);
+                        } else if (connected) {
+                            g_slots[slot].conn_id = connection.conn_id;
+                            g_slots[slot].connecting = false;
+                            g_slots[slot].disconnected = false;
+                        }
+                    }
+
+                    if (ours && connected && (slot == InvalidSlot) && g_have_attempted && AddressEqual(connection.address, g_attempted)) {
+                        g_adopted = true;
+                        g_adopted_address = connection.address;
+                        g_adopted_conn_id = connection.conn_id;
+                    }
+                }
+            }
+
+            if (type == BtdrvBleEventType_ConnectionUpdate) {
+                auto &cu = info->connection_update;
+                profile::RecordConnectionUpdate(cu.conn_interval, cu.conn_latency, cu.supervision_tout);
+            }
+
+            if (ours && (type == BtdrvBleEventType_ClientNotify)) {
+                const auto &notify = info->client_notify;
+                // Swallow asynchronous rumble CharacteristicWrite completions on Report (0x2A4D)
+                // so high-frequency Write-With-Response rumble acks (e.g. Stadia handle 0x0044)
+                // never overflow the 64-entry control ring and drop disconnect events.
+                if ((notify.op_type == GattNotifyType_WriteCharacteristic) && IsUuid16(notify.char_uuid, GattCharReport)) {
+                    return true;
+                }
+                if ((notify.op_type == GattNotifyType_Notification) && (notify.result == 0) && IsUuid16(notify.char_uuid, GattCharReport)) {
+                    is_input_report_notify = true;
+                }
+            }
+
+            if (!is_input_report_notify) {
+                EnqueueRecordLocked(type, !ours, info);
+                return ours;
             }
         }
 
-        if (type == BtdrvBleEventType_ClientConnection) {
-            auto &connection = info->client_connection;
-            const bool connected = (connection.result == 0) && (connection.status == BleConnectionStatus_Connected);
-            if (!connected && g_adopted && connection.conn_id == g_adopted_conn_id) g_adopted = false;
-
-            if (!connected && (connection.conn_id == InvalidConnId) && (connection.client_if == InvalidClientIf)) {
-                // Stack-wide BLE teardown/reset (e.g. result=55 status=2 client_if=255 conn_id=0xFFFFFFFF)
-                for (size_t s = 0; s < MaxBleControllers; ++s) {
-                    if (g_slots[s].active) {
-                        g_slots[s].disconnected = true;
-                        g_slots[s].disconnect_reason = connection.reason ? connection.reason : connection.result;
-                        UnregisterSlotController(static_cast<u32>(s));
-                    }
-                }
-                g_adopted = false;
-            } else {
-                u32 slot = FindSlotByAddressInternal(connection.address);
-                if (slot == InvalidSlot) {
-                    slot = FindSlotByConnIdInternal(connection.conn_id);
-                }
-
-                if (slot != InvalidSlot) {
-                    if (!connected && ((g_slots[slot].conn_id == InvalidConnId) || (connection.conn_id == g_slots[slot].conn_id))) {
-                        g_slots[slot].disconnected = true;
-                        g_slots[slot].disconnect_reason = connection.reason;
-                        UnregisterSlotController(slot);
-                    } else if (connected) {
-                        g_slots[slot].conn_id = connection.conn_id;
-                        g_slots[slot].connecting = false;
-                        g_slots[slot].disconnected = false;
-                    }
-                }
-
-                if (ours && connected && (slot == InvalidSlot) && g_have_attempted && AddressEqual(connection.address, g_attempted)) {
-                    g_adopted = true;
-                    g_adopted_address = connection.address;
-                    g_adopted_conn_id = connection.conn_id;
-                }
-            }
+        // Fast-path fallback: if HID Report notifications arrive on the managed BLE stream
+        // instead of the dedicated LE HID data path, dispatch directly outside g_lock to avoid
+        // lock inversion and prevent 100Hz reports from overflowing the 64-entry control ring.
+        const auto &notify = info->client_notify;
+        if (auto controller = GetActiveController(notify.conn_id)) {
+            const size_t report_len = std::min<size_t>(notify.size, sizeof(notify.data));
+            NoteReceivedInputReport("managed", notify.conn_id, notify.data, report_len);
+            const u64 start_tick = profile::RecordReportStart();
+            static_cast<void>(controller->HandleBleInputReport(notify.data, report_len));
+            profile::RecordReportEnd(start_tick);
+            return true;
         }
 
-        if (type == BtdrvBleEventType_ConnectionUpdate) {
-            auto &cu = info->connection_update;
-            profile::RecordConnectionUpdate(cu.conn_interval, cu.conn_latency, cu.supervision_tout);
-        }
-
+        // Controller not yet presented (e.g. first notification arriving while Subscribe waits for CCCD):
+        // queue into the control ring so Subscribe can accept it as confirmation.
+        std::scoped_lock lk(g_lock);
         EnqueueRecordLocked(type, !ours, info);
-
         return ours;
     }
 
@@ -470,7 +543,9 @@ namespace ams::ble::events {
 
         if (type == BtdrvEventType_Connection) {
             auto &connection = info->connection.v12;
-            log::Write("slot %u: core connection type=%u", matched_slot, connection.type);
+            log::Write("slot %u: core connection type=%u extra=%02x%02x%02x%02x",
+                matched_slot, connection.type,
+                connection.reserved[0], connection.reserved[1], connection.reserved[2], connection.reserved[3]);
             if (connection.type == CoreConnectionType_Suspended) {
                 std::scoped_lock lk(g_lock);
                 if (matched_slot != InvalidSlot) {
@@ -632,9 +707,7 @@ namespace ams::ble::events {
             return {g_adopted, InvalidClientIf, g_adopted_conn_id, g_adopted_address};
         }
         const auto &link = g_slots[slot];
-        const u8 client_if = slot < g_client_if_count ? g_available_client_ifs[slot] :
-            g_client_if_count > 0 ? g_available_client_ifs[0] : g_spare_client_if;
-        return {link.active && !link.disconnected, client_if, link.conn_id, link.address};
+        return {link.active && !link.disconnected, GetClientIfForSlotLocked(slot), link.conn_id, link.address};
     }
 
     void WaitForSleepPreparation() {
@@ -670,10 +743,7 @@ namespace ams::ble::events {
 
     u8 GetClientIfForSlot(u32 slot) {
         std::scoped_lock lk(g_lock);
-        if (slot < g_client_if_count) {
-            return g_available_client_ifs[slot];
-        }
-        return (g_client_if_count > 0) ? g_available_client_ifs[0] : g_spare_client_if;
+        return GetClientIfForSlotLocked(slot);
     }
 
     u32 GetClientRegistrationGeneration() {
@@ -779,8 +849,10 @@ namespace ams::ble::events {
             case BtdrvBleEventType_ClientNotify: {
                 auto &notify = info.client_notify;
                 char chr[0x40];
+                char desc[0x40];
                 FormatUuid(notify.char_uuid, chr, sizeof(chr));
-                log::Write("evt ClientNotify result=%u conn_id=%u type=%u char=%s size=%u", notify.result, notify.conn_id, notify.op_type, chr, notify.size);
+                FormatUuid(notify.desc_uuid, desc, sizeof(desc));
+                log::Write("evt ClientNotify result=%u conn_id=%u type=%u char=%s desc=%s size=%u", notify.result, notify.conn_id, notify.op_type, chr, desc, notify.size);
                 break;
             }
             case BtdrvBleEventType_ClientCacheSave:

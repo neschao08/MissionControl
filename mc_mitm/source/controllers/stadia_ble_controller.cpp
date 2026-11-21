@@ -111,7 +111,9 @@ namespace ams::controller {
             R_SUCCEED();
         }
 
-        constexpr s64 MinRumbleIntervalNs                  = TimeSpan::FromMilliSeconds(32).GetNanoSeconds();
+        const s64 min_single_interval_ns = m_output_write_with_response
+            ? TimeSpan::FromMilliSeconds(48).GetNanoSeconds()
+            : TimeSpan::FromMilliSeconds(32).GetNanoSeconds();
         constexpr s64 MultiControllerMinRumbleIntervalNs   = TimeSpan::FromMilliSeconds(64).GetNanoSeconds();
         constexpr s64 HeavyMultiControllerRumbleIntervalNs = TimeSpan::FromMilliSeconds(96).GetNanoSeconds();
 
@@ -143,7 +145,7 @@ namespace ams::controller {
             const size_t total_controllers = controller::GetConnectedControllerCount();
             const s64 min_rumble_interval_ns = (total_controllers >= 4) ? HeavyMultiControllerRumbleIntervalNs
                                              : (total_controllers >= 2) ? MultiControllerMinRumbleIntervalNs
-                                             : MinRumbleIntervalNs;
+                                             : min_single_interval_ns;
             if (elapsed_ns < min_rumble_interval_ns) {
                 R_SUCCEED();
             }
@@ -154,7 +156,16 @@ namespace ams::controller {
         report.output0x05.strong_magnitude = strong;
         report.output0x05.weak_magnitude   = weak;
 
-        R_TRY(this->WriteDataReport(&report, sizeof(stadia::StadiaOutputReport0x05) + 1));
+        const Result rc = this->WriteDataReport(&report, sizeof(stadia::StadiaOutputReport0x05) + 1);
+        if (R_FAILED(rc)) {
+            // On transient GATT BUSY (0x2a671) during Write-With-Response rumble:
+            // back off non-stop updates to avoid hammering the GATT channel, while leaving
+            // m_last_rumble_* non-zero on stop failures so the next frame retries stop.
+            if (!is_stop) {
+                m_last_rumble_tick = now_tick;
+            }
+            R_RETURN(rc);
+        }
         m_last_rumble_strong = strong;
         m_last_rumble_weak   = weak;
         m_last_rumble_tick   = now_tick;
@@ -168,7 +179,7 @@ namespace ams::controller {
         }
         R_UNLESS(size >= 1, svc::ResultInvalidSize());
         const u8 *data = static_cast<const u8 *>(report_buffer);
-        R_RETURN(btdrvWriteGattCharacteristic(m_conn_id, m_service_primary, &m_service_id, &m_output_report_id, &data[1], size - 1, BtdrvGattAuthReqType_NoMitm, m_output_write_with_response));
+        R_RETURN(btdrvWriteGattCharacteristic(m_conn_id, m_service_primary, &m_service_id, &m_output_report_id, &data[1], size - 1, static_cast<BtdrvGattAuthReqType>(m_write_auth_req), m_output_write_with_response));
     }
 
 }

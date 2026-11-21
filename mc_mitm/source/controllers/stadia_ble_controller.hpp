@@ -32,14 +32,15 @@ namespace ams::controller {
                 {stadia::VendorId, stadia::ProductId},
             };
 
-            StadiaBleController(bluetooth::Address address, u32 conn_id, const BtdrvGattId &service_id, bool service_primary, const BtdrvGattId &output_report_id, bool has_output_report = true, bool output_write_with_response = true)
+            StadiaBleController(bluetooth::Address address, u32 conn_id, const BtdrvGattId &service_id, bool service_primary, const BtdrvGattId &output_report_id, bool has_output_report = true, bool output_write_with_response = true, u8 write_auth_req = BtdrvGattAuthReqType_NoMitm)
             : EmulatedSwitchController(address, {stadia::VendorId, stadia::ProductId})
             , m_conn_id(conn_id)
             , m_service_id(service_id)
             , m_service_primary(service_primary)
             , m_output_report_id(output_report_id)
             , m_has_output_report(has_output_report)
-            , m_output_write_with_response(output_write_with_response) { }
+            , m_output_write_with_response(output_write_with_response)
+            , m_write_auth_req(write_auth_req) { }
 
             Result HandleBleInputReport(const u8 *data, size_t size) override;
             Result HandleOutputDataReport(const u8 *report_buffer, size_t size) override;
@@ -59,6 +60,7 @@ namespace ams::controller {
             BtdrvGattId m_output_report_id;
             bool m_has_output_report;
             bool m_output_write_with_response;
+            u8 m_write_auth_req;
             bool m_connected = true;
 
             u16 m_last_rumble_strong = 0;

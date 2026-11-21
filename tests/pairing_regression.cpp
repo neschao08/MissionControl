@@ -3,9 +3,11 @@
 #include <iostream>
 using namespace ams::ble;
 static constexpr ams::bluetooth::Address Target = {{0x14,0xcb,0x65,0xe8,0x2b,0xe2}};
-static unsigned removes, connects, cancels, bond_cancels, bonds;
+static unsigned removes, ext_removes, connects, cancels, bond_cancels, bonds, set_encryptions;
 static u64 connected_at;
-static bool remove_fails, cancel_bond_fails, connect_fails, respond, late_connection, new_bond, bond_fails;
+static bool remove_fails, ext_remove_fails, cancel_bond_fails, connect_fails, respond, late_connection, new_bond, bond_fails;
+static u32 set_encryption_raw_rc;
+static bool set_encryption_emits_bond;
 static bool callback_on_bond_cancel, radio_off_on_bond_cancel;
 static Result Connect() {
     u32 conn_id = InvalidConnId;
@@ -49,12 +51,25 @@ Result btdrvCreateBond(ams::bluetooth::Address addr, u32 transport) {
     if (new_bond) events::Schedule(events::Bond, 100);
     return {bond_fails ? 7u : 0u};
 }
+Result btdrvextSecRemoveDevice(ams::bluetooth::Address addr) {
+    assert(AddressEqual(addr, Target));
+    ++ext_removes;
+    return {ext_remove_fails ? 99u : 0u};
+}
+Result btdrvextSetEncryption(ams::bluetooth::Address addr, u8 transport, u8 sec_act) {
+    assert(AddressEqual(addr, Target) && transport == 2 && sec_act == 2 && events::radio && !events::disconnected);
+    ++set_encryptions;
+    if (set_encryption_emits_bond) events::Schedule(events::Bond, 250);
+    return {set_encryption_raw_rc};
+}
 static void Reset() {
     events::queue.clear(); events::now_ms = 0;
     events::radio = true;
     events::SetSlotConnecting(0, Target);
-    removes = connects = cancels = bond_cancels = bonds = 0; connected_at = 0;
-    remove_fails = cancel_bond_fails = connect_fails = late_connection = bond_fails = false;
+    removes = ext_removes = connects = cancels = bond_cancels = bonds = set_encryptions = 0; connected_at = 0;
+    remove_fails = ext_remove_fails = cancel_bond_fails = connect_fails = late_connection = bond_fails = false;
+    set_encryption_raw_rc = 0;
+    set_encryption_emits_bond = false;
     callback_on_bond_cancel = radio_off_on_bond_cancel = false;
     respond = new_bond = true;
 }
@@ -146,6 +161,47 @@ int main() {
     events::Schedule(BtdrvBleEventType_ClientConnection, 200, refused);
     assert(!pairing::PrepareSecurity(0, Target));
     assert(bonds == 1 && events::now_ms == 200);
+
+    // Best-effort IPS BSA_SecRemoveDevice (cmd 4) runs in Connect & ClearPeer without aborting on error
+    Reset(); ext_remove_fails = true;
+    assert(R_SUCCEEDED(Connect()));
+    assert(removes == 1 && ext_removes == 1 && connects == 1);
+    Reset(); ext_remove_fails = true;
+    assert(R_SUCCEEDED(pairing::ClearPeer(0, Target)));
+    assert(bond_cancels == 1 && removes == 1 && ext_removes == 1);
+
+    // Strategy 0: GattOnDemand succeeds immediately without calling CreateBond or SetEncryption
+    Reset(); events::bond = true;
+    assert(pairing::PrepareSecurityWithStrategy(0, Target, pairing::SecurityStrategy::GattOnDemand));
+    assert(bonds == 0 && set_encryptions == 0 && !events::bond && events::now_ms == 0);
+    Reset(); events::disconnected = true;
+    assert(!pairing::PrepareSecurityWithStrategy(0, Target, pairing::SecurityStrategy::GattOnDemand));
+    Reset(); events::radio = false;
+    assert(!pairing::PrepareSecurityWithStrategy(0, Target, pairing::SecurityStrategy::GattOnDemand));
+
+    // Strategy 1: DirectSetEncryption ignores non-zero residual w0 return value from void BTA_DmSetEncryption
+    Reset(); set_encryption_raw_rc = 0xDEADBEEF;
+    assert(pairing::PrepareSecurityWithStrategy(0, Target, pairing::SecurityStrategy::DirectSetEncryption));
+    assert(bonds == 0 && set_encryptions == 1 && events::now_ms == 1500);
+
+    // DirectSetEncryption with bond event settles 500ms after event
+    Reset(); set_encryption_raw_rc = 0x123456; set_encryption_emits_bond = true;
+    assert(pairing::PrepareSecurityWithStrategy(0, Target, pairing::SecurityStrategy::DirectSetEncryption));
+    assert(bonds == 0 && set_encryptions == 1 && events::now_ms == 750);
+
+    // DirectSetEncryption aborts immediately on disconnect or sleep
+    Reset(); set_encryption_raw_rc = 0x42;
+    events::Schedule(BtdrvBleEventType_ClientConnection, 180, refused);
+    assert(!pairing::PrepareSecurityWithStrategy(0, Target, pairing::SecurityStrategy::DirectSetEncryption));
+    assert(set_encryptions == 1 && events::now_ms == 180);
+    Reset(); events::Schedule(events::Sleep, 120);
+    assert(!pairing::PrepareSecurityWithStrategy(0, Target, pairing::SecurityStrategy::DirectSetEncryption));
+    assert(set_encryptions == 1 && events::now_ms == 120);
+
+    // Strategy 2: CreateBond delegates directly to PrepareSecurity
+    Reset();
+    assert(pairing::PrepareSecurityWithStrategy(0, Target, pairing::SecurityStrategy::CreateBond));
+    assert(bonds == 1 && set_encryptions == 0 && events::now_ms == 600);
 
     std::cout << "BLE production reconnect/pairing regressions passed\n";
 }

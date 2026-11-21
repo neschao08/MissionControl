@@ -17,6 +17,7 @@
 #include <switch.h>
 #include <stratosphere.hpp>
 #include "../bluetooth_mitm/bluetooth/bluetooth_types.hpp"
+#include "../bluetooth_mitm/btdrv_ext.h"
 
 namespace ams::ble {
 

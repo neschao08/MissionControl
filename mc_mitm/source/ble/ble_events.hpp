@@ -64,6 +64,8 @@ namespace ams::ble::events {
     void RegisterSlotController(u32 slot, u32 conn_id, std::shared_ptr<controller::EmulatedSwitchController> ctrl);
     void UnregisterSlotController(u32 slot);
     std::shared_ptr<controller::EmulatedSwitchController> GetActiveController(u32 conn_id);
+    u64 GetSlotInputReportCount(u32 slot);
+    void NoteReceivedInputReport(const char *path, u32 conn_id, const u8 *data, size_t size);
 
     u16 GetTargetMaxConnectionInterval(size_t active_count);
     u16 RequestLowLatencyConnectionParameters(const bluetooth::Address &address, size_t active_count = 0);

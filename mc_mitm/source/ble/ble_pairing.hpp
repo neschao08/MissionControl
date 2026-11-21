@@ -17,8 +17,15 @@
 #include "ble_types.hpp"
 
 namespace ams::ble::pairing {
+    enum class SecurityStrategy : u8 {
+        CreateBond,
+        GattOnDemand,
+        DirectSetEncryption,
+    };
+
     Result Connect(u32 slot, u8 client_if, const bluetooth::Address &address, u32 *out_conn_id, TimeSpan timeout);
     Result ClearPeer(u32 slot, const bluetooth::Address &address);
     // A fresh security indication only permits Subscribe to verify authenticated GATT access.
     bool PrepareSecurity(u32 slot, const bluetooth::Address &address);
+    bool PrepareSecurityWithStrategy(u32 slot, const bluetooth::Address &address, SecurityStrategy strategy);
 }

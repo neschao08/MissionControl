@@ -52,27 +52,77 @@ namespace ams::ble {
         u32 g_hid_data_path_generation = UINT32_MAX;
 
         constexpr s64 PairingRetryBackoffMs = 5000;
+        constexpr s64 StadiaRetryBackoffMs  = 1500;
+        constexpr u8  StadiaStrategyCount   = 3;
+
         struct PairingFailure {
             bluetooth::Address address = {};
             s64 tick = 0;
+            s64 backoff_ms = PairingRetryBackoffMs;
         };
         PairingFailure g_pairing_failures[MaxBleControllers];
+
+        struct StadiaStrategyState {
+            bluetooth::Address address = {};
+            u8 stage = 0;
+            u8 failures_in_cycle = 0;
+            bool valid = false;
+        };
+        StadiaStrategyState g_stadia_strategies[MaxBleControllers] = {};
 
         bool PairingBackoffActive(const bluetooth::Address &address) {
             for (const auto &failure : g_pairing_failures) {
                 if (failure.tick && AddressEqual(failure.address, address) &&
-                    ((os::GetSystemTick() - os::Tick(failure.tick)).ToTimeSpan().GetMilliSeconds() < PairingRetryBackoffMs)) return true;
+                    ((os::GetSystemTick() - os::Tick(failure.tick)).ToTimeSpan().GetMilliSeconds() < failure.backoff_ms)) return true;
             }
             return false;
         }
 
-        void NotePairingFailure(const bluetooth::Address &address) {
+        void NotePairingFailure(const bluetooth::Address &address, s64 backoff_ms = PairingRetryBackoffMs) {
             auto *oldest = &g_pairing_failures[0];
             for (auto &failure : g_pairing_failures) {
                 if (AddressEqual(failure.address, address)) { oldest = &failure; break; }
                 if (failure.tick < oldest->tick) oldest = &failure;
             }
-            *oldest = {address, os::GetSystemTick().GetInt64Value()};
+            *oldest = {address, os::GetSystemTick().GetInt64Value(), backoff_ms};
+        }
+
+        StadiaStrategyState *FindOrAllocStadiaStrategy(const bluetooth::Address &address) {
+            StadiaStrategyState *empty = nullptr;
+            for (auto &entry : g_stadia_strategies) {
+                if (entry.valid && AddressEqual(entry.address, address)) {
+                    return &entry;
+                }
+                if (!entry.valid && !empty) {
+                    empty = &entry;
+                }
+            }
+            StadiaStrategyState *slot = empty ? empty : &g_stadia_strategies[0];
+            *slot = { address, 0, 0, true };
+            return slot;
+        }
+
+        u8 GetStadiaStrategyStage(const bluetooth::Address &address) {
+            return FindOrAllocStadiaStrategy(address)->stage;
+        }
+
+        void NoteStadiaStrategySuccess(const bluetooth::Address &address, u8 stage) {
+            auto *state = FindOrAllocStadiaStrategy(address);
+            state->stage = stage % StadiaStrategyCount;
+            state->failures_in_cycle = 0;
+        }
+
+        // Advances to the next Stadia security stage. Returns true only after a full 3-stage cycle
+        // has failed so we don't trigger a 60s radio cycle between stages.
+        bool AdvanceStadiaStrategy(const bluetooth::Address &address) {
+            auto *state = FindOrAllocStadiaStrategy(address);
+            state->stage = static_cast<u8>((state->stage + 1) % StadiaStrategyCount);
+            ++state->failures_in_cycle;
+            if (state->failures_in_cycle >= StadiaStrategyCount) {
+                state->failures_in_cycle = 0;
+                return true;
+            }
+            return false;
         }
 
         /* Multi-device slot management */
@@ -237,8 +287,10 @@ namespace ams::ble {
                 if ((notify.op_type == GattNotifyType_Notification) && (notify.result == 0) && IsUuid16(notify.char_uuid, GattCharReport)) {
                     // Keep the controller alive until dispatch finishes, including during disconnect.
                     if (auto controller = events::GetActiveController(notify.conn_id)) {
+                        const size_t report_len = std::min<size_t>(notify.size, sizeof(notify.data));
+                        events::NoteReceivedInputReport("le_hid", notify.conn_id, notify.data, report_len);
                         const u64 start_tick = profile::RecordReportStart();
-                        static_cast<void>(controller->HandleBleInputReport(notify.data, std::min<size_t>(notify.size, sizeof(notify.data))));
+                        static_cast<void>(controller->HandleBleInputReport(notify.data, report_len));
                         profile::RecordReportEnd(start_tick);
                     } else {
                         events::PushRecord(g_le_hid_record);
@@ -522,7 +574,8 @@ namespace ams::ble {
             if (controller_type == BleControllerType::Stadia) {
                 controller = std::make_shared<controller::StadiaBleController>(
                     slot.address, slot.conn_id, slot.hid.service.id, slot.hid.service.is_primary,
-                    slot.hid.output_report.id, slot.hid.has_output_report, slot.hid.output_write_with_response);
+                    slot.hid.output_report.id, slot.hid.has_output_report, slot.hid.output_write_with_response,
+                    slot.hid.write_auth_req);
             } else {
                 controller = std::make_shared<controller::XboxOneBleController>(
                     slot.address, slot.conn_id, slot.hid.service.id, slot.hid.service.is_primary,
@@ -542,6 +595,7 @@ namespace ams::ble {
                 if (AddressEqual(failure.address, slot.address)) failure = {};
             }
 
+            const u64 reports_before = events::GetSlotInputReportCount(slot_index);
             if (controller_type == BleControllerType::Stadia) {
                 const u8 neutral[sizeof(controller::stadia::StadiaInputReport0x03)] = { 0x08, 0x00, 0x00, 0x80, 0x80, 0x80, 0x80, 0x00, 0x00, 0x00 };
                 static_cast<void>(controller->HandleBleInputReport(neutral, sizeof(neutral)));
@@ -555,8 +609,23 @@ namespace ams::ble {
             slot.negotiated_max_interval = 0;
             RebalanceConnectionParameters();
 
-            log::Write("slot %u: %s controller presented to system (conn_id=%u, total active=%zu)",
-                slot_index, controller_type == BleControllerType::Stadia ? "Stadia" : "Xbox", slot.conn_id, GetConnectedCount());
+            // If no real Stadia HID packet arrived on this slot within 150ms of attach, send a second
+            // neutral frame so the Switch "Change Grip/Order" UI reliably sees an active controller.
+            if (controller_type == BleControllerType::Stadia) {
+                events::WaitFor(events::InvalidType, TimeSpan::FromMilliSeconds(150), nullptr, [&](const EventRecord &) {
+                    return events::IsSlotDisconnected(slot_index) || !events::IsRadioEnabled() ||
+                        (events::GetSlotInputReportCount(slot_index) != reports_before);
+                });
+                if (!events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled() &&
+                    (events::GetSlotInputReportCount(slot_index) == reports_before)) {
+                    const u8 neutral[sizeof(controller::stadia::StadiaInputReport0x03)] = { 0x08, 0x00, 0x00, 0x80, 0x80, 0x80, 0x80, 0x00, 0x00, 0x00 };
+                    static_cast<void>(controller->HandleBleInputReport(neutral, sizeof(neutral)));
+                }
+            }
+
+            log::Write("slot %u: %s controller presented to system (conn_id=%u, write_auth=%u, total active=%zu)",
+                slot_index, controller_type == BleControllerType::Stadia ? "Stadia" : "Xbox",
+                slot.conn_id, slot.hid.write_auth_req, GetConnectedCount());
         }
 
         void DismissSlot(u32 slot_index, bool close_transport) {
@@ -667,7 +736,10 @@ namespace ams::ble {
                     } else if (gatt::TakeRediscovered(slot_idx)) {
                         log::Write("slot %u: services re-discovered, subscribing again", slot_idx);
                         gatt::HidService hid;
-                        static_cast<void>(gatt::Subscribe(slot_idx, g_host_slots[i].conn_id, &hid));
+                        const auto auth_mode = (g_host_slots[i].controller_type == BleControllerType::Stadia)
+                            ? gatt::SubscribeAuthMode::PlainThenNoMitm
+                            : gatt::SubscribeAuthMode::StandardNoMitm;
+                        static_cast<void>(gatt::Subscribe(slot_idx, g_host_slots[i].conn_id, &hid, auth_mode));
                     }
                 }
             }
@@ -767,16 +839,56 @@ namespace ams::ble {
                 DismissSlot(slot, false);
                 return;
             }
-            if (!pairing::PrepareSecurity(slot, address)) {
-                g_radio_recovery.Request();
-                NotePairingFailure(address);
-                log::Write("slot %u: backing off for %ldms before trying to pair again", slot, static_cast<long>(PairingRetryBackoffMs));
-                if (events::IsRadioEnabled()) {
+
+            const bool is_stadia = (scanned_type == BleControllerType::Stadia) || (RecallControllerType(address) == BleControllerType::Stadia);
+            u8 stadia_stage = 0;
+            pairing::SecurityStrategy sec_strategy = pairing::SecurityStrategy::CreateBond;
+            gatt::SubscribeAuthMode sub_mode = gatt::SubscribeAuthMode::StandardNoMitm;
+            if (is_stadia) {
+                stadia_stage = GetStadiaStrategyStage(address);
+                switch (stadia_stage) {
+                    case 0:
+                        sec_strategy = pairing::SecurityStrategy::GattOnDemand;
+                        sub_mode = gatt::SubscribeAuthMode::PlainThenNoMitm;
+                        break;
+                    case 1:
+                        sec_strategy = pairing::SecurityStrategy::DirectSetEncryption;
+                        sub_mode = gatt::SubscribeAuthMode::PlainOnlyAfterBond;
+                        break;
+                    default:
+                        sec_strategy = pairing::SecurityStrategy::CreateBond;
+                        sub_mode = gatt::SubscribeAuthMode::PlainOnlyAfterBond;
+                        break;
+                }
+                log::Write("slot %u: Stadia security plan stage=%u (sec=%u sub=%u)",
+                    slot, stadia_stage, static_cast<u32>(sec_strategy), static_cast<u32>(sub_mode));
+            }
+
+            const auto handle_attempt_failure = [&](const char *phase) {
+                if (is_stadia) {
+                    const bool cycle_exhausted = AdvanceStadiaStrategy(address);
+                    const s64 backoff = cycle_exhausted ? PairingRetryBackoffMs : StadiaRetryBackoffMs;
+                    if (cycle_exhausted) {
+                        g_radio_recovery.Request();
+                    }
+                    NotePairingFailure(address, backoff);
+                    log::Write("slot %u: Stadia %s failed (stage=%u next=%u cycle_exhausted=%u backoff=%ldms)",
+                        slot, phase, stadia_stage, GetStadiaStrategyStage(address), cycle_exhausted, static_cast<long>(backoff));
+                } else {
+                    g_radio_recovery.Request();
+                    NotePairingFailure(address, PairingRetryBackoffMs);
+                    log::Write("slot %u: backing off for %ldms before trying to pair again", slot, static_cast<long>(PairingRetryBackoffMs));
+                }
+                if (events::IsRadioEnabled() && (sec_strategy == pairing::SecurityStrategy::CreateBond)) {
                     const Result cancel_rc = btdrvCancelBond(address);
-                    log::Write("btdrvCancelBond slot=%u rc=0x%x", slot, cancel_rc.GetValue());
+                    log::Write("btdrvCancelBond after %s failure slot=%u rc=0x%x", phase, slot, cancel_rc.GetValue());
                 }
                 DismissSlot(slot);
-                os::SleepThread(TimeSpan::FromSeconds(1));
+                os::SleepThread(TimeSpan::FromMilliSeconds(is_stadia ? 500 : 1000));
+            };
+
+            if (!pairing::PrepareSecurityWithStrategy(slot, address, sec_strategy)) {
+                handle_attempt_failure("security");
                 return;
             }
 
@@ -794,17 +906,10 @@ namespace ams::ble {
             }
             events::ClearGattFailure(slot);
             gatt::HidService hid = {};
-            rc = gatt::Subscribe(slot, conn_id, &hid);
+            rc = gatt::Subscribe(slot, conn_id, &hid, sub_mode);
             if (R_FAILED(rc)) {
                 log::Write("slot %u: subscription failed rc=0x%x gatt_result=%u", slot, rc.GetValue(), events::GetGattFailure(slot));
-                g_radio_recovery.Request();
-                NotePairingFailure(address);
-                if (events::IsRadioEnabled()) {
-                    const Result cancel_rc = btdrvCancelBond(address);
-                    log::Write("btdrvCancelBond after subscription failure slot=%u rc=0x%x", slot, cancel_rc.GetValue());
-                }
-                DismissSlot(slot);
-                os::SleepThread(TimeSpan::FromSeconds(1));
+                handle_attempt_failure("subscription");
                 return;
             }
 
@@ -812,8 +917,11 @@ namespace ams::ble {
                 DismissSlot(slot, false);
                 return;
             }
+            if (is_stadia) {
+                NoteStadiaStrategySuccess(address, stadia_stage);
+            }
             g_host_slots[slot].hid = hid;
-            log::Write("slot %u: paired and subscribed", slot);
+            log::Write("slot %u: paired and subscribed (write_auth=%u)", slot, hid.write_auth_req);
             PresentSlot(slot);
         }
 
@@ -877,7 +985,7 @@ namespace ams::ble {
             bluetooth::ble::WaitInitialized();
 
             os::SleepThread(TimeSpan::FromSeconds(20));
-            log::Write("starting multi-device BLE host (native-peer-cleanup-r10, HOS=0x%x)", static_cast<u32>(hos::GetVersion()));
+            log::Write("starting multi-device BLE host (stadia-ble-v4-hos2250, HOS=0x%x)", static_cast<u32>(hos::GetVersion()));
 
             if (R_FAILED(PrepareClient())) {
                 log::Write("giving up: no gatt client available");
@@ -895,6 +1003,9 @@ namespace ams::ble {
                 if (current_pairing_window_generation != pairing_window_generation) {
                     pairing_window_generation = current_pairing_window_generation;
                     std::fill(std::begin(g_pairing_failures), std::end(g_pairing_failures), PairingFailure{});
+                    for (auto &strategy : g_stadia_strategies) {
+                        strategy.failures_in_cycle = 0;
+                    }
                     log::Write("BLE pairing window opened; ready to search (free slot=%s)", FindFreeSlot() >= 0 ? "yes" : "no");
                 }
                 profile::FlushIfDue();

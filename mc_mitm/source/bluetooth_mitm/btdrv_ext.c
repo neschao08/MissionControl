@@ -56,3 +56,25 @@ Result btdrvextDmSetConfig(const tBSA_DM_SET_CONFIG *set_config) {
 
     return _btdrvCustomCommand(&cmd, sizeof(cmd));
 }
+
+Result btdrvextSecRemoveDevice(BtdrvAddress address) {
+    const struct NX_PACKED {
+        u32 type;
+        BtdrvAddress address;
+    } cmd = { BtdrvExtCustomEventType_SecRemoveDevice, address };
+    _Static_assert(sizeof(cmd) == 10, "SecRemoveDevice custom command layout mismatch");
+
+    return _btdrvCustomCommand(&cmd, sizeof(cmd));
+}
+
+Result btdrvextSetEncryption(BtdrvAddress address, u8 transport, u8 sec_act) {
+    const struct NX_PACKED {
+        u32 type;
+        BtdrvAddress address;
+        u8 transport;
+        u8 sec_act;
+    } cmd = { BtdrvExtCustomEventType_SetEncryption, address, transport, sec_act };
+    _Static_assert(sizeof(cmd) == 12, "SetEncryption custom command layout mismatch");
+
+    return _btdrvCustomCommand(&cmd, sizeof(cmd));
+}

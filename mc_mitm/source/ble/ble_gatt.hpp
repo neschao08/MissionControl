@@ -38,10 +38,17 @@ namespace ams::ble::gatt {
         BtdrvGattAttribute output_report;
         bool has_output_report;
         bool output_write_with_response;
+        u8 write_auth_req;
         u16 vendor_id;
         u16 product_id;
         bool has_pnp_id;
         char device_name[0x20];
+    };
+
+    enum class SubscribeAuthMode : u8 {
+        StandardNoMitm,
+        PlainThenNoMitm,
+        PlainOnlyAfterBond,
     };
 
     // Event sink, see events::SetSink
@@ -56,7 +63,7 @@ namespace ams::ble::gatt {
 
     // Enables notifications on the HID input Report characteristic(s). Fails with InsufficientAuthentication
     // when the link isn't encrypted; returns NotFound if the table holds no HID service.
-    Result Subscribe(u32 slot_index, u32 conn_id, HidService *out);
+    Result Subscribe(u32 slot_index, u32 conn_id, HidService *out, SubscribeAuthMode auth_mode = SubscribeAuthMode::StandardNoMitm);
 
     // Resets slot connection state while retaining cached attributes for the address
     void ResetSlot(u32 slot_index);

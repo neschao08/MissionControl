@@ -42,6 +42,23 @@ namespace ams::controller {
     static_assert(stadia::ButtonBit::L       == static_cast<u32>(SwitchButton::L));
     static_assert(stadia::ButtonBit::ZL      == static_cast<u32>(SwitchButton::ZL));
 
+    Result StadiaBleController::Initialize() {
+        R_TRY(EmulatedSwitchController::Initialize());
+
+        // Apply pure-white minimalist Pro icon colours and overwrite any cached spi_flash.bin 0x6050 entry.
+        const Result colour_rc = this->WriteControllerColours(
+            {0xf5, 0xf5, 0xf5}, // body
+            {0xb4, 0xb4, 0xb4}, // buttons
+            {0xf5, 0xf5, 0xf5}, // left_grip
+            {0xf5, 0xf5, 0xf5}  // right_grip
+        );
+        if (R_FAILED(colour_rc) && ble::log::IsEnabled()) {
+            ble::log::Write("stadia colour write failed conn_id=%u rc=0x%x", m_conn_id, colour_rc.GetValue());
+        }
+
+        R_SUCCEED();
+    }
+
     Result StadiaBleController::HandleBleInputReport(const u8 *data, size_t size) {
         R_UNLESS(hos::GetVersion() >= hos::Version_9_0_0, sf::ResultNotSupported());
 
@@ -202,6 +219,35 @@ namespace ams::controller {
         m_last_rumble_weak   = weak;
         m_last_rumble_tick   = now_tick;
         R_SUCCEED();
+    }
+
+    Result StadiaBleController::SendConnectRumble(u16 strong, u16 weak) {
+        std::scoped_lock lk(m_rumble_mutex);
+        R_UNLESS(m_connected, svc::ResultInvalidState());
+        if (!m_has_output_report) {
+            R_SUCCEED();
+        }
+
+        stadia::StadiaReportData report = {};
+        report.id = stadia::OutputReportId;
+        report.output0x05.strong_magnitude = strong;
+        report.output0x05.weak_magnitude   = weak;
+
+        Result rc = this->WriteDataReport(&report, sizeof(stadia::StadiaOutputReport0x05) + 1);
+        if (ble::log::IsEnabled()) {
+            ble::log::Write("stadia connect-rumble conn_id=%u strong=0x%04x weak=0x%04x auth=%u with_rsp=%u rc=0x%x",
+                m_conn_id, strong, weak, m_write_auth_req, m_output_write_with_response ? 1u : 0u, rc.GetValue());
+        }
+        // Retry once with NoMitm auth if an encrypted peer requires authenticated writes (ignoring GATT BUSY 0x2a671).
+        if (R_FAILED(rc) && (m_write_auth_req == BtdrvGattAuthReqType_None) && (rc.GetValue() != 0x2a671)) {
+            m_write_auth_req = BtdrvGattAuthReqType_NoMitm;
+            rc = this->WriteDataReport(&report, sizeof(stadia::StadiaOutputReport0x05) + 1);
+            if (ble::log::IsEnabled()) {
+                ble::log::Write("stadia connect-rumble retry conn_id=%u auth=%u with_rsp=%u rc=0x%x",
+                    m_conn_id, m_write_auth_req, m_output_write_with_response ? 1u : 0u, rc.GetValue());
+            }
+        }
+        R_RETURN(rc);
     }
 
     Result StadiaBleController::WriteDataReport(const void *report_buffer, size_t size) {

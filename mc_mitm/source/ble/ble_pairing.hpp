@@ -28,5 +28,5 @@ namespace ams::ble::pairing {
     Result ClearPeer(u32 slot, const bluetooth::Address &address);
     // A fresh security indication only permits Subscribe to verify authenticated GATT access.
     bool PrepareSecurity(u32 slot, const bluetooth::Address &address);
-    bool PrepareSecurityWithStrategy(u32 slot, const bluetooth::Address &address, SecurityStrategy strategy);
+    bool PrepareSecurityWithStrategy(u32 slot, const bluetooth::Address &address, SecurityStrategy strategy, bool fast_reconnect = false);
 }

@@ -4,6 +4,19 @@
 namespace ams::controller {
     struct HardwareID { u16 vid; u16 pid; };
 
+    struct RGBColour {
+        u8 r;
+        u8 g;
+        u8 b;
+    };
+
+    struct SwitchControllerColours {
+        RGBColour body;
+        RGBColour buttons;
+        RGBColour left_grip;
+        RGBColour right_grip;
+    };
+
     enum class SwitchHidReportId : u8 {
         CommandOutputReport = 0x01,
         BasicOutputReport   = 0x10,
@@ -59,7 +72,9 @@ namespace ams::controller {
             EmulatedSwitchController(bluetooth::Address addr, HardwareID id) : m_address(addr), m_id(id) {}
             virtual ~EmulatedSwitchController() = default;
 
+            virtual Result Initialize() { return {0}; }
             virtual Result HandleBleInputReport(const u8 *data, size_t size) = 0;
+            virtual Result SendConnectRumble(u16 strong, u16 weak) { (void)strong; (void)weak; return {0}; }
             virtual Result HandleOutputDataReport(const u8 *report_buffer, size_t size) {
                 ++m_output_calls;
                 m_last_output_id = size > 0 ? report_buffer[0] : 0;
@@ -80,6 +95,8 @@ namespace ams::controller {
 
             // Public test hooks to drive protected methods directly
             Result TestSetVibration(const SwitchMotorData *m) { return this->SetVibration(m); }
+            SwitchControllerColours TestColours() const { return m_test_colours; }
+            u32 TestColourWrites() const { return m_colour_writes; }
             u32 TestButtons() const { return m_buttons.mask; }
             u16 TestLeftX() const { return m_left_stick.x; }
             u16 TestLeftY() const { return m_left_stick.y; }
@@ -91,6 +108,11 @@ namespace ams::controller {
             void TestSetTriggerThreshold(float t) { m_trigger_threshold = t; }
 
         protected:
+            Result WriteControllerColours(RGBColour body, RGBColour buttons, RGBColour left_grip, RGBColour right_grip) {
+                m_test_colours = {body, buttons, left_grip, right_grip};
+                ++m_colour_writes;
+                return {0};
+            }
             size_t FillBasicInputReport(u8 *report_buffer, size_t size) {
                 const size_t n = std::min<size_t>(size, sizeof(SwitchHidBasicInputReport));
                 std::memset(report_buffer, 0, n);
@@ -110,6 +132,8 @@ namespace ams::controller {
             u32 m_data_report_events = 0;
             u32 m_output_calls = 0;
             u32 m_inject_calls = 0;
+            u32 m_colour_writes = 0;
+            SwitchControllerColours m_test_colours = {};
             u8 m_last_output_id = 0;
     };
 }

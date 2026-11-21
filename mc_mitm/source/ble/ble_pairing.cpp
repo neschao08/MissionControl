@@ -240,7 +240,7 @@ namespace ams::ble::pairing {
         return false;
     }
 
-    bool PrepareSecurityWithStrategy(u32 slot, const bluetooth::Address &address, SecurityStrategy strategy) {
+    bool PrepareSecurityWithStrategy(u32 slot, const bluetooth::Address &address, SecurityStrategy strategy, bool fast_reconnect) {
         if (strategy == SecurityStrategy::CreateBond) {
             return PrepareSecurity(slot, address);
         }
@@ -257,7 +257,7 @@ namespace ams::ble::pairing {
             // BSA_SEC_AUTHORIZE_EVT at 0x2fb50. Invoke IPS cmd 6 (BTA_DmBleSecurityGrant(addr, 0))
             // so SMP proceeds with Legacy Just Works pairing & encryption instead of disconnecting
             // at t + 30.15s with reason=0x0016.
-            log::Write("slot %u: granting pending BLE SMP security request via BTA_DmBleSecurityGrant(res=0)", slot);
+            log::Write("slot %u: granting pending BLE SMP security request via BTA_DmBleSecurityGrant(res=0, fast=%u)", slot, fast_reconnect ? 1u : 0u);
             const Result grant_rc1 = btdrvextBleSecurityGrant(address, 0);
             log::Write("btdrvextBleSecurityGrant(#1) slot=%u rc=0x%x", slot, grant_rc1.GetValue());
             if (events::IsSlotDisconnected(slot) || !events::IsRadioEnabled()) {
@@ -266,31 +266,39 @@ namespace ams::ble::pairing {
                 return false;
             }
 
-            // Re-issue once after 250ms in case Slave Security Request arrived after a fast cached
+            // Re-issue once after a short gap in case Slave Security Request arrived after a fast cached
             // GATT discovery; SMP_SecurityGrant (0xf5bf0) is a safe no-op once out of WAIT_APP_DECISION.
-            events::WaitFor(events::InvalidType, TimeSpan::FromMilliSeconds(250), nullptr, [&](const EventRecord &) {
-                return events::IsSlotDisconnected(slot) || !events::IsRadioEnabled();
+            const s64 grant_gap_ms = fast_reconnect ? 100 : 150;
+            const s64 settle_ms    = fast_reconnect ? 350 : 750;
+            bool bond_complete = false;
+            events::WaitFor(events::InvalidType, TimeSpan::FromMilliSeconds(grant_gap_ms), nullptr, [&](const EventRecord &) {
+                bond_complete = bond_complete || events::TakeSlotBondComplete(slot);
+                return bond_complete || events::IsSlotDisconnected(slot) || !events::IsRadioEnabled();
             });
             if (events::IsSlotDisconnected(slot) || !events::IsRadioEnabled()) {
-                log::Write("slot %u: BLE security grant failed at 250ms (disconnected=%u reason=0x%04x radio=%u)",
-                    slot, events::IsSlotDisconnected(slot), events::GetSlotDisconnectReason(slot), events::IsRadioEnabled());
+                log::Write("slot %u: BLE security grant failed at %ldms (disconnected=%u reason=0x%04x radio=%u)",
+                    slot, static_cast<long>(grant_gap_ms), events::IsSlotDisconnected(slot), events::GetSlotDisconnectReason(slot), events::IsRadioEnabled());
                 return false;
             }
 
-            const Result grant_rc2 = btdrvextBleSecurityGrant(address, 0);
-            log::Write("btdrvextBleSecurityGrant(#2) slot=%u rc=0x%x", slot, grant_rc2.GetValue());
+            if (!bond_complete) {
+                const Result grant_rc2 = btdrvextBleSecurityGrant(address, 0);
+                log::Write("btdrvextBleSecurityGrant(#2) slot=%u rc=0x%x", slot, grant_rc2.GetValue());
 
-            // Wait up to 1500ms for Legacy Just Works pairing + HCI LE Start Encryption + key distribution.
-            events::WaitFor(events::InvalidType, TimeSpan::FromMilliSeconds(1500), nullptr, [&](const EventRecord &) {
-                return events::IsSlotDisconnected(slot) || !events::IsRadioEnabled();
-            });
-            if (events::IsSlotDisconnected(slot) || !events::IsRadioEnabled()) {
-                log::Write("slot %u: BLE security grant failed during SMP settle (disconnected=%u reason=0x%04x radio=%u)",
-                    slot, events::IsSlotDisconnected(slot), events::GetSlotDisconnectReason(slot), events::IsRadioEnabled());
-                return false;
+                // Wait for Legacy Just Works pairing + HCI LE Start Encryption + key distribution (or earlier bond event).
+                events::WaitFor(events::InvalidType, TimeSpan::FromMilliSeconds(settle_ms), nullptr, [&](const EventRecord &) {
+                    bond_complete = bond_complete || events::TakeSlotBondComplete(slot);
+                    return bond_complete || events::IsSlotDisconnected(slot) || !events::IsRadioEnabled();
+                });
+                if (events::IsSlotDisconnected(slot) || !events::IsRadioEnabled()) {
+                    log::Write("slot %u: BLE security grant failed during SMP settle (disconnected=%u reason=0x%04x radio=%u)",
+                        slot, events::IsSlotDisconnected(slot), events::GetSlotDisconnectReason(slot), events::IsRadioEnabled());
+                    return false;
+                }
             }
 
-            log::Write("slot %u: link alive after BTA_DmBleSecurityGrant settle; proceeding to GATT", slot);
+            log::Write("slot %u: link alive after BTA_DmBleSecurityGrant settle (fast=%u bond=%u); proceeding to GATT",
+                slot, fast_reconnect ? 1u : 0u, bond_complete ? 1u : 0u);
             return true;
         }
 

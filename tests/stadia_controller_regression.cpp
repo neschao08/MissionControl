@@ -189,5 +189,38 @@ int main() {
         assert(g_writes.size() == 3);
     }
 
+    // 4. Initialize() writes pure-white minimalist 0x6050 colours; SendConnectRumble() sends pulse & retries auth if non-busy error
+    {
+        g_writes.clear(); g_write_rc = 0;
+        ble::events::g_radio_enabled = true;
+        StadiaBleController ctrl_c(addr, 259, svc_id, true, out_id, true, true, BtdrvGattAuthReqType_None);
+        assert(R_SUCCEEDED(ctrl_c.Initialize()));
+        assert(ctrl_c.TestColourWrites() == 1);
+        const auto cols = ctrl_c.TestColours();
+        assert(cols.body.r == 0xf5 && cols.body.g == 0xf5 && cols.body.b == 0xf5);
+        assert(cols.buttons.r == 0xb4 && cols.buttons.g == 0xb4 && cols.buttons.b == 0xb4);
+        assert(cols.left_grip.r == 0xf5 && cols.right_grip.r == 0xf5);
+
+        // Connect pulse: strong=0x9000 weak=0x9000, non-busy error triggers one NoMitm retry
+        g_write_rc = 0x1234;
+        assert(R_FAILED(ctrl_c.SendConnectRumble(0x9000, 0x9000)));
+        assert(g_writes.size() == 2);
+        assert(g_writes[0].auth_req == BtdrvGattAuthReqType_None && g_writes[1].auth_req == BtdrvGattAuthReqType_NoMitm);
+        assert(g_writes[0].payload == std::vector<u8>({0x00, 0x90, 0x00, 0x90}));
+
+        // GATT BUSY (0x2a671) must NOT blindly escalate auth
+        g_writes.clear();
+        StadiaBleController ctrl_busy(addr, 259, svc_id, true, out_id, true, true, BtdrvGattAuthReqType_None);
+        g_write_rc = 0x2a671;
+        assert(ctrl_busy.SendConnectRumble(0x9000, 0x9000).value == 0x2a671);
+        assert(g_writes.size() == 1);
+        assert(g_writes[0].auth_req == BtdrvGattAuthReqType_None);
+
+        // Stop pulse succeeds cleanly
+        g_writes.clear(); g_write_rc = 0;
+        assert(R_SUCCEEDED(ctrl_busy.SendConnectRumble(0, 0)));
+        assert(g_writes.size() == 1 && g_writes[0].payload == std::vector<u8>({0, 0, 0, 0}));
+    }
+
     std::cout << "StadiaBleController production framing/rumble/auth/disconnect regressions passed\n";
 }

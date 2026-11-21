@@ -50,6 +50,11 @@ namespace ams::controller {
         m_sixaxis_processor.Reset();
     }
 
+    Result EmulatedSwitchController::WriteControllerColours(RGBColour body, RGBColour buttons, RGBColour left_grip, RGBColour right_grip) {
+        const SwitchControllerColours colours = { body, buttons, left_grip, right_grip };
+        R_RETURN(m_virtual_memory.Write(0x6050, &colours, sizeof(colours)));
+    }
+
     Result EmulatedSwitchController::InjectInputReport(const u8 *report_buffer, size_t size) {
         bluetooth::hid::report::WriteHidDataReport(m_address, report_buffer, size);
         R_SUCCEED();

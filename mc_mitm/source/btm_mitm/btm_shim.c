@@ -23,6 +23,13 @@ Result btmAcquireDeviceConditionEventFwd(Service* s, Handle *out_handle) {
     );
 }
 
+Result btmAcquireDeviceInfoEventFwd(Service* s, Handle *out_handle) {
+    return serviceMitmDispatch(s, 8,
+        .out_handle_attrs = { SfOutHandleAttr_HipcCopy },
+        .out_handles = out_handle,
+    );
+}
+
 Result btmGetDeviceConditionFwd(Service* s, BtmProfile profile, BtmDeviceCondition *device_condition, size_t count, s32 *total_out) {
     return serviceMitmDispatchInOut(s, 3, profile, *total_out,
         .buffer_attrs = { SfBufferAttr_HipcPointer | SfBufferAttr_Out },

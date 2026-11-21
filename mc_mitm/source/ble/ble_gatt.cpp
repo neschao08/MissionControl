@@ -293,8 +293,16 @@ namespace ams::ble::gatt {
             // prove that pairing failed. Input still fits the default MTU.
             if (!completed) log::Write("slot %u: MTU completion timed out, continuing to pairing", slot_index);
         }
-        events::WaitFor(events::InvalidType, TimeSpan::FromMilliSeconds(500), nullptr, disconnected);
+        const bool had_input = HasHidInputReport(slot_index);
+        const bool arrived_input = !had_input && events::WaitFor(events::InvalidType, TimeSpan::FromMilliSeconds(400), nullptr, [&](const EventRecord &) {
+            return link_lost() || HasHidInputReport(slot_index);
+        });
         R_UNLESS(!link_lost(), ResultNoConnection());
+        if (had_input || arrived_input) {
+            // Brief settle for trailing attribute cache chunks without adding fixed 500ms stalls.
+            events::WaitFor(events::InvalidType, TimeSpan::FromMilliSeconds(100), nullptr, disconnected);
+            R_UNLESS(!link_lost(), ResultNoConnection());
+        }
         log::Write("slot %u: GATT setup finished, attributes=%u hid_input=%u; pairing next",
             slot_index, s.table.count, HasHidInputReport(slot_index));
         R_SUCCEED();

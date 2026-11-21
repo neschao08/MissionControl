@@ -17,6 +17,7 @@
 #include <stratosphere.hpp>
 #include "../utils.hpp"
 #include "../btm_mitm/btm_device_condition.hpp"
+#include "../btm_mitm/btm_device_info.hpp"
 #include "../ble/ble_events.hpp"
 
 namespace ams::controller {
@@ -390,6 +391,7 @@ namespace ams::controller {
         }
 
         // Let hid know there is a new device to pick up
+        mitm::btm::info::Signal();
         mitm::btm::condition::Signal();
     }
 
@@ -407,6 +409,7 @@ namespace ams::controller {
         }
 
         mitm::btm::condition::Signal();
+        mitm::btm::info::Signal();
     }
 
     size_t GetVirtualDevices(bluetooth::Address *out, size_t max) {

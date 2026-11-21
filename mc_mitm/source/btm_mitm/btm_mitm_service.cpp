@@ -16,11 +16,30 @@
 #include "btm_mitm_service.hpp"
 #include "btm_shim.h"
 #include "btm_device_condition.hpp"
+#include "btm_device_info.hpp"
+#include "../ble/ble_log.hpp"
 #include "../controllers/controller_management.hpp"
+#include <atomic>
 
 namespace ams::mitm::btm {
 
     namespace {
+
+        std::atomic<u32> g_btm_diag_log_count{0};
+
+        bool TryTakeBtmLogSlot(u32 *out_idx) {
+            if (!ble::log::IsEnabled()) {
+                return false;
+            }
+            u32 cur = g_btm_diag_log_count.load(std::memory_order_relaxed);
+            while (cur < 16) {
+                if (g_btm_diag_log_count.compare_exchange_weak(cur, cur + 1, std::memory_order_relaxed)) {
+                    *out_idx = cur + 1;
+                    return true;
+                }
+            }
+            return false;
+        }
 
         void RenameConnectedDevices(BtmDeviceConditionLegacy *devices, size_t count) {
             for (unsigned int i = 0; i < count; ++i) {
@@ -87,7 +106,7 @@ namespace ams::mitm::btm {
                 device->addr = virtual_devices[i];
                 device->class_of_device = { 0x00, 0x25, 0x08 };
                 std::memset(device->link_key.link_key, 0xAA, sizeof(device->link_key.link_key));
-                device->key_type = 0;
+                device->key_type = 4;
                 device->profile = BtmProfile_Hid;
                 device->profile_info.hid.vid = 0x057e;
                 device->profile_info.hid.pid = 0x2009;
@@ -99,6 +118,13 @@ namespace ams::mitm::btm {
     }
 
     Result BtmMitmService::AcquireDeviceConditionEvent(sf::OutCopyHandle out_handle) {
+        if (m_client_info.program_id != ncm::SystemProgramId::Hid) {
+            os::NativeHandle handle = os::InvalidNativeHandle;
+            R_TRY(btmAcquireDeviceConditionEventFwd(m_forward_service.get(), &handle));
+            out_handle.SetValue(handle, true);
+            R_SUCCEED();
+        }
+
         if (!condition::IsInitialized()) {
             // Forward to the real function to obtain the system event handle
             os::NativeHandle handle = os::InvalidNativeHandle;
@@ -112,9 +138,36 @@ namespace ams::mitm::btm {
 
             condition::SignalInitialized();
         } else {
-            // hid is the only client, so it gets the event it already has rather than a second one nothing
-            // would signal
+            // hid gets the event it already has rather than a second one nothing would signal
             out_handle.SetValue(condition::GetForwardEvent()->GetReadableHandle(), false);
+        }
+
+        R_SUCCEED();
+    }
+
+    Result BtmMitmService::AcquireDeviceInfoEvent(sf::OutCopyHandle out_handle) {
+        if (u32 log_idx = 0; TryTakeBtmLogSlot(&log_idx)) {
+            ble::log::Write("btm diag #%u AcquireDeviceInfoEvent pid=0x%016llx",
+                log_idx, static_cast<unsigned long long>(m_client_info.program_id.value));
+        }
+
+        if (m_client_info.program_id != ncm::SystemProgramId::Hid) {
+            os::NativeHandle handle = os::InvalidNativeHandle;
+            R_TRY(btmAcquireDeviceInfoEventFwd(m_forward_service.get(), &handle));
+            out_handle.SetValue(handle, true);
+            R_SUCCEED();
+        }
+
+        if (!info::IsInitialized()) {
+            os::NativeHandle handle = os::InvalidNativeHandle;
+            R_TRY(btmAcquireDeviceInfoEventFwd(m_forward_service.get(), &handle));
+
+            info::GetSystemEvent()->AttachReadableHandle(handle, false, os::EventClearMode_AutoClear);
+            out_handle.SetValue(info::GetForwardEvent()->GetReadableHandle(), false);
+
+            info::SignalInitialized();
+        } else {
+            out_handle.SetValue(info::GetForwardEvent()->GetReadableHandle(), false);
         }
 
         R_SUCCEED();
@@ -142,6 +195,7 @@ namespace ams::mitm::btm {
     Result BtmMitmService::GetDeviceInfo(ams::btm::Profile profile, const sf::OutArray<ams::btm::DeviceInfo> &out, sf::Out<s32> total_out) {
         auto device_info = reinterpret_cast<BtmDeviceInfo *>(out.GetPointer());
         R_TRY(btmGetDeviceInfoFwd(m_forward_service.get(), profile, device_info, out.GetSize(), total_out.GetPointer()));
+        const s32 raw_total = total_out.GetValue();
 
         for (int i = 0; i < total_out.GetValue(); ++i) {
             auto device = &device_info[i];
@@ -152,6 +206,12 @@ namespace ams::mitm::btm {
 
         if ((profile == BtmProfile_Hid) || (profile == BtmProfile_None)) {
             AppendVirtualDeviceInfos(device_info, out.GetSize(), total_out);
+        }
+
+        if (u32 log_idx = 0; TryTakeBtmLogSlot(&log_idx)) {
+            ble::log::Write("btm diag #%u GetDeviceInfo pid=0x%016llx profile=%d raw=%d final=%d",
+                log_idx, static_cast<unsigned long long>(m_client_info.program_id.value),
+                static_cast<int>(profile), raw_total, total_out.GetValue());
         }
 
         R_SUCCEED();
@@ -160,6 +220,7 @@ namespace ams::mitm::btm {
     Result BtmMitmService::GetShortenedDeviceInfo(ams::btm::Profile profile, const sf::OutArray<ams::btm::ShortenedDeviceInfo> &out, sf::Out<s32> total_out) {
         auto device_info = reinterpret_cast<BtmShortenedDeviceInfo *>(out.GetPointer());
         R_TRY(btmGetShortenedDeviceInfoFwd(m_forward_service.get(), profile, device_info, out.GetSize(), total_out.GetPointer()));
+        const s32 raw_total = total_out.GetValue();
 
         for (int i = 0; i < total_out.GetValue(); ++i) {
             auto device = &device_info[i];
@@ -170,6 +231,12 @@ namespace ams::mitm::btm {
 
         if ((profile == BtmProfile_Hid) || (profile == BtmProfile_None)) {
             AppendVirtualDeviceInfos(device_info, out.GetSize(), total_out);
+        }
+
+        if (u32 log_idx = 0; TryTakeBtmLogSlot(&log_idx)) {
+            ble::log::Write("btm diag #%u GetShortenedDeviceInfo pid=0x%016llx profile=%d raw=%d final=%d",
+                log_idx, static_cast<unsigned long long>(m_client_info.program_id.value),
+                static_cast<int>(profile), raw_total, total_out.GetValue());
         }
 
         R_SUCCEED();

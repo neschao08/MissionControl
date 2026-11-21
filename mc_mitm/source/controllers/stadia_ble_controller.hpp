@@ -42,8 +42,10 @@ namespace ams::controller {
             , m_output_write_with_response(output_write_with_response)
             , m_write_auth_req(write_auth_req) { }
 
+            Result Initialize() override;
             Result HandleBleInputReport(const u8 *data, size_t size) override;
             Result HandleOutputDataReport(const u8 *report_buffer, size_t size) override;
+            Result SendConnectRumble(u16 strong, u16 weak) override;
             void DisconnectBle() override;
 
         protected:

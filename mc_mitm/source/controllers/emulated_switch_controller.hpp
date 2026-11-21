@@ -42,10 +42,12 @@ namespace ams::controller {
             virtual Result HandleOutputDataReport(const u8 *report_buffer, size_t size) override;
             virtual Result InjectInputReport(const u8 *report_buffer, size_t size);
             virtual Result HandleBleInputReport(const u8 *data, size_t size) { AMS_UNUSED(data, size); R_THROW(sf::ResultNotSupported()); }
+            virtual Result SendConnectRumble(u16 strong, u16 weak) { AMS_UNUSED(strong, weak); R_SUCCEED(); }
             virtual void DisconnectBle() { }
 
         protected:
             void Reset();
+            Result WriteControllerColours(RGBColour body, RGBColour buttons, RGBColour left_grip, RGBColour right_grip);
             virtual Result SetVibration(const SwitchMotorData *motor_data) { AMS_UNUSED(motor_data); R_SUCCEED(); }
             virtual Result CancelVibration() { R_SUCCEED(); }
             virtual Result SetPlayerLed(SwitchPlayerNumber player_number) { AMS_UNUSED(player_number); R_SUCCEED(); }

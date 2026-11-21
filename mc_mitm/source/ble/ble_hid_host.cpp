@@ -161,10 +161,18 @@ namespace ams::ble {
                 Disconnecting
             };
 
+            enum class ConnectRumbleState : u8 {
+                None,
+                PendingStart,
+                Vibrating
+            };
+
             State state = State::Vacant;
             BleControllerType controller_type = BleControllerType::Unknown;
             bool was_connected = false;
             bool disconnect_requested = false;
+            ConnectRumbleState connect_rumble_state = ConnectRumbleState::None;
+            s64 connect_rumble_tick = 0;
             u32 conn_id = InvalidConnId;
             u8 client_if = InvalidClientIf;
             u16 negotiated_max_interval = 0;
@@ -605,10 +613,49 @@ namespace ams::ble {
             }
         }
 
+        void ServiceConnectRumble() {
+            struct RumblePulse {
+                std::shared_ptr<controller::EmulatedSwitchController> controller;
+                u16 strong;
+                u16 weak;
+            };
+            RumblePulse actions[MaxBleControllers] = {};
+            size_t count = 0;
+            {
+                std::scoped_lock lk(g_slots_lock);
+                const s64 now = os::GetSystemTick().GetInt64Value();
+                for (size_t i = 0; i < MaxBleControllers; ++i) {
+                    auto &slot = g_host_slots[i];
+                    if ((slot.state != BleDeviceSlot::State::Connected) || !slot.controller) {
+                        slot.connect_rumble_state = BleDeviceSlot::ConnectRumbleState::None;
+                        slot.connect_rumble_tick = 0;
+                        continue;
+                    }
+                    if (slot.connect_rumble_state == BleDeviceSlot::ConnectRumbleState::PendingStart) {
+                        if ((os::Tick(now) - os::Tick(slot.connect_rumble_tick)).ToTimeSpan() >= TimeSpan::FromMilliSeconds(350)) {
+                            slot.connect_rumble_state = BleDeviceSlot::ConnectRumbleState::Vibrating;
+                            slot.connect_rumble_tick = now;
+                            actions[count++] = { slot.controller, 0x9000, 0x9000 };
+                        }
+                    } else if (slot.connect_rumble_state == BleDeviceSlot::ConnectRumbleState::Vibrating) {
+                        if ((os::Tick(now) - os::Tick(slot.connect_rumble_tick)).ToTimeSpan() >= TimeSpan::FromMilliSeconds(150)) {
+                            slot.connect_rumble_state = BleDeviceSlot::ConnectRumbleState::None;
+                            slot.connect_rumble_tick = 0;
+                            actions[count++] = { slot.controller, 0x0000, 0x0000 };
+                        }
+                    }
+                }
+            }
+            for (size_t i = 0; i < count; ++i) {
+                static_cast<void>(actions[i].controller->SendConnectRumble(actions[i].strong, actions[i].weak));
+            }
+        }
+
         void IdleWithNeutralReports(TimeSpan duration, const auto &stop_pred) {
             const auto deadline = os::GetSystemTick().ToTimeSpan() + duration;
             for (;;) {
                 ServiceNeutralReports();
+                ServiceConnectRumble();
                 if (stop_pred()) {
                     return;
                 }
@@ -684,6 +731,7 @@ namespace ams::ble {
             int refused_attempts = 0;
             for (;;) {
                 ServiceNeutralReports();
+                ServiceConnectRumble();
                 if (events::ClassicActivityWithin(ClassicActivityHoldOff)) {
                     log::Write("scan not started: classic controller activity");
                     events::Pump(TimeSpan::FromSeconds(1));
@@ -735,6 +783,7 @@ namespace ams::ble {
             bool found = false;
             for (;;) {
                 ServiceNeutralReports();
+                ServiceConnectRumble();
                 if (should_abort_scan()) {
                     break;
                 }
@@ -946,6 +995,13 @@ namespace ams::ble {
                 std::scoped_lock lk(g_slots_lock);
                 slot.attach_input_reports = events::GetSlotInputReportCount(slot_index);
                 ScheduleNeutralReportsLocked(slot);
+                if (controller_type == BleControllerType::Stadia) {
+                    slot.connect_rumble_state = BleDeviceSlot::ConnectRumbleState::PendingStart;
+                    slot.connect_rumble_tick = os::GetSystemTick().GetInt64Value();
+                } else {
+                    slot.connect_rumble_state = BleDeviceSlot::ConnectRumbleState::None;
+                    slot.connect_rumble_tick = 0;
+                }
             }
             events::RegisterSlotController(slot_index, slot.conn_id, controller);
             ServiceNeutralReports();
@@ -987,6 +1043,8 @@ namespace ams::ble {
                     controller = std::move(slot.controller);
                     slot.controller = nullptr;
                     slot.negotiated_max_interval = 0;
+                    slot.connect_rumble_state = BleDeviceSlot::ConnectRumbleState::None;
+                    slot.connect_rumble_tick = 0;
                 }
             }
 
@@ -1289,6 +1347,17 @@ namespace ams::ble {
             }
             events::SetSlotClaimed(slot, true);
 
+            const bool is_stadia = (scanned_type == BleControllerType::Stadia) || (RecallControllerType(address) == BleControllerType::Stadia);
+            u8 stadia_stage = 0;
+            if (is_stadia) {
+                stadia_stage = GetStadiaStrategyStage(address);
+                if (stadia_stage <= 1) {
+                    // Grant any early SMP Slave Security Request so SMP overlaps with GATT discovery.
+                    const Result pre_grant_rc = btdrvextBleSecurityGrant(address, 0);
+                    log::Write("btdrvextBleSecurityGrant(pre-discover) slot=%u rc=0x%x", slot, pre_grant_rc.GetValue());
+                }
+            }
+
             Result rc = gatt::Discover(slot, conn_id, address);
             if (R_FAILED(rc)) {
                 log::Write("slot %u: GATT setup failed before pairing rc=0x%x", slot, rc.GetValue());
@@ -1306,12 +1375,9 @@ namespace ams::ble {
                 return;
             }
 
-            const bool is_stadia = (scanned_type == BleControllerType::Stadia) || (RecallControllerType(address) == BleControllerType::Stadia);
-            u8 stadia_stage = 0;
             pairing::SecurityStrategy sec_strategy = pairing::SecurityStrategy::CreateBond;
             gatt::SubscribeAuthMode sub_mode = gatt::SubscribeAuthMode::StandardNoMitm;
             if (is_stadia) {
-                stadia_stage = GetStadiaStrategyStage(address);
                 switch (stadia_stage) {
                     case 0:
                         // Primary: grant Stadia's proactive SMP Slave Security Request via IPS cmd 6
@@ -1365,7 +1431,9 @@ namespace ams::ble {
                 os::SleepThread(TimeSpan::FromMilliSeconds(is_stadia ? 500 : 1000));
             };
 
-            if (!pairing::PrepareSecurityWithStrategy(slot, address, sec_strategy)) {
+            const bool fast_reconnect = is_stadia && IsKnownStadia(address) && ((scanned_flags & 0x01) == 0) &&
+                (FindOrAllocStadiaStrategy(address)->failures_in_cycle == 0);
+            if (!pairing::PrepareSecurityWithStrategy(slot, address, sec_strategy, fast_reconnect)) {
                 handle_attempt_failure("security");
                 return;
             }
@@ -1457,7 +1525,7 @@ namespace ams::ble {
             bluetooth::ble::WaitInitialized();
 
             os::SleepThread(TimeSpan::FromSeconds(20));
-            log::Write("starting multi-device BLE host (stadia-ble-v12-hos2250, HOS=0x%x)", static_cast<u32>(hos::GetVersion()));
+            log::Write("starting multi-device BLE host (stadia-ble-v13-hos2250, HOS=0x%x)", static_cast<u32>(hos::GetVersion()));
             LoadKnownStadia();
 
             if (R_FAILED(PrepareClient())) {
@@ -1474,6 +1542,7 @@ namespace ams::ble {
                 WaitForRadio();
                 ProcessPendingDisconnections();
                 ServiceNeutralReports();
+                ServiceConnectRumble();
                 const u32 current_pairing_window_generation = events::PairingWindowGeneration();
                 if (current_pairing_window_generation != pairing_window_generation) {
                     pairing_window_generation = current_pairing_window_generation;

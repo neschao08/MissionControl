@@ -203,7 +203,7 @@ int main() {
     const ams::bluetooth::Address fresh_address{{9,8,7,6,5,4}};
     assert(R_SUCCEEDED(gatt::Discover(0, 260, fresh_address)));
     assert(query_times.front() == 800);
-    assert(events::now_ms == 1400);
+    assert(events::now_ms == 1000);
     AssertSubscribed(0, 260);
 
     const ams::bluetooth::Address a{{1}}, b{{2}};
@@ -247,7 +247,7 @@ int main() {
         if (!timeout) mtu_result = {7};
         assert(R_SUCCEEDED(gatt::Discover(0, 260, a)));
         AssertSubscribed(0, 260);
-        assert(events::now_ms == (timeout ? 7540u : 2540u));
+        assert(events::now_ms == (timeout ? 7140u : 2160u));
     }
 
     // A different controller's MTU response must not finish this setup wait.
@@ -255,14 +255,14 @@ int main() {
     mtu_reply = false;
     events::Schedule(Mtu(3), 2100);
     assert(R_SUCCEEDED(gatt::Discover(0, 260, a)));
-    assert(events::now_ms == 7500);
+    assert(events::now_ms == 7400);
     gatt::HidService hid{};
     assert(gatt::Subscribe(0, 260, &hid).value == 2);
     assert(events::now_ms <= 13000); // post-bond failure is still bounded
 
-    // Cancellation is honored during both settling and the MTU wait.
+    // Cancellation is honored during settling, MTU wait, and final trailing settle.
     for (int kind : {events::Disconnect, events::RadioOff}) {
-        for (u64 when : {500u, 2050u, 2300u}) {
+        for (u64 when : {500u, 2050u, 2150u}) {
             Reset();
             events::Schedule(EventRecord{kind, {}}, when);
             assert(gatt::Discover(0, 260, a).value == 4);

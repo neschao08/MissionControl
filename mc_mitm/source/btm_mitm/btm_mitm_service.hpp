@@ -20,6 +20,7 @@
 #define AMS_BTM_MITM_INTERFACE_INFO(C, H)                                                                                                                                                                                                                      \
     AMS_SF_METHOD_INFO(C, H, 2,   Result, AcquireDeviceConditionEvent,   (sf::OutCopyHandle out_handle),                                                                              (out_handle))                                                                \
     AMS_SF_METHOD_INFO(C, H, 3,   Result, GetDeviceCondition,            (ams::btm::Profile profile, const sf::OutArray<ams::btm::DeviceCondition> &out, sf::Out<s32> total_out),          (profile, out, total_out), hos::Version_13_0_0)                     \
+    AMS_SF_METHOD_INFO(C, H, 8,   Result, AcquireDeviceInfoEvent,        (sf::OutCopyHandle out_handle),                                                                              (out_handle))                                                                \
     AMS_SF_METHOD_INFO(C, H, 9,   Result, GetDeviceInfo,                 (ams::btm::Profile profile, const sf::OutArray<ams::btm::DeviceInfo> &out, sf::Out<s32> total_out),               (profile, out, total_out), hos::Version_13_0_0)                     \
     AMS_SF_METHOD_INFO(C, H, 110, Result, GetShortenedDeviceInfo,        (ams::btm::Profile profile, const sf::OutArray<ams::btm::ShortenedDeviceInfo> &out, sf::Out<s32> total_out),      (profile, out, total_out), hos::Version_13_0_0)                     \
     AMS_SF_METHOD_INFO(C, H, 115, Result, GetShortenedDeviceCondition,   (ams::btm::Profile profile, const sf::OutArray<ams::btm::ShortenedDeviceCondition> &out, sf::Out<s32> total_out), (profile, out, total_out), hos::Version_14_0_0)                     \
@@ -40,12 +41,13 @@ namespace ams::mitm::btm {
 
         public:
             static bool ShouldMitm(const sm::MitmProcessInfo &client_info) {
-                return client_info.program_id == ncm::SystemProgramId::Hid;
+                return client_info.program_id != ncm::ProgramId{0x010000000000bd00};
             }
 
         public:
             Result AcquireDeviceConditionEvent(sf::OutCopyHandle out_handle);
             Result GetDeviceCondition(ams::btm::Profile profile, const sf::OutArray<ams::btm::DeviceCondition> &out, sf::Out<s32> total_out);
+            Result AcquireDeviceInfoEvent(sf::OutCopyHandle out_handle);
             Result GetDeviceInfo(ams::btm::Profile profile, const sf::OutArray<ams::btm::DeviceInfo> &out, sf::Out<s32> total_out);
             Result GetShortenedDeviceInfo(ams::btm::Profile profile, const sf::OutArray<ams::btm::ShortenedDeviceInfo> &out, sf::Out<s32> total_out);
             Result GetShortenedDeviceCondition(ams::btm::Profile profile, const sf::OutArray<ams::btm::ShortenedDeviceCondition> &out, sf::Out<s32> total_out);

@@ -16,6 +16,7 @@
 #include "btmmitm_module.hpp"
 #include "btm_mitm_service.hpp"
 #include "btm_device_condition.hpp"
+#include "btm_device_info.hpp"
 #include <stratosphere.hpp>
 
 namespace ams::mitm::btm {
@@ -37,7 +38,7 @@ namespace ams::mitm::btm {
             static constexpr bool CanManageMitmServers  = true;
         };
 
-        constexpr size_t MaxSessions = 6;
+        constexpr size_t MaxSessions = 16;
 
         class ServerManager final : public sf::hipc::ServerManager<PortIndex_Count, ServerOptions, MaxSessions> {
             private:
@@ -73,6 +74,7 @@ namespace ams::mitm::btm {
 
     void Launch() {
         R_ABORT_UNLESS(condition::Initialize());
+        R_ABORT_UNLESS(info::Initialize());
 
         R_ABORT_UNLESS(os::CreateThread(&g_thread,
             BtmMitmThreadFunction,

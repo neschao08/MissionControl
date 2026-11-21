@@ -51,12 +51,13 @@ namespace ams::ble {
         RadioRecovery g_radio_recovery;
         u32 g_hid_data_path_generation = UINT32_MAX;
 
-        constexpr s64 PairingRetryBackoffMs        = 5000;
-        constexpr s64 StadiaRetryBackoffMs         = 1500;
-        constexpr s64 BackgroundReconnectBackoffMs = 6000;
-        constexpr s64 BackgroundScanIdlePeriodMs   = 2500;
-        constexpr s64 BackgroundScanBusyPeriodMs   = 5000;
-        constexpr u8  StadiaStrategyCount          = 3;
+        constexpr s64 PairingRetryBackoffMs          = 5000;
+        constexpr s64 StadiaRetryBackoffMs           = 1500;
+        constexpr s64 BackgroundReconnectBackoffMs   = 6000;
+        constexpr s64 BackgroundTransientBackoffMs   = 1000;
+        constexpr s64 BackgroundScanIdlePeriodMs     = 1500;
+        constexpr s64 BackgroundScanBusyPeriodMs     = 5000;
+        constexpr u8  StadiaStrategyCount            = 3;
 
         constexpr const char KnownStadiaFilePath[] = "sdmc:/config/MissionControl/ble_known_stadia.bin";
         constexpr u32 KnownStadiaMagic = 0x53544431; // "STD1"
@@ -986,8 +987,10 @@ namespace ams::ble {
                 scanned_type = RecallControllerType(address);
             } else {
                 const bool another_controller_connected = (events::GetActiveConnectionCount() > 0) || (controller::GetConnectedControllerCount() > 0);
+                // Real Stadia flags=0x06 (white blink reconnect) advertisements can take ~4.3s to appear under
+                // bt_nso's default scan duty cycle; scan 4.5s when idle so white-blink reconnect catches reliably.
                 const TimeSpan scan_duration = background_reconnect
-                    ? TimeSpan::FromMilliSeconds(another_controller_connected ? 800 : 1000)
+                    ? TimeSpan::FromMilliSeconds(another_controller_connected ? 1500 : 4500)
                     : TimeSpan::FromSeconds(another_controller_connected ? 2 : 5);
                 u32 stale_slot = InvalidSlot;
                 Result rc = Scan(&address, &scanned_type, &scanned_flags, scan_duration, background_reconnect, &stale_slot);
@@ -1022,7 +1025,11 @@ namespace ams::ble {
                         (FindOrAllocStadiaStrategy(address)->failures_in_cycle == 0);
                     connected = R_SUCCEEDED(pairing::Connect(slot, client_if, address, &conn_id, TimeSpan::FromSeconds(15), !preserve_bond));
                     if (!connected) {
-                        NotePairingFailure(address, background_reconnect ? BackgroundReconnectBackoffMs : PairingRetryBackoffMs);
+                        const bool transient_0x3e = (events::GetSlotDisconnectReason(slot) == 0x003e);
+                        const s64 backoff = background_reconnect
+                            ? (transient_0x3e ? BackgroundTransientBackoffMs : BackgroundReconnectBackoffMs)
+                            : PairingRetryBackoffMs;
+                        NotePairingFailure(address, backoff);
                         DismissSlot(slot);
                         return;
                     }
@@ -1058,7 +1065,9 @@ namespace ams::ble {
             Result rc = gatt::Discover(slot, conn_id, address);
             if (R_FAILED(rc)) {
                 log::Write("slot %u: GATT setup failed before pairing rc=0x%x", slot, rc.GetValue());
-                NotePairingFailure(address);
+                const bool transient_0x3e = (events::GetSlotDisconnectReason(slot) == 0x003e);
+                const s64 backoff = (background_reconnect && transient_0x3e) ? BackgroundTransientBackoffMs : PairingRetryBackoffMs;
+                NotePairingFailure(address, backoff);
                 DismissSlot(slot);
                 return;
             }
@@ -1227,7 +1236,7 @@ namespace ams::ble {
             bluetooth::ble::WaitInitialized();
 
             os::SleepThread(TimeSpan::FromSeconds(20));
-            log::Write("starting multi-device BLE host (stadia-ble-v7-hos2250, HOS=0x%x)", static_cast<u32>(hos::GetVersion()));
+            log::Write("starting multi-device BLE host (stadia-ble-v8-hos2250, HOS=0x%x)", static_cast<u32>(hos::GetVersion()));
             LoadKnownStadia();
 
             if (R_FAILED(PrepareClient())) {

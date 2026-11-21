@@ -511,7 +511,8 @@ Result btdrvUnregisterGattNotification(u32 conn_id, bool, const BtdrvGattId *, c
 }
 
 Result btdrvWriteGattDescriptor(u32 conn_id, bool, const BtdrvGattId *, const BtdrvGattId *attr, const BtdrvGattId *, const u8 *data, size_t size, int auth) {
-    assert(size == 2 && (data[0] == 0 || data[0] == 1) && data[1] == 0);
+    // Regression guard: NEVER write CCCD=0x0000 on Stadia (ble_v7_test1.log proved it silences notifications)!
+    assert(size == 2 && data[0] == 1 && data[1] == 0);
     ++g_sim.cccd_write_count;
     return SimStartGattOp(g_sim.FindConnById(conn_id), BtdrvGattOperationType_DescriptorWrite, attr->uuid.value, auth, true, data[0]);
 }
@@ -613,9 +614,9 @@ static void Test2_Stage0_DirectNoMitmEncryptsEvenWhenPlainCccdWouldHaveReturnedO
     assert(host.stage == 0 && host.radio_cycles == 0);
     assert(g_sim.create_bond_count == 0);
     assert(g_sim.smp_pair_count == 1);      // Actually encrypted the link!
-    assert(g_sim.cccd_write_count == 2);    // CCCD 0x0000 -> 0x0001 toggle with NoMitm!
+    assert(g_sim.cccd_write_count == 1);    // Direct NoMitm CCCD=0x0001 write once (never 0x0000)!
     assert(g_sim.busy_0x2a671_count == 0);
-    assert(g_sim.conns[conn_id].encrypted && g_sim.conns[conn_id].cccd_disabled_first && g_sim.conns[conn_id].cccd_enabled);
+    assert(g_sim.conns[conn_id].encrypted && !g_sim.conns[conn_id].cccd_disabled_first && g_sim.conns[conn_id].cccd_enabled);
     assert(hid.write_auth_req == BtdrvGattAuthReqType_NoMitm);
     assert(!hid.has_pnp_id);                // Must NOT read 0x2A50 on Stadia!
     assert(hid.has_output_report && hid.output_report.handle == 0x0044 && hid.output_report.id.instance_id == 1);
@@ -632,10 +633,10 @@ static void Test3_Stage0_Att05DeviceDirectNoMitmSmp() {
     assert(host.stage == 0 && host.radio_cycles == 0);
     assert(g_sim.create_bond_count == 0);        // Never touched broken CreateBond!
     assert(g_sim.smp_pair_count == 1);           // Triggered real on-demand SMP_Pair via 0xc5848!
-    assert(g_sim.cccd_write_count == 2);         // CCCD 0x0000 -> 0x0001 toggle -> SMP -> OK!
+    assert(g_sim.cccd_write_count == 1);         // Direct NoMitm CCCD=0x0001 write -> SMP -> OK!
     assert(g_sim.busy_0x2a671_count == 0);       // Zero 0x2a671 BUSY!
     assert(g_sim.zombie_timer_fires == 0);
-    assert(g_sim.conns[conn_id].encrypted && g_sim.conns[conn_id].cccd_disabled_first && g_sim.conns[conn_id].cccd_enabled);
+    assert(g_sim.conns[conn_id].encrypted && !g_sim.conns[conn_id].cccd_disabled_first && g_sim.conns[conn_id].cccd_enabled);
     assert(hid.write_auth_req == BtdrvGattAuthReqType_NoMitm);
     assert(!hid.has_pnp_id);
 }
@@ -882,7 +883,7 @@ static void Test10_Result26DirtyNotifTableAndCccdToggleReconnect() {
     gatt::HidService hid1{};
     assert(R_SUCCEEDED(gatt::Subscribe(0, cid1, &hid1, gatt::SubscribeAuthMode::PlainOnlyAfterBond)));
     assert(g_sim.conns[cid1].notif_registered);
-    assert(g_sim.conns[cid1].cccd_disabled_first && g_sim.conns[cid1].cccd_enabled);
+    assert(!g_sim.conns[cid1].cccd_disabled_first && g_sim.conns[cid1].cccd_enabled);
     assert(g_sim.busy_0x2a671_count == 0);
 
     // Conn #1 ends with result=26 (exact ble_v6_test1.log line 156!) -> leaves dirty entry in g_gatt_manager!
@@ -899,9 +900,9 @@ static void Test10_Result26DirtyNotifTableAndCccdToggleReconnect() {
     assert(pairing::PrepareSecurityWithStrategy(0, StadiaAddr, pairing::SecurityStrategy::BleSecurityGrant));
     gatt::HidService hid2{};
     assert(R_SUCCEEDED(gatt::Subscribe(0, cid2, &hid2, gatt::SubscribeAuthMode::PlainOnlyAfterBond)));
-    // Must have purged dirty entry and truly called BSA_GattcRegisterNotification + toggled CCCD!
+    // Must have purged dirty entry and truly called BSA_GattcRegisterNotification + written CCCD=0x0001 ONCE!
     assert(g_sim.conns[cid2].notif_registered);
-    assert(g_sim.conns[cid2].cccd_disabled_first && g_sim.conns[cid2].cccd_enabled);
+    assert(!g_sim.conns[cid2].cccd_disabled_first && g_sim.conns[cid2].cccd_enabled);
     assert(g_sim.busy_0x2a671_count == 0);
 
     // Conn #2 ends with result=0 -> Conn #3 (flags=0x05) also works cleanly
@@ -916,7 +917,7 @@ static void Test10_Result26DirtyNotifTableAndCccdToggleReconnect() {
     gatt::HidService hid3{};
     assert(R_SUCCEEDED(gatt::Subscribe(0, cid3, &hid3, gatt::SubscribeAuthMode::PlainOnlyAfterBond)));
     assert(g_sim.conns[cid3].notif_registered);
-    assert(g_sim.conns[cid3].cccd_disabled_first && g_sim.conns[cid3].cccd_enabled);
+    assert(!g_sim.conns[cid3].cccd_disabled_first && g_sim.conns[cid3].cccd_enabled);
     assert(g_sim.busy_0x2a671_count == 0);
 }
 

@@ -419,10 +419,6 @@ namespace ams::ble::gatt {
             ? static_cast<u8>(BtdrvGattAuthReqType_NoMitm)
             : static_cast<u8>(BtdrvGattAuthReqType_None);
 
-        const bool toggle_cccd_for_stadia =
-            (auth_mode == SubscribeAuthMode::PlainOnlyAfterBond) ||
-            (auth_mode == SubscribeAuthMode::NoMitmCccdOnly);
-
         Result result = svc::ResultNotFound();
         for (size_t i = 0; i < count; ++i) {
             const auto attr = s.table.attributes[i];
@@ -443,7 +439,8 @@ namespace ams::ble::gatt {
             // Work around bt_nso 0x2c26c bug: when a previous connection ended with ClientConnection result != 0
             // (e.g. result=26 on supervision timeout), bt_nso skipped BSA_GattcDeregisterNotification and left a
             // stale entry in g_gatt_manager, causing btdrvRegisterGattNotification to early-return 0 without
-            // calling BSA_GattcRegisterNotification. Unregistering on the live conn_id first purges any stale entry.
+            // calling BSA_GattcRegisterNotification. Unregistering on the live conn_id first purges any stale entry
+            // (and is a pure no-op at bt_nso 0x6578 when the table is empty on first connect).
             const Result unreg_rc = btdrvUnregisterGattNotification(conn_id, service.is_primary, &service.id, &attr.id);
             log::Write("btdrvUnregisterGattNotification(pre-clean) slot=%u handle=0x%04x rc=0x%x", slot_index, attr.handle, unreg_rc.GetValue());
 
@@ -451,21 +448,9 @@ namespace ams::ble::gatt {
             log::Write("btdrvRegisterGattNotification slot=%u handle=0x%04x rc=0x%x", slot_index, attr.handle, rc.GetValue());
             R_TRY(rc);
 
-            if (toggle_cccd_for_stadia) {
-                // Stadia BLE firmware quirk: on reconnect or post-pair sessions, writing 0x0000 -> 0x0001
-                // guarantees a clean rising-edge transition that restarts Input Report 0x03 notifications.
-                const u8 disable_notifications[2] = { 0x00, 0x00 };
-                u32 disable_status = 0;
-                const Result disable_rc = WriteCccdValueWithAuth(slot_index, conn_id, service, attr, *cccd, disable_notifications, active_auth, TimeSpan::FromSeconds(3), &disable_status, false);
-                R_UNLESS(!events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled(), ResultNoConnection());
-                if (R_FAILED(disable_rc)) {
-                    // If the disable write timed out, bt_nso's GATT channel stays BUSY (0x2a671); abort cleanly.
-                    if (svc::ResultTimedOut::Includes(disable_rc)) {
-                        R_TRY(disable_rc);
-                    }
-                    log::Write("slot %u: CCCD disable pre-toggle returned rc=0x%x status=%u; proceeding to enable", slot_index, disable_rc.GetValue(), disable_status);
-                }
-            }
+            // NOTE: Never pre-write CCCD=0x0000 on Stadia! Real hardware (ble_v7_test1.log) proved
+            // writing 0x0000 -> 0x0001 silences Stadia HID Input Report notifications completely;
+            // always write 0x0001 directly once.
 
             u32 gatt_status = 0;
             const TimeSpan initial_timeout = (auth_mode == SubscribeAuthMode::NoMitmCccdOnly)

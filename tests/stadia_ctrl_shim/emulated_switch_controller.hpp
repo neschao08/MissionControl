@@ -9,6 +9,10 @@ namespace ams::controller {
         BasicOutputReport   = 0x10,
     };
 
+    struct SwitchHidBasicInputReport {
+        u8 data[0x31];
+    };
+
     enum class SwitchButton : u32 {
         Y       = 1u << 0,
         X       = 1u << 1,
@@ -61,6 +65,12 @@ namespace ams::controller {
                 m_last_output_id = size > 0 ? report_buffer[0] : 0;
                 return {0};
             }
+            virtual Result InjectInputReport(const u8 *report_buffer, size_t size) {
+                (void)report_buffer;
+                (void)size;
+                ++m_inject_calls;
+                return {0};
+            }
             virtual void DisconnectBle() = 0;
 
             void HandleDataReportEvent(const bluetooth::HidReportEventInfo *info) {
@@ -77,9 +87,16 @@ namespace ams::controller {
             u16 TestRightY() const { return m_right_stick.y; }
             u32 TestDataEvents() const { return m_data_report_events; }
             u32 TestOutputCalls() const { return m_output_calls; }
+            u32 TestInjectCalls() const { return m_inject_calls; }
             void TestSetTriggerThreshold(float t) { m_trigger_threshold = t; }
 
         protected:
+            size_t FillBasicInputReport(u8 *report_buffer, size_t size) {
+                const size_t n = std::min<size_t>(size, sizeof(SwitchHidBasicInputReport));
+                std::memset(report_buffer, 0, n);
+                if (n > 0) report_buffer[0] = 0x30;
+                return n;
+            }
             virtual void ParseInputReport(const u8 *report_buffer, size_t size) = 0;
             virtual Result SetVibration(const SwitchMotorData *motor_data) = 0;
             virtual Result WriteDataReport(const void *report_buffer, size_t size) = 0;
@@ -92,6 +109,7 @@ namespace ams::controller {
             float m_trigger_threshold = 0.5f;
             u32 m_data_report_events = 0;
             u32 m_output_calls = 0;
+            u32 m_inject_calls = 0;
             u8 m_last_output_id = 0;
     };
 }

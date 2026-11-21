@@ -356,11 +356,19 @@ namespace ams::ble::gatt {
         out->has_pnp_id = false;
         std::memset(out->device_name, 0, sizeof(out->device_name));
 
-        // Never issue another GATT op after a timeout on the same conn_id: bt_nso keeps the
-        // client channel busy (0x2a671 GATT_OPERATION_BUSY) until the timed-out op settles or disconnects.
-        if (auth_mode == SubscribeAuthMode::StandardNoMitm) {
-            // Authenticated reads request encryption (pairing first if needed).
-            // Skip long GattCharReportMap (0x2A4B); use short GattCharHidInformation (0x2A4A) only.
+        u8 active_auth = (auth_mode == SubscribeAuthMode::StandardNoMitm || auth_mode == SubscribeAuthMode::NoMitmCccdOnly)
+            ? static_cast<u8>(BtdrvGattAuthReqType_NoMitm)
+            : static_cast<u8>(BtdrvGattAuthReqType_None);
+
+        // Read 0x2A4A (HID Information) across all modes before notification setup:
+        // - StandardNoMitm: requests encryption (pairing first if needed) with 5s wait & retries.
+        // - Stadia modes: invokes HidServer::OnReadHidInfo (0x600816b0) on the controller, which
+        //   takes GattServer::OnRead's success branch (0x6006b004) and resets its in-read-callback
+        //   gate ([GattServer + 0x1975] = 0) before CCCD subscribe so input notifications flow.
+        {
+            const TimeSpan hid_info_timeout = (auth_mode == SubscribeAuthMode::StandardNoMitm)
+                ? TimeSpan::FromSeconds(5)
+                : TimeSpan::FromSeconds(2);
             bool found_hid_info = false;
             for (size_t i = 0; i < count; ++i) {
                 const auto attr = s.table.attributes[i];
@@ -376,20 +384,38 @@ namespace ams::ble::gatt {
                     Result rc = ResultSuccess();
                     for (int attempt = 0; ; ++attempt) {
                         R_UNLESS(!events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled(), ResultNoConnection());
-                        rc = btdrvReadGattCharacteristic(conn_id, service.is_primary, &service.id, &attr.id, BtdrvGattAuthReqType_NoMitm);
-                        log::Write("btdrvReadGattCharacteristic slot=%u handle=0x%04x rc=0x%x", slot_index, attr.handle, rc.GetValue());
+                        rc = btdrvReadGattCharacteristic(conn_id, service.is_primary, &service.id, &attr.id, active_auth);
+                        log::Write("btdrvReadGattCharacteristic(0x2a4a) slot=%u handle=0x%04x auth=%u rc=0x%x",
+                            slot_index, attr.handle, active_auth, rc.GetValue());
                         // Refused locally while the pad's connection parameter update is in flight; it clears within a second or two
-                        if (!ResultInsufficientAuthentication::Includes(rc) || (attempt >= 4) || events::IsSlotDisconnected(slot_index) || !events::IsRadioEnabled()) {
+                        if ((active_auth != BtdrvGattAuthReqType_NoMitm) || !ResultInsufficientAuthentication::Includes(rc) ||
+                            (attempt >= 4) || events::IsSlotDisconnected(slot_index) || !events::IsRadioEnabled()) {
                             break;
                         }
                         events::Pump(TimeSpan::FromSeconds(1));
                     }
-                    R_TRY(rc);
-                    R_TRY(WaitForOperation(slot_index, conn_id, BtdrvGattOperationType_CharacteristicRead,
-                        GattCharHidInformation, TimeSpan::FromSeconds(5)));
+                    if (auth_mode == SubscribeAuthMode::StandardNoMitm) {
+                        R_TRY(rc);
+                        R_TRY(WaitForOperation(slot_index, conn_id, BtdrvGattOperationType_CharacteristicRead,
+                            GattCharHidInformation, hid_info_timeout));
+                    } else if (R_SUCCEEDED(rc)) {
+                        EventRecord read_evt = {};
+                        const Result wait_rc = WaitForOperation(slot_index, conn_id, BtdrvGattOperationType_CharacteristicRead,
+                            GattCharHidInformation, hid_info_timeout, &read_evt);
+                        log::Write("slot %u: HidInformation read rc=0x%x size=%u",
+                            slot_index, wait_rc.GetValue(), R_SUCCEEDED(wait_rc) ? read_evt.info.client_notify.size : 0u);
+                        R_UNLESS(!events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled(), ResultNoConnection());
+                        if (svc::ResultTimedOut::Includes(wait_rc)) {
+                            // Timed-out op leaves bt_nso GATT channel busy (0x2a671); abort cleanly.
+                            R_RETURN(wait_rc);
+                        }
+                    }
+                    break;
                 }
             }
-            R_UNLESS(found_hid_info, svc::ResultNotFound());
+            if (auth_mode == SubscribeAuthMode::StandardNoMitm) {
+                R_UNLESS(found_hid_info, svc::ResultNotFound());
+            }
         }
 
         // First scan writable Report characteristics for rumble output without sending any GATT traffic.
@@ -415,11 +441,6 @@ namespace ams::ble::gatt {
                 out->output_report.property, out->output_write_with_response ? 1u : 0u, out->write_auth_req);
         }
 
-        u8 active_auth = (auth_mode == SubscribeAuthMode::StandardNoMitm || auth_mode == SubscribeAuthMode::NoMitmCccdOnly)
-            ? static_cast<u8>(BtdrvGattAuthReqType_NoMitm)
-            : static_cast<u8>(BtdrvGattAuthReqType_None);
-
-        const bool notif_preclean = events::TakeNotifTableDirty();
         Result result = svc::ResultNotFound();
         for (size_t i = 0; i < count; ++i) {
             const auto attr = s.table.attributes[i];
@@ -437,17 +458,8 @@ namespace ams::ble::gatt {
 
             R_UNLESS(!events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled(), ResultNoConnection());
 
-            // Work around bt_nso 0x2c26c bug: when a previous connection ended with ClientConnection result != 0
-            // (e.g. result=26), bt_nso skipped BSA_GattcDeregisterNotification and left a stale entry in
-            // g_gatt_manager, causing btdrvRegisterGattNotification to early-return 0 without calling
-            // BSA_GattcRegisterNotification. ONLY purge when such a dirty disconnect actually happened:
-            // real hardware (v7/v8) showed an unconditional Unregister right before Register on a clean
-            // first connection leaves Stadia with zero input reports, while v6 (no pre-clean) worked.
-            if (notif_preclean) {
-                const Result unreg_rc = btdrvUnregisterGattNotification(conn_id, service.is_primary, &service.id, &attr.id);
-                log::Write("btdrvUnregisterGattNotification(pre-clean after dirty disconnect) slot=%u handle=0x%04x rc=0x%x", slot_index, attr.handle, unreg_rc.GetValue());
-            }
-
+            // Match upstream stek_ble_gatt: never call btdrvUnregisterGattNotification before Register
+            // or during teardown, as real hardware (v7-v9) showed it corrupts bt_nso's notification state.
             Result rc = btdrvRegisterGattNotification(conn_id, service.is_primary, &service.id, &attr.id);
             log::Write("btdrvRegisterGattNotification slot=%u handle=0x%04x rc=0x%x", slot_index, attr.handle, rc.GetValue());
             R_TRY(rc);
@@ -509,16 +521,10 @@ namespace ams::ble::gatt {
     }
 
     void Unsubscribe(u32 slot_index, u32 conn_id) {
-        const auto *service = FindService(slot_index, GattServiceHid);
-        if (!service) return;
-        const auto &table = g_slots[slot_index].table;
-        for (size_t i = 0; i < table.count; ++i) {
-            const auto &attr = table.attributes[i];
-            if ((attr.type == BtdrvGattAttributeType_Characteristic) && IsWithinService(attr, *service) &&
-                IsUuid16(attr.id.uuid, GattCharReport) && (attr.property & BtdrvGattCharacteristicProperty_Notify)) {
-                static_cast<void>(btdrvUnregisterGattNotification(conn_id, service->is_primary, &service->id, &attr.id));
-            }
-        }
+        // Intentional no-op matching upstream stek_ble_gatt: never call btdrvUnregisterGattNotification,
+        // as real hardware testing showed it disrupts notification delivery across subsequent connections.
+        (void)slot_index;
+        (void)conn_id;
     }
 
     bool HasCachedAddress(u32 slot_index, const bluetooth::Address &address) {

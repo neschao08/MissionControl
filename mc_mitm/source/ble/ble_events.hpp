@@ -59,7 +59,6 @@ namespace ams::ble::events {
     bool IsSlotDisconnected(u32 slot);
     u32 GetSlotConnectionId(u32 slot);
     u16 GetSlotDisconnectReason(u32 slot);
-    bool TakeNotifTableDirty();
     bool TakeSlotBondComplete(u32 slot);
 
     /* Bounded four-slot lookup; the returned reference protects in-flight dispatch during teardown. */
@@ -91,6 +90,9 @@ namespace ams::ble::events {
     void SetInquiryActive(bool active);
     bool IsPairingWindowOpen();
     u32 PairingWindowGeneration();
+    void NoteClassicActivity();
+    bool ClassicActivityWithin(TimeSpan span);
+    s64 NowMs();
 
     // The console's sleep state (from the psc power module): no radio activity is allowed while asleep
     void SetRadioEnabled(bool enabled);

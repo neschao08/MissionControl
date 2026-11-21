@@ -214,17 +214,9 @@ int main() {
     assert(query_times.size() == 1 && query_times[0] >= 2000);
     assert(mtu_connections == std::vector<u32>{260});
     AssertSubscribed(0, 260);
-    assert(unregister_count == 0); // clean first connect: NEVER Unregister before Register (v7/v8 zero-input regression)
+    assert(unregister_count == 0); // clean first connect: NEVER Unregister before Register (v7/v8/v10 zero-input regression)
     gatt::Unsubscribe(0, 260);
-    assert(unregister_count == 1);
-
-    // After a dirty (result != 0) disconnect, the next subscription must purge the stale bt_nso entry exactly once.
-    Reset();
-    events::notif_dirty = true;
-    assert(R_SUCCEEDED(gatt::Discover(0, 260, a)));
-    AssertSubscribed(0, 260);
-    assert(unregister_count == 1);
-    assert(!events::notif_dirty);
+    assert(unregister_count == 0); // v10: never call btdrvUnregisterGattNotification even on Unsubscribe
 
     Reset(DiscoveryMode::AfterMtu);
     assert(R_SUCCEEDED(gatt::Discover(0, 260, a)));
@@ -429,28 +421,27 @@ int main() {
         assert(cccd_auths.empty());
         events::completed = true;
 
-        // NoMitmCccdOnly (Stadia Stage 1): skips 0x2A4A AND skips 0x2A50/0x2A00 (which stall 28.36s on Stadia),
-        // pre-cleans stale bt_nso notif table via Unregister ONLY after a dirty disconnect, writes CCCD=0x0001 ONCE with NoMitm (never 0x0000)!
+        // NoMitmCccdOnly (Stadia Stage 1): reads 0x2A4A to clear [GattServer+0x1975], skips 0x2A50/0x2A00,
+        // never calls btdrvUnregisterGattNotification, and writes CCCD=0x0001 ONCE with NoMitm (never 0x0000)!
         read_uuids.clear(); read_auths.clear(); cccd_auths.clear();
         const int unreg_before = unregister_count;
-        events::notif_dirty = true;
         gatt::HidService nomitm_direct{};
         assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &nomitm_direct, gatt::SubscribeAuthMode::NoMitmCccdOnly)));
-        assert(unregister_count == unreg_before + 1);
-        assert(!events::notif_dirty);
+        assert(unregister_count == unreg_before);
         assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_NoMitm}));
         assert(nomitm_direct.write_auth_req == BtdrvGattAuthReqType_NoMitm);
         assert(nomitm_direct.has_output_report && nomitm_direct.output_report.handle == out_handle);
-        assert(read_uuids.empty()); // Zero DIS/GAP/HID-Info reads!
+        assert(read_uuids == std::vector<u16>({GattCharHidInformation}));
+        assert(read_auths == std::vector<int>({BtdrvGattAuthReqType_NoMitm}));
 
-        // PlainThenNoMitm: skips 0x2A4A & 0x2A50, tries plaintext CCCD first; succeeds with write_auth_req=None
+        // PlainThenNoMitm: reads 0x2A4A first, skips 0x2A50/0x2A00, tries plaintext CCCD first; succeeds with write_auth_req=None
         read_uuids.clear(); read_auths.clear(); cccd_auths.clear();
         gatt::HidService plain_ok{};
         assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &plain_ok, gatt::SubscribeAuthMode::PlainThenNoMitm)));
         assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_None}));
         assert(plain_ok.write_auth_req == BtdrvGattAuthReqType_None);
         assert(plain_ok.has_output_report && plain_ok.output_report.handle == out_handle);
-        assert(read_uuids.empty());
+        assert(read_uuids == std::vector<u16>({GattCharHidInformation}));
 
         // PlainThenNoMitm: plaintext CCCD gets ATT 0x05 (Insufficient Auth -> GATT IDLE), escalates to NoMitm -> succeeds!
         read_uuids.clear(); read_auths.clear(); cccd_auths.clear();
@@ -459,7 +450,7 @@ int main() {
         assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &escalated, gatt::SubscribeAuthMode::PlainThenNoMitm)));
         assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_None, BtdrvGattAuthReqType_NoMitm}));
         assert(escalated.write_auth_req == BtdrvGattAuthReqType_NoMitm);
-        assert(read_uuids.empty());
+        assert(read_uuids == std::vector<u16>({GattCharHidInformation}));
         cccd_plain_failure = 0;
 
         // PlainThenNoMitm: plaintext CCCD times out -> must NOT escalate into 0x2a671 BUSY
@@ -470,13 +461,13 @@ int main() {
         assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_None}));
         cccd_completed = true;
 
-        // PlainOnlyAfterBond (Stadia Stage 0 & 2): skips 0x2A4A & 0x2A50, writes CCCD=0x0001 ONCE with None (never 0x0000)
+        // PlainOnlyAfterBond (Stadia Stage 0 & 2): reads 0x2A4A, skips 0x2A50, writes CCCD=0x0001 ONCE with None (never 0x0000)
         read_uuids.clear(); cccd_auths.clear();
         gatt::HidService after_bond{};
         assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &after_bond, gatt::SubscribeAuthMode::PlainOnlyAfterBond)));
         assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_None}));
         assert(after_bond.write_auth_req == BtdrvGattAuthReqType_None);
-        assert(read_uuids.empty());
+        assert(read_uuids == std::vector<u16>({GattCharHidInformation}));
 
         cccd_auths.clear();
         cccd_plain_failure = 5;

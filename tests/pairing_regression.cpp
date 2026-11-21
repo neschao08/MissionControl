@@ -6,6 +6,7 @@ static constexpr ams::bluetooth::Address Target = {{0x14,0xcb,0x65,0xe8,0x2b,0xe
 static unsigned removes, ext_removes, connects, cancels, bond_cancels, bonds, set_encryptions, ble_sec_grants;
 static u64 connected_at;
 static bool remove_fails, ext_remove_fails, cancel_bond_fails, connect_fails, respond, late_connection, new_bond, bond_fails;
+static int fail_connect_event_once = 0;
 static u32 set_encryption_raw_rc;
 static bool set_encryption_emits_bond;
 static bool callback_on_bond_cancel, radio_off_on_bond_cancel;
@@ -34,6 +35,18 @@ Result btdrvCancelBond(ams::bluetooth::Address addr) {
 Result btdrvConnectGattServer(u8 client, ams::bluetooth::Address addr, bool direct, u64 aruid) {
     assert(client == 3 && AddressEqual(addr, Target) && direct && aruid == 0);
     ++connects; connected_at = events::now_ms;
+    if (fail_connect_event_once > 0) {
+        --fail_connect_event_once;
+        EventRecord rej{};
+        rej.info.client_connection.result = 1;
+        rej.info.client_connection.status = 1;
+        rej.info.client_connection.client_if = 3;
+        rej.info.client_connection.conn_id = 0;
+        rej.info.client_connection.address = Target;
+        rej.info.client_connection.reason = 0x26;
+        events::Schedule(BtdrvBleEventType_ClientConnection, 50, rej);
+        return {connect_fails ? 6u : 0u};
+    }
     if (respond) {
         EventRecord record;
         record.info.client_connection.address = Target;
@@ -76,6 +89,7 @@ static void Reset() {
     set_encryption_raw_rc = 0;
     set_encryption_emits_bond = false;
     callback_on_bond_cancel = radio_off_on_bond_cancel = false;
+    fail_connect_event_once = 0;
     respond = new_bond = true;
 }
 int main() {
@@ -230,6 +244,12 @@ int main() {
         assert(R_SUCCEEDED(pairing::Connect(0, 3, Target, &cid, TimeSpan::FromSeconds(15), false)));
         assert(removes == 0 && ext_removes == 0 && connects == 1);
     }
+
+    // Immediate (<800ms) stack refusal during Classic inquiry (result != 0, reason != 0x003e) retries cleanly
+    Reset();
+    fail_connect_event_once = 1;
+    assert(R_SUCCEEDED(Connect()));
+    assert(connects == 2 && removes == 1 && cancels == 1 && events::now_ms == 570);
 
     std::cout << "BLE production reconnect/pairing regressions passed\n";
 }

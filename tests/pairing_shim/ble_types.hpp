@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
-using u8 = uint8_t; using u16 = uint16_t; using u32 = uint32_t; using u64 = uint64_t;
+using s64 = int64_t; using u8 = uint8_t; using u16 = uint16_t; using u32 = uint32_t; using u64 = uint64_t;
 struct Result { unsigned value; unsigned GetValue() const { return value; } };
 #define R_FAILED(r) ((r).value != 0)
 #define R_SUCCEEDED(r) (!R_FAILED(r))
@@ -12,11 +12,13 @@ struct Result { unsigned value; unsigned GetValue() const { return value; } };
 #define R_SUCCEED() return Result{0}
 #define R_TRY(r) do { auto rc_ = (r); if (R_FAILED(rc_)) return rc_; } while (0)
 #define R_UNLESS(p,r) do { if (!(p)) return (r); } while (0)
+inline Result ResultSuccess() { return {0}; }
 namespace svc { inline Result ResultTimedOut() { return {2}; } }
 struct TimeSpan {
     u64 milliseconds;
     static TimeSpan FromSeconds(int seconds) { return {u64(seconds) * 1000}; }
     static TimeSpan FromMilliSeconds(int ms) { return {u64(ms)}; }
+    s64 GetMilliSeconds() const { return static_cast<s64>(milliseconds); }
 };
 namespace ams::bluetooth { struct Address { u8 address[6]; }; }
 constexpr int BtdrvBleEventType_ClientConnection = 1;

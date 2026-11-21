@@ -24,7 +24,14 @@ namespace ams::ble::pairing {
     // BTM_BLE_SEC_ENCRYPT_NO_MITM (2): triggers SMP_Pair via btm_ble_set_encryption without CreateBond's 35-tick state leak.
     constexpr u8 BtmBleSecAct_EncryptNoMitm = 2;
 
-    static Result WaitForConnection(u32 slot, u8 client_if, const bluetooth::Address &address, u32 *out_conn_id, TimeSpan timeout) {
+    constexpr s64 ConnectRefusedRetryWindowMs = 11000;
+    constexpr s64 ConnectRefusedMaxElapsedMs  = 800;
+    constexpr s64 ConnectRefusedRetryDelayMs  = 500;
+
+    static Result WaitForConnection(u32 slot, u8 client_if, const bluetooth::Address &address, u32 *out_conn_id, TimeSpan timeout, bool *out_refused_by_stack = nullptr) {
+        if (out_refused_by_stack) {
+            *out_refused_by_stack = false;
+        }
         EventRecord e;
         if (!events::WaitFor(events::InvalidType, timeout, &e, [&](const EventRecord &r) {
             return !events::IsRadioEnabled() || events::IsSlotDisconnected(slot) ||
@@ -35,6 +42,9 @@ namespace ams::ble::pairing {
 
         R_UNLESS(events::IsRadioEnabled() && e.type == BtdrvBleEventType_ClientConnection, ResultNoConnection());
         if ((e.info.client_connection.result != 0) || (e.info.client_connection.status != BleConnectionStatus_Connected)) {
+            if (out_refused_by_stack && (e.info.client_connection.result != 0)) {
+                *out_refused_by_stack = true;
+            }
             log::Write("slot %u: connection failed result=%u status=%u", slot, e.info.client_connection.result, e.info.client_connection.status);
             R_THROW(ResultNoConnection());
         }
@@ -83,13 +93,49 @@ namespace ams::ble::pairing {
             log::Write("slot %u: preserving existing BLE bond record for reconnect", slot);
         }
 
-        Result rc = btdrvConnectGattServer(client_if, address, true, 0);
-        log::Write("btdrvConnectGattServer slot=%u client_if=%u rc=0x%x", slot, client_if, rc.GetValue());
-        R_TRY(rc);
+        // While btm runs a classic inquiry (10.24 s, e.g. at boot or when the Controllers screen opens),
+        // the stack turns an ACL connection request down at once with result=26. Keep retrying every
+        // 500ms within 11s until the inquiry finishes instead of abandoning the pad.
+        const s64 deadline_ms = events::NowMs() + ConnectRefusedRetryWindowMs;
+        int refused = 0;
+        Result rc = ResultSuccess();
+        for (;;) {
+            const s64 attempt_started_ms = events::NowMs();
+            rc = btdrvConnectGattServer(client_if, address, true, 0);
+            log::Write("btdrvConnectGattServer slot=%u client_if=%u rc=0x%x", slot, client_if, rc.GetValue());
+            R_TRY(rc);
 
-        rc = WaitForConnection(slot, client_if, address, out_conn_id, timeout);
-        if (R_FAILED(rc) && events::IsRadioEnabled()) {
-            static_cast<void>(btdrvCancelConnectGattServer(client_if, address, true));
+            bool refused_by_stack = false;
+            rc = WaitForConnection(slot, client_if, address, out_conn_id, timeout, &refused_by_stack);
+            if (R_SUCCEEDED(rc)) {
+                break;
+            }
+            if (events::IsRadioEnabled()) {
+                static_cast<void>(btdrvCancelConnectGattServer(client_if, address, true));
+            }
+
+            const s64 now_ms = events::NowMs();
+            const bool immediate_busy_refusal =
+                ResultNoConnection::Includes(rc) &&
+                refused_by_stack &&
+                ((now_ms - attempt_started_ms) < ConnectRefusedMaxElapsedMs) &&
+                (events::GetSlotDisconnectReason(slot) != 0x003e);
+            if (!immediate_busy_refusal || (now_ms >= deadline_ms) || !events::IsRadioEnabled()) {
+                break;
+            }
+            if (++refused == 1) {
+                log::Write("slot %u: connection refused immediately while radio is busy; retrying", slot);
+            }
+            events::WaitFor(events::InvalidType, TimeSpan::FromMilliSeconds(ConnectRefusedRetryDelayMs), nullptr, [](const EventRecord &) {
+                return !events::IsRadioEnabled();
+            });
+            if (!events::IsRadioEnabled()) {
+                break;
+            }
+            events::SetSlotConnecting(slot, address);
+        }
+        if (refused > 0) {
+            log::Write("slot %u: %s after %d refused connection attempts", slot, R_SUCCEEDED(rc) ? "connected" : "gave up", refused);
         }
         R_RETURN(rc);
     }

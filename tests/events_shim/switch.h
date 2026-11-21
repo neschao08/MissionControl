@@ -26,6 +26,8 @@ namespace ams {
         constexpr TimeSpan operator+(TimeSpan o) const { return {ms + o.ms}; }
         constexpr TimeSpan operator-(TimeSpan o) const { return {ms - o.ms}; }
         constexpr bool operator>=(TimeSpan o) const { return ms >= o.ms; }
+        constexpr bool operator<(TimeSpan o) const { return ms < o.ms; }
+        constexpr s64 GetMilliSeconds() const { return ms; }
     };
 }
 namespace ams::os {
@@ -43,6 +45,7 @@ namespace ams::os {
         s64 v;
         s64 GetInt64Value() const { return v; }
         TimeSpan ToTimeSpan() const { return {v}; }
+        Tick operator-(Tick o) const { return {v - o.v}; }
     };
     inline Tick GetSystemTick() { return {g_tick_ms}; }
 }
@@ -87,9 +90,10 @@ enum BtdrvBleEventType : u32 {
 };
 
 enum BtdrvEventType : u32 {
-    BtdrvEventType_SspRequest     = 3,
-    BtdrvEventType_Connection     = 4,
-    BtdrvEventType_BluetoothCrash = 10,
+    BtdrvEventType_PairingPinCodeRequest = 2,
+    BtdrvEventType_SspRequest            = 3,
+    BtdrvEventType_Connection            = 4,
+    BtdrvEventType_BluetoothCrash        = 10,
 };
 
 enum BtdrvGattOperationType : u8 {
@@ -123,6 +127,11 @@ struct BtdrvBleEventInfo {
 struct BtdrvEventInfo {
     union {
         u8 raw[0x400];
+        struct {
+            BtdrvAddress addr;
+            char name[0xF9];
+            u8 cod[3];
+        } pairing_pin_code_request;
         struct {
             struct { BtdrvAddress addr; char name[0xF9]; u8 cod[3]; u8 flag; u8 pad; s32 passkey; } v12;
         } ssp_request;

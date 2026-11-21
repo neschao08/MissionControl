@@ -13,6 +13,7 @@ inline void Schedule(int type, u64 delay_ms, EventRecord record = {}) {
     queue.push_back({now_ms + delay_ms, record});
     std::stable_sort(queue.begin(), queue.end(), [](const auto &a, const auto &b) { return a.at_ms < b.at_ms; });
 }
+inline s64 NowMs() { return static_cast<s64>(now_ms); }
 inline bool IsRadioEnabled() { return radio; }
 inline bool IsSlotDisconnected(u32) { return disconnected; }
 inline u32 GetSlotConnectionId(u32) { return disconnected ? InvalidConnId : conn_id; }

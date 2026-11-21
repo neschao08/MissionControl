@@ -46,7 +46,7 @@ namespace ams::ble::events {
         os::Event g_sleep_prepared_event(os::EventClearMode_ManualClear);
         std::atomic<bool> g_controller_count_changed{false};
         std::atomic<bool> g_quiet_scan_logs{false};
-        std::atomic<bool> g_notif_table_dirty{false};
+        std::atomic<s64> g_classic_activity_tick{0};
         std::atomic<u64> g_input_report_count{0};
         std::atomic<u64> g_slot_input_report_counts[MaxBleControllers] = {};
         std::atomic<u32> g_slot_rumble_ack_logs[MaxBleControllers] = {};
@@ -279,10 +279,6 @@ namespace ams::ble::events {
         return g_slots[slot].conn_id;
     }
 
-    bool TakeNotifTableDirty() {
-        return g_notif_table_dirty.exchange(false, std::memory_order_acq_rel);
-    }
-
     u16 GetSlotDisconnectReason(u32 slot) {
         std::scoped_lock lk(g_lock);
         if (slot >= MaxBleControllers) {
@@ -465,9 +461,6 @@ namespace ams::ble::events {
                         if (!connected && ((g_slots[slot].conn_id == InvalidConnId) || (connection.conn_id == g_slots[slot].conn_id))) {
                             g_slots[slot].disconnected = true;
                             g_slots[slot].disconnect_reason = connection.reason;
-                            if (connection.result != 0) {
-                                g_notif_table_dirty.store(true, std::memory_order_release);
-                            }
                             UnregisterSlotController(slot);
                         } else if (connected) {
                             g_slots[slot].conn_id = connection.conn_id;
@@ -539,6 +532,7 @@ namespace ams::ble::events {
         }
 
         bool is_ours = false;
+        bool classic_activity = false;
         u32 matched_slot = InvalidSlot;
 
         {
@@ -582,12 +576,24 @@ namespace ams::ble::events {
             if (type == BtdrvEventType_SspRequest) {
                 if (check_match(info->ssp_request.v12.addr)) {
                     is_ours = true;
+                } else {
+                    classic_activity = true;
                 }
             } else if (type == BtdrvEventType_Connection) {
                 if (check_match(info->connection.v12.addr)) {
                     is_ours = true;
+                } else {
+                    classic_activity = true;
+                }
+            } else if (type == BtdrvEventType_PairingPinCodeRequest) {
+                if (!check_match(info->pairing_pin_code_request.addr)) {
+                    classic_activity = true;
                 }
             }
+        }
+
+        if (classic_activity) {
+            NoteClassicActivity();
         }
 
         if (!is_ours) {
@@ -723,6 +729,23 @@ namespace ams::ble::events {
     u32 PairingWindowGeneration() {
         std::scoped_lock lk(g_lock);
         return g_pairing_window_generation;
+    }
+
+    void NoteClassicActivity() {
+        g_classic_activity_tick.store(os::GetSystemTick().GetInt64Value(), std::memory_order_release);
+        g_ring_event.Signal();
+    }
+
+    bool ClassicActivityWithin(TimeSpan span) {
+        const s64 tick = g_classic_activity_tick.load(std::memory_order_acquire);
+        if (tick == 0) {
+            return false;
+        }
+        return (os::GetSystemTick() - os::Tick(tick)).ToTimeSpan() < span;
+    }
+
+    s64 NowMs() {
+        return os::GetSystemTick().ToTimeSpan().GetMilliSeconds();
     }
 
     void SetRadioEnabled(bool enabled) {

@@ -143,6 +143,15 @@ int main() {
         const u8 basic_out[2] = {0x10, 0x00};
         assert(R_SUCCEEDED(ctrl.HandleOutputDataReport(basic_out, sizeof(basic_out))));
         assert(ctrl.TestOutputCalls() == 1);
+
+        // CommandOutputReport subcmd 0x04 / 0x30 injects extra basic input report (pairing/grip confirmation)
+        const u32 inject_before = ctrl.TestInjectCalls();
+        u8 cmd04[12] = {}; cmd04[0] = 0x01; cmd04[10] = 0x04;
+        assert(R_SUCCEEDED(ctrl.HandleOutputDataReport(cmd04, sizeof(cmd04))));
+        u8 cmd30[12] = {}; cmd30[0] = 0x01; cmd30[10] = 0x30;
+        assert(R_SUCCEEDED(ctrl.HandleOutputDataReport(cmd30, sizeof(cmd30))));
+        assert(ctrl.TestInjectCalls() == inject_before + 2);
+
         ctrl.DisconnectBle();
         assert(ctrl.HandleBleInputReport(pkt10, sizeof(pkt10)).value == 11);
         assert(ctrl.HandleOutputDataReport(basic_out, sizeof(basic_out)).value == 11);

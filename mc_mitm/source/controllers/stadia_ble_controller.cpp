@@ -83,14 +83,20 @@ namespace ams::controller {
 
         std::scoped_lock lk(m_report_mutex, m_rumble_mutex);
         R_UNLESS(m_connected, svc::ResultInvalidState());
-        if ((report_id == SwitchHidReportId::CommandOutputReport) && (m_cmd_log_count < 6) && ble::log::IsEnabled()) {
+        const u8 subcmd = ((report_id == SwitchHidReportId::CommandOutputReport) && (size > 10)) ? report_buffer[10] : 0;
+        if ((report_id == SwitchHidReportId::CommandOutputReport) && (m_cmd_log_count < 20) && ble::log::IsEnabled()) {
             ++m_cmd_log_count;
-            const u8 subcmd = (size > 10) ? report_buffer[10] : 0;
-            const u8 arg0   = (size > 11) ? report_buffer[11] : 0;
+            const u8 arg0 = (size > 11) ? report_buffer[11] : 0;
             ble::log::Write("stadia cmd #%u conn_id=%u subcmd=0x%02x arg0=0x%02x size=%zu",
                 m_cmd_log_count, m_conn_id, subcmd, arg0, size);
         }
-        R_RETURN(EmulatedSwitchController::HandleOutputDataReport(report_buffer, size));
+        R_TRY(EmulatedSwitchController::HandleOutputDataReport(report_buffer, size));
+        if ((report_id == SwitchHidReportId::CommandOutputReport) && ((subcmd == 0x04) || (subcmd == 0x30))) {
+            u8 basic_report[sizeof(SwitchHidBasicInputReport)] = {};
+            const size_t basic_size = this->FillBasicInputReport(basic_report, sizeof(basic_report));
+            static_cast<void>(this->InjectInputReport(basic_report, basic_size));
+        }
+        R_SUCCEED();
     }
 
     void StadiaBleController::DisconnectBle() {

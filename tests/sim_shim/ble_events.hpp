@@ -59,6 +59,7 @@ namespace ams::ble::events {
     inline void SetSlotConnecting(u32 slot, const bluetooth::Address &addr) {
         slots[slot] = {true, addr, InvalidConnId, false, 0, false};
     }
+    inline s64 NowMs() { return static_cast<s64>(now_ms); }
     inline bool IsRadioEnabled() { return radio; }
     inline bool notif_dirty = false;
     inline bool TakeNotifTableDirty() { const bool v = notif_dirty; notif_dirty = false; return v; }

@@ -49,7 +49,6 @@ namespace ams::ble {
 
         constinit u8 g_client_if = InvalidClientIf;
         RadioRecovery g_radio_recovery;
-        u32 g_hid_data_path_generation = UINT32_MAX;
 
         constexpr s64 PairingRetryBackoffMs          = 5000;
         constexpr s64 StadiaRetryBackoffMs           = 1500;
@@ -57,7 +56,11 @@ namespace ams::ble {
         constexpr s64 BackgroundTransientBackoffMs   = 1000;
         constexpr s64 BackgroundScanIdlePeriodMs     = 1500;
         constexpr s64 BackgroundScanBusyPeriodMs     = 5000;
+        constexpr TimeSpan ClassicActivityHoldOff    = TimeSpan::FromSeconds(12);
         constexpr u8  StadiaStrategyCount            = 3;
+
+        constexpr size_t NeutralReportCount = 4;
+        constexpr s64 NeutralReportDelaysMs[NeutralReportCount] = { 0, 300, 1000, 2500 };
 
         constexpr const char KnownStadiaFilePath[] = "sdmc:/config/MissionControl/ble_known_stadia.bin";
         constexpr u32 KnownStadiaMagic = 0x53544431; // "STD1"
@@ -160,6 +163,8 @@ namespace ams::ble {
             u32 conn_id = InvalidConnId;
             u8 client_if = InvalidClientIf;
             u16 negotiated_max_interval = 0;
+            u64 attach_input_reports = 0;
+            s64 neutral_due[NeutralReportCount] = {};
             bluetooth::Address address = {};
             gatt::HidService hid = {};
             std::shared_ptr<controller::EmulatedSwitchController> controller = nullptr;
@@ -537,6 +542,79 @@ namespace ams::ble {
             }
         }
 
+        /* Presenting and dismissing helpers for neutral keepalive */
+
+        void DeliverNeutralReport(const std::shared_ptr<controller::EmulatedSwitchController> &controller, BleControllerType controller_type) {
+            if (!controller) {
+                return;
+            }
+            if (controller_type == BleControllerType::Stadia) {
+                const u8 neutral[sizeof(controller::stadia::StadiaInputReport0x03)] = { 0x08, 0x00, 0x00, 0x80, 0x80, 0x80, 0x80, 0x00, 0x00, 0x00 };
+                static_cast<void>(controller->HandleBleInputReport(neutral, sizeof(neutral)));
+            } else {
+                const u8 neutral[sizeof(controller::XboxOneInputReport0x01)] = { 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80 };
+                static_cast<void>(controller->HandleBleInputReport(neutral, sizeof(neutral)));
+            }
+        }
+
+        void ScheduleNeutralReportsLocked(BleDeviceSlot &slot) {
+            const s64 now = os::GetSystemTick().GetInt64Value();
+            for (size_t i = 0; i < NeutralReportCount; ++i) {
+                slot.neutral_due[i] = now + os::ConvertToTick(TimeSpan::FromMilliSeconds(NeutralReportDelaysMs[i])).GetInt64Value();
+            }
+        }
+
+        void ServiceNeutralReports() {
+            struct PendingNeutral {
+                std::shared_ptr<controller::EmulatedSwitchController> controller;
+                BleControllerType type;
+            };
+            PendingNeutral due_list[MaxBleControllers] = {};
+            size_t count = 0;
+            {
+                std::scoped_lock lk(g_slots_lock);
+                const s64 now = os::GetSystemTick().GetInt64Value();
+                for (size_t i = 0; i < MaxBleControllers; ++i) {
+                    auto &slot = g_host_slots[i];
+                    if ((slot.state != BleDeviceSlot::State::Connected) || !slot.controller) {
+                        continue;
+                    }
+                    if (events::GetSlotInputReportCount(static_cast<u32>(i)) != slot.attach_input_reports) {
+                        std::fill(std::begin(slot.neutral_due), std::end(slot.neutral_due), 0);
+                        continue;
+                    }
+                    bool due = false;
+                    for (auto &tick : slot.neutral_due) {
+                        if ((tick != 0) && (now >= tick)) {
+                            tick = 0;
+                            due = true;
+                        }
+                    }
+                    if (due) {
+                        due_list[count++] = { slot.controller, slot.controller_type };
+                    }
+                }
+            }
+            for (size_t i = 0; i < count; ++i) {
+                DeliverNeutralReport(due_list[i].controller, due_list[i].type);
+            }
+        }
+
+        void IdleWithNeutralReports(TimeSpan duration, const auto &stop_pred) {
+            const auto deadline = os::GetSystemTick().ToTimeSpan() + duration;
+            for (;;) {
+                ServiceNeutralReports();
+                if (stop_pred()) {
+                    return;
+                }
+                const auto now = os::GetSystemTick().ToTimeSpan();
+                if (now >= deadline) {
+                    return;
+                }
+                events::Pump(std::min(deadline - now, TimeSpan::FromMilliSeconds(200)));
+            }
+        }
+
         /* Scanning and connection */
 
         Result ConfigureScanFilter(u32 action, bool quiet = false) {
@@ -570,6 +648,13 @@ namespace ams::ble {
                 return background_reconnect ? events::IsPairingWindowOpen() : !events::IsPairingWindowOpen();
             };
 
+            if (events::ClassicActivityWithin(ClassicActivityHoldOff)) {
+                log::Write("scan skipped: classic controller activity hold-off");
+                ServiceNeutralReports();
+                events::Pump(TimeSpan::FromSeconds(1));
+                R_THROW(svc::ResultCancelled());
+            }
+
             events::SetQuietScanLogs(background_reconnect);
             ON_SCOPE_EXIT { events::SetQuietScanLogs(false); };
             events::SetScanning(true);
@@ -587,91 +672,138 @@ namespace ams::ble {
             R_TRY(ConfigureScanFilter(4, background_reconnect));
             R_UNLESS(!should_abort_scan(), svc::ResultCancelled());
 
-            Result rc = btdrvStartBleScan();
-            if (!background_reconnect && ResultScanAlreadyActive::Includes(rc) && events::IsRadioEnabled()) {
-                // btm starts its own 10-second BLE scan when "Change Grip/Order" opens, causing
-                // btdrvStartBleScan to fail with 0x2a871 for 10 seconds. Stop that scan and claim it immediately.
-                log::Write("btdrvStartBleScan hit 0x2a871 (already active); stopping existing scan and retrying");
-                const Result preempt_rc = btdrvStopBleScan();
-                if (R_SUCCEEDED(preempt_rc)) {
-                    events::WaitFor(BtdrvBleEventType_ScanResult, TimeSpan::FromMilliSeconds(500), nullptr,
-                        [](const EventRecord &r) { return r.info.scan_result.status == 1; });
-                    if (!should_abort_scan()) {
-                        rc = btdrvStartBleScan();
-                    }
+            // Never call btdrvStopBleScan() when btdrvStartBleScan returns 0x2a871: that cancels btm's
+            // own 10.24s Classic inquiry / Pro Controller discovery. Instead poll every 200ms while the
+            // pairing window stays open and back off immediately if a Classic controller connects.
+            Result rc = ResultSuccess();
+            int refused_attempts = 0;
+            for (;;) {
+                ServiceNeutralReports();
+                if (events::ClassicActivityWithin(ClassicActivityHoldOff)) {
+                    log::Write("scan not started: classic controller activity");
+                    events::Pump(TimeSpan::FromSeconds(1));
+                    R_THROW(svc::ResultCancelled());
                 }
+                if (should_abort_scan()) {
+                    R_THROW(svc::ResultCancelled());
+                }
+
+                rc = btdrvStartBleScan();
+                if (R_SUCCEEDED(rc)) {
+                    break;
+                }
+                if (background_reconnect && ResultScanAlreadyActive::Includes(rc)) {
+                    return rc;
+                }
+                if (!ResultScanAlreadyActive::Includes(rc) || (++refused_attempts >= 75)) {
+                    break;
+                }
+                if (refused_attempts == 1) {
+                    log::Write("btdrvStartBleScan rc=0x%x, retrying", rc.GetValue());
+                }
+                events::Pump(TimeSpan::FromMilliSeconds(200));
             }
-            if (!background_reconnect || (R_FAILED(rc) && !ResultScanAlreadyActive::Includes(rc))) {
+            if (!background_reconnect || R_FAILED(rc)) {
                 log::Write("btdrvStartBleScan rc=0x%x", rc.GetValue());
             }
             if (R_FAILED(rc)) {
-                if (!background_reconnect) {
-                    // Give the shared radio time before retrying a rejected scan.
+                if (!ResultScanAlreadyActive::Includes(rc) && !background_reconnect) {
+                    // Give the shared radio time before retrying a hard-rejected scan.
                     events::Pump(TimeSpan::FromSeconds(2));
+                } else if (refused_attempts > 0) {
+                    log::Write("btdrvStartBleScan rc=0x%x after %d attempts", rc.GetValue(), refused_attempts);
                 }
                 return rc;
+            }
+            if (refused_attempts > 0) {
+                log::Write("scanning after %d refused attempts", refused_attempts);
             }
 
             u32 advertisements = 0, rejected_transport = 0, rejected_identity = 0, unavailable = 0, failed = 0;
             bluetooth::Address logged_addresses[8] = {};
             size_t logged_count = 0;
             bool scan_complete = false;
+            bool classic_aborted = false;
             u32 stale_slot = InvalidSlot;
             EventRecord e = {};
-            const bool found = events::WaitFor(events::InvalidType, duration, &e, [&](const EventRecord &r) {
+            const auto scan_deadline = os::GetSystemTick().ToTimeSpan() + duration;
+            bool found = false;
+            for (;;) {
+                ServiceNeutralReports();
                 if (should_abort_scan()) {
-                    return true;
+                    break;
                 }
-                if (r.type != BtdrvBleEventType_ScanResult) {
-                    return false;
+                if (events::ClassicActivityWithin(ClassicActivityHoldOff)) {
+                    classic_aborted = true;
+                    break;
                 }
-                const auto &scan = r.info.scan_result;
-                if (scan.status == 1) {
-                    scan_complete = true;
-                    return true;
+                const auto now = os::GetSystemTick().ToTimeSpan();
+                if (now >= scan_deadline) {
+                    break;
                 }
-                if (scan.status != BleScanStatus_NewDevice) return false;
-                ++advertisements;
-                const auto summary = ParseAdvertisements(scan.ad_list, scan.count);
-                BleControllerType candidate_type = BleControllerType::Unknown;
-                const char *decision = "candidate";
-                if (background_reconnect) {
-                    if (scan.result != 0) { ++failed; decision = "scan-error"; }
-                    else if (!IsKnownStadia(scan.address)) { ++rejected_identity; decision = "not-known-stadia"; }
-                    else if (IsAddressConnected(scan.address) || PairingBackoffActive(scan.address)) { ++unavailable; decision = "active-or-backoff"; }
-                    else { candidate_type = BleControllerType::Stadia; }
-                } else {
-                    if (scan.result != 0) { ++failed; decision = "scan-error"; }
-                    else if (!IsBleAdvertisement(summary, scan.device_type)) { ++rejected_transport; decision = "classic"; }
-                    else if (!IsSupportedBleCandidate(summary, &candidate_type)) { ++rejected_identity; decision = "identity"; }
-                    else if (IsAddressConnected(scan.address)) {
-                        const u32 existing_slot = FindConnectedSlotByAddress(scan.address);
-                        // If a connected Stadia controller is actively advertising Limited Discoverable
-                        // (flags=0x05, orange pairing mode), the old slot is stale/dead; preempt it immediately.
-                        if ((candidate_type == BleControllerType::Stadia) && ((summary.flags & 0x01) != 0) && (existing_slot != InvalidSlot)) {
-                            stale_slot = existing_slot;
-                            decision = "stale-reconnect";
-                        } else {
-                            ++unavailable;
-                            decision = "active-or-backoff";
-                        }
-                    } else if (PairingBackoffActive(scan.address)) { ++unavailable; decision = "active-or-backoff"; }
-                }
-                const bool candidate = (std::strcmp(decision, "candidate") == 0) || (std::strcmp(decision, "stale-reconnect") == 0);
+                const TimeSpan slice = std::min(scan_deadline - now, TimeSpan::FromMilliSeconds(250));
+                found = events::WaitFor(events::InvalidType, slice, &e, [&](const EventRecord &r) {
+                    if (should_abort_scan()) {
+                        return true;
+                    }
+                    if (events::ClassicActivityWithin(ClassicActivityHoldOff)) {
+                        classic_aborted = true;
+                        return true;
+                    }
+                    if (r.type != BtdrvBleEventType_ScanResult) {
+                        return false;
+                    }
+                    const auto &scan = r.info.scan_result;
+                    if (scan.status == 1) {
+                        scan_complete = true;
+                        return true;
+                    }
+                    if (scan.status != BleScanStatus_NewDevice) return false;
+                    ++advertisements;
+                    const auto summary = ParseAdvertisements(scan.ad_list, scan.count);
+                    BleControllerType candidate_type = BleControllerType::Unknown;
+                    const char *decision = "candidate";
+                    if (background_reconnect) {
+                        if (scan.result != 0) { ++failed; decision = "scan-error"; }
+                        else if (!IsKnownStadia(scan.address)) { ++rejected_identity; decision = "not-known-stadia"; }
+                        else if (IsAddressConnected(scan.address) || PairingBackoffActive(scan.address)) { ++unavailable; decision = "active-or-backoff"; }
+                        else { candidate_type = BleControllerType::Stadia; }
+                    } else {
+                        if (scan.result != 0) { ++failed; decision = "scan-error"; }
+                        else if (!IsBleAdvertisement(summary, scan.device_type)) { ++rejected_transport; decision = "classic"; }
+                        else if (!IsSupportedBleCandidate(summary, &candidate_type)) { ++rejected_identity; decision = "identity"; }
+                        else if (IsAddressConnected(scan.address)) {
+                            const u32 existing_slot = FindConnectedSlotByAddress(scan.address);
+                            // If a connected Stadia controller is actively advertising Limited Discoverable
+                            // (flags=0x05, orange pairing mode), the old slot is stale/dead; preempt it immediately.
+                            if ((candidate_type == BleControllerType::Stadia) && ((summary.flags & 0x01) != 0) && (existing_slot != InvalidSlot)) {
+                                stale_slot = existing_slot;
+                                decision = "stale-reconnect";
+                            } else {
+                                ++unavailable;
+                                decision = "active-or-backoff";
+                            }
+                        } else if (PairingBackoffActive(scan.address)) { ++unavailable; decision = "active-or-backoff"; }
+                    }
+                    const bool candidate = (std::strcmp(decision, "candidate") == 0) || (std::strcmp(decision, "stale-reconnect") == 0);
 
-                // Bound diagnostic SD writes: one detail per address (up to eight
-                // per scan), plus the selected candidate. No input-thread I/O.
-                if (log::IsEnabled() && (candidate || (!background_reconnect && logged_count < std::size(logged_addresses) &&
-                        std::none_of(logged_addresses, logged_addresses + logged_count,
-                            [&](const auto &address) { return AddressEqual(address, scan.address); })))) {
-                    if (logged_count < std::size(logged_addresses)) logged_addresses[logged_count++] = scan.address;
-                    events::LogAddress(background_reconnect ? "bg reconnect scan device" : "scan device", scan.address);
-                    log::Write("  result=%u type=%u addr_type=%u rssi=%ld name='%s' appearance=0x%04x flags=0x%02x hid=%u decision=%s",
-                        scan.result, scan.device_type, scan.ble_addr_type, static_cast<long>(scan.rssi), summary.name,
-                        summary.appearance, summary.flags, summary.has_hid_service, decision);
+                    // Bound diagnostic SD writes: one detail per address (up to eight
+                    // per scan), plus the selected candidate. No input-thread I/O.
+                    if (log::IsEnabled() && (candidate || (!background_reconnect && logged_count < std::size(logged_addresses) &&
+                            std::none_of(logged_addresses, logged_addresses + logged_count,
+                                [&](const auto &address) { return AddressEqual(address, scan.address); })))) {
+                        if (logged_count < std::size(logged_addresses)) logged_addresses[logged_count++] = scan.address;
+                        events::LogAddress(background_reconnect ? "bg reconnect scan device" : "scan device", scan.address);
+                        log::Write("  result=%u type=%u addr_type=%u rssi=%ld name='%s' appearance=0x%04x flags=0x%02x hid=%u decision=%s",
+                            scan.result, scan.device_type, scan.ble_addr_type, static_cast<long>(scan.rssi), summary.name,
+                            summary.appearance, summary.flags, summary.has_hid_service, decision);
+                    }
+                    return candidate;
+                });
+                if (found || scan_complete || classic_aborted || should_abort_scan()) {
+                    break;
                 }
-                return candidate;
-            });
+            }
 
             if (!scan_complete && events::IsRadioEnabled()) {
                 Result stop_rc = btdrvStopBleScan();
@@ -692,6 +824,10 @@ namespace ams::ble {
                     advertisements, rejected_transport, rejected_identity, unavailable, failed, events::TakeRingDropped());
             }
 
+            if (classic_aborted) {
+                log::Write("scan stopped: a classic controller is connecting");
+                R_THROW(svc::ResultCancelled());
+            }
             R_UNLESS(!should_abort_scan(), svc::ResultCancelled());
             if (stale_slot != InvalidSlot) {
                 if (out_stale_slot) {
@@ -801,33 +937,18 @@ namespace ams::ble {
                 if (AddressEqual(failure.address, slot.address)) failure = {};
             }
 
-            const u64 reports_before = events::GetSlotInputReportCount(slot_index);
-            if (controller_type == BleControllerType::Stadia) {
-                const u8 neutral[sizeof(controller::stadia::StadiaInputReport0x03)] = { 0x08, 0x00, 0x00, 0x80, 0x80, 0x80, 0x80, 0x00, 0x00, 0x00 };
-                static_cast<void>(controller->HandleBleInputReport(neutral, sizeof(neutral)));
-            } else {
-                const u8 neutral[sizeof(controller::XboxOneInputReport0x01)] = { 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80 };
-                static_cast<void>(controller->HandleBleInputReport(neutral, sizeof(neutral)));
+            {
+                std::scoped_lock lk(g_slots_lock);
+                slot.attach_input_reports = events::GetSlotInputReportCount(slot_index);
+                ScheduleNeutralReportsLocked(slot);
             }
             events::RegisterSlotController(slot_index, slot.conn_id, controller);
+            ServiceNeutralReports();
 
             // Request low-latency parameters and rebalance active BLE slots
             slot.negotiated_max_interval = 0;
             RebalanceConnectionParameters();
-
-            // If no real Stadia HID packet arrived on this slot within 150ms of attach, send a second
-            // neutral frame so the Switch "Change Grip/Order" UI reliably sees an active controller.
-            if (controller_type == BleControllerType::Stadia) {
-                events::WaitFor(events::InvalidType, TimeSpan::FromMilliSeconds(150), nullptr, [&](const EventRecord &) {
-                    return events::IsSlotDisconnected(slot_index) || !events::IsRadioEnabled() ||
-                        (events::GetSlotInputReportCount(slot_index) != reports_before);
-                });
-                if (!events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled() &&
-                    (events::GetSlotInputReportCount(slot_index) == reports_before)) {
-                    const u8 neutral[sizeof(controller::stadia::StadiaInputReport0x03)] = { 0x08, 0x00, 0x00, 0x80, 0x80, 0x80, 0x80, 0x00, 0x00, 0x00 };
-                    static_cast<void>(controller->HandleBleInputReport(neutral, sizeof(neutral)));
-                }
-            }
+            ServiceNeutralReports();
 
             log::Write("slot %u: %s controller presented to system (conn_id=%u, write_auth=%u, total active=%zu)",
                 slot_index, controller_type == BleControllerType::Stadia ? "Stadia" : "Xbox",
@@ -1034,12 +1155,13 @@ namespace ams::ble {
                         return;
                     }
                 } else {
-                    // With another controller connected, pair a two-second scan with this two-second pause.
                     // Always leave radio airtime between BLE scans while the pairing window is open so btm's
-                    // Classic inquiry/page for genuine Joy-Con/Pro Controllers is not starved (v8 log showed
-                    // 400s of back-to-back 5s BLE scans while the user could not pair original controllers).
+                    // Classic inquiry/page for genuine Joy-Con/Pro Controllers is not starved.
                     if (!background_reconnect && svc::ResultTimedOut::Includes(rc) && events::IsPairingWindowOpen()) {
-                        events::Pump(TimeSpan::FromSeconds(another_controller_connected ? 2 : 3));
+                        IdleWithNeutralReports(TimeSpan::FromSeconds(another_controller_connected ? 2 : 3), [&] {
+                            return !events::IsPairingWindowOpen() || !events::IsRadioEnabled() ||
+                                events::HasAdoptedConnection() || events::ClassicActivityWithin(ClassicActivityHoldOff);
+                        });
                     }
                     return;
                 }
@@ -1146,17 +1268,12 @@ namespace ams::ble {
                 return;
             }
 
-            rc = ResultSuccess();
-            const u32 generation = events::GetClientRegistrationGeneration();
-            if (g_hid_data_path_generation != generation) {
-                auto hid_uuid = MakeUuid16(GattServiceHid);
-                rc = btdrvRegisterGattHidDataPath(&hid_uuid);
-                log::Write("btdrvRegisterGattHidDataPath slot=%u rc=0x%x", slot, rc.GetValue());
-                if (R_FAILED(rc)) {
-                    DismissSlot(slot);
-                    return;
-                }
-                g_hid_data_path_generation = generation;
+            auto hid_uuid = MakeUuid16(GattServiceHid);
+            rc = btdrvRegisterGattHidDataPath(&hid_uuid);
+            log::Write("btdrvRegisterGattHidDataPath slot=%u rc=0x%x", slot, rc.GetValue());
+            if (R_FAILED(rc)) {
+                DismissSlot(slot);
+                return;
             }
             events::ClearGattFailure(slot);
             gatt::HidService hid = {};
@@ -1210,7 +1327,6 @@ namespace ams::ble {
                 log::Write("BLE pairing recovery: radio cycle rc=0x%x", rc.GetValue());
                 if (R_FAILED(rc)) return true;
                 g_radio_recovery.AwaitClients(generation);
-                g_hid_data_path_generation = UINT32_MAX;
             }
 
             // A timeout must not resume scanning with stale client handles. Keep
@@ -1239,7 +1355,7 @@ namespace ams::ble {
             bluetooth::ble::WaitInitialized();
 
             os::SleepThread(TimeSpan::FromSeconds(20));
-            log::Write("starting multi-device BLE host (stadia-ble-v9-hos2250, HOS=0x%x)", static_cast<u32>(hos::GetVersion()));
+            log::Write("starting multi-device BLE host (stadia-ble-v10-hos2250, HOS=0x%x)", static_cast<u32>(hos::GetVersion()));
             LoadKnownStadia();
 
             if (R_FAILED(PrepareClient())) {
@@ -1255,6 +1371,7 @@ namespace ams::ble {
             for (;;) {
                 WaitForRadio();
                 ProcessPendingDisconnections();
+                ServiceNeutralReports();
                 const u32 current_pairing_window_generation = events::PairingWindowGeneration();
                 if (current_pairing_window_generation != pairing_window_generation) {
                     pairing_window_generation = current_pairing_window_generation;
@@ -1267,9 +1384,12 @@ namespace ams::ble {
                 profile::FlushIfDue();
                 if (!RecoverRadioIfNeeded()) continue;
 
-                if ((events::IsPairingWindowOpen() || events::HasAdoptedConnection()) && events::IsRadioEnabled() && (FindFreeSlot() >= 0)) {
+                const bool classic_busy = events::ClassicActivityWithin(ClassicActivityHoldOff);
+                if ((events::HasAdoptedConnection() || (!classic_busy && events::IsPairingWindowOpen())) &&
+                    events::IsRadioEnabled() && (FindFreeSlot() >= 0)) {
                     ScanAndPairNextController(false);
-                } else if (events::IsRadioEnabled() && (FindFreeSlot() >= 0) && HasDisconnectedKnownStadia()) {
+                } else if (!classic_busy && !events::IsPairingWindowOpen() &&
+                           events::IsRadioEnabled() && (FindFreeSlot() >= 0) && HasDisconnectedKnownStadia()) {
                     const s64 now_ms = os::GetSystemTick().ToTimeSpan().GetMilliSeconds();
                     const bool other_pads = (events::GetActiveConnectionCount() > 0) || (controller::GetConnectedControllerCount() > 0);
                     const s64 period_ms = other_pads ? BackgroundScanBusyPeriodMs : BackgroundScanIdlePeriodMs;

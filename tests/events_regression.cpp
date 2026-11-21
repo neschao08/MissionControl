@@ -143,5 +143,14 @@ int main() {
     assert(events::GetAvailableClientIfCount() == 0);
     assert(events::IsSlotDisconnected(0) && events::IsSlotDisconnected(1));
 
+    // Classic Bluetooth pairing activity hold-off (Switch Pro / Classic controllers)
+    BtdrvEventInfo classic_pin{};
+    classic_pin.pairing_pin_code_request.addr = {{0x98, 0xb6, 0xe9, 0x11, 0x22, 0x33}};
+    os::g_tick_ms = 50000;
+    assert(events::OnCoreEvent(BtdrvEventType_PairingPinCodeRequest, &classic_pin) == false);
+    assert(events::ClassicActivityWithin(TimeSpan::FromSeconds(12)));
+    os::g_tick_ms += 13000;
+    assert(!events::ClassicActivityWithin(TimeSpan::FromSeconds(12)));
+
     std::cout << "BLE production events (dual-path dispatch, rumble filter, descending client_if) regressions passed\n";
 }

@@ -1035,8 +1035,11 @@ namespace ams::ble {
                     }
                 } else {
                     // With another controller connected, pair a two-second scan with this two-second pause.
-                    if (!background_reconnect && svc::ResultTimedOut::Includes(rc) && events::IsPairingWindowOpen() && another_controller_connected) {
-                        events::Pump(TimeSpan::FromSeconds(2));
+                    // Always leave radio airtime between BLE scans while the pairing window is open so btm's
+                    // Classic inquiry/page for genuine Joy-Con/Pro Controllers is not starved (v8 log showed
+                    // 400s of back-to-back 5s BLE scans while the user could not pair original controllers).
+                    if (!background_reconnect && svc::ResultTimedOut::Includes(rc) && events::IsPairingWindowOpen()) {
+                        events::Pump(TimeSpan::FromSeconds(another_controller_connected ? 2 : 3));
                     }
                     return;
                 }

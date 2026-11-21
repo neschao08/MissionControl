@@ -66,6 +66,9 @@ namespace ams::controller {
             u16 m_last_rumble_strong = 0;
             u16 m_last_rumble_weak = 0;
             s64 m_last_rumble_tick = 0;
+            u32 m_cmd_log_count = 0;
+            u32 m_rumble_log_count = 0;
+            u8  m_rumble_fallback_stage = 0;
 
             bluetooth::HidReportEventInfo m_event_info = {};
     };

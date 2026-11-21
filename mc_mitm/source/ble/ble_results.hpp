@@ -22,6 +22,7 @@ R_DEFINE_NAMESPACE_RESULT_MODULE(ams::ble, 113);
 namespace ams::ble {
 
     R_DEFINE_ERROR_RESULT(NoConnection,               335);   // 0x29e71: the connection id no longer refers to a link
-    R_DEFINE_ERROR_RESULT(InsufficientAuthentication, 339);   // 0x2a671: the link isn't encrypted and there is no usable bond
+    R_DEFINE_ERROR_RESULT(InsufficientAuthentication, 339);   // 0x2a671: the link isn't encrypted and there is no usable bond (or GATT op busy)
+    R_DEFINE_ERROR_RESULT(ScanAlreadyActive,          340);   // 0x2a871: a BLE scan is already running (e.g. btm's inquiry scan)
 
 }

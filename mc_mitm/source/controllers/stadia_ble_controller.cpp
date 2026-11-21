@@ -16,6 +16,7 @@
 #include "stadia_ble_controller.hpp"
 #include "controller_management.hpp"
 #include "../ble/ble_events.hpp"
+#include "../ble/ble_log.hpp"
 #include <algorithm>
 #include <cstring>
 #include <stratosphere.hpp>
@@ -82,6 +83,13 @@ namespace ams::controller {
 
         std::scoped_lock lk(m_report_mutex, m_rumble_mutex);
         R_UNLESS(m_connected, svc::ResultInvalidState());
+        if ((report_id == SwitchHidReportId::CommandOutputReport) && (m_cmd_log_count < 6) && ble::log::IsEnabled()) {
+            ++m_cmd_log_count;
+            const u8 subcmd = (size > 10) ? report_buffer[10] : 0;
+            const u8 arg0   = (size > 11) ? report_buffer[11] : 0;
+            ble::log::Write("stadia cmd #%u conn_id=%u subcmd=0x%02x arg0=0x%02x size=%zu",
+                m_cmd_log_count, m_conn_id, subcmd, arg0, size);
+        }
         R_RETURN(EmulatedSwitchController::HandleOutputDataReport(report_buffer, size));
     }
 
@@ -120,8 +128,21 @@ namespace ams::controller {
         const float strong_amp = std::clamp(std::max(motor_data->left_motor.low_band_amp, motor_data->right_motor.low_band_amp), 0.0f, 1.0f);
         const float weak_amp   = std::clamp(std::max(motor_data->left_motor.high_band_amp, motor_data->right_motor.high_band_amp), 0.0f, 1.0f);
 
-        const u16 strong = static_cast<u16>(strong_amp * 65535.0f);
-        const u16 weak   = static_cast<u16>(weak_amp * 65535.0f);
+        const u16 strong = stadia::MapRumbleMagnitude(strong_amp, true);
+        const u16 weak   = stadia::MapRumbleMagnitude(weak_amp, false);
+
+        u32 att_err = 0;
+        if (ble::events::TakeRumbleWriteError(m_conn_id, &att_err)) {
+            if ((m_rumble_fallback_stage == 0) && (m_write_auth_req == BtdrvGattAuthReqType_None)) {
+                m_write_auth_req = BtdrvGattAuthReqType_NoMitm;
+                m_rumble_fallback_stage = 1;
+                ble::log::Write("stadia rumble conn_id=%u att_err=%u; switching write auth None -> NoMitm", m_conn_id, att_err);
+            } else if ((m_rumble_fallback_stage < 2) && m_output_write_with_response) {
+                m_output_write_with_response = false;
+                m_rumble_fallback_stage = 2;
+                ble::log::Write("stadia rumble conn_id=%u att_err=%u; switching write mode WithRsp -> NoRsp", m_conn_id, att_err);
+            }
+        }
 
         const s64 now_tick = os::GetSystemTick().GetInt64Value();
         const TimeSpan elapsed_time = (m_last_rumble_tick > 0)
@@ -157,6 +178,11 @@ namespace ams::controller {
         report.output0x05.weak_magnitude   = weak;
 
         const Result rc = this->WriteDataReport(&report, sizeof(stadia::StadiaOutputReport0x05) + 1);
+        if ((m_rumble_log_count < 8) && ble::log::IsEnabled()) {
+            ++m_rumble_log_count;
+            ble::log::Write("stadia rumble #%u conn_id=%u strong=0x%04x weak=0x%04x auth=%u with_rsp=%u rc=0x%x",
+                m_rumble_log_count, m_conn_id, strong, weak, m_write_auth_req, m_output_write_with_response ? 1u : 0u, rc.GetValue());
+        }
         if (R_FAILED(rc)) {
             // On transient GATT BUSY (0x2a671) during Write-With-Response rumble:
             // back off non-stop updates to avoid hammering the GATT channel, while leaving

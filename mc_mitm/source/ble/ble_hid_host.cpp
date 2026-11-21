@@ -51,9 +51,25 @@ namespace ams::ble {
         RadioRecovery g_radio_recovery;
         u32 g_hid_data_path_generation = UINT32_MAX;
 
-        constexpr s64 PairingRetryBackoffMs = 5000;
-        constexpr s64 StadiaRetryBackoffMs  = 1500;
-        constexpr u8  StadiaStrategyCount   = 3;
+        constexpr s64 PairingRetryBackoffMs        = 5000;
+        constexpr s64 StadiaRetryBackoffMs         = 1500;
+        constexpr s64 BackgroundReconnectBackoffMs = 6000;
+        constexpr s64 BackgroundScanIdlePeriodMs   = 2500;
+        constexpr s64 BackgroundScanBusyPeriodMs   = 5000;
+        constexpr u8  StadiaStrategyCount          = 3;
+
+        constexpr const char KnownStadiaFilePath[] = "sdmc:/config/MissionControl/ble_known_stadia.bin";
+        constexpr u32 KnownStadiaMagic = 0x53544431; // "STD1"
+
+        struct KnownStadiaStore {
+            u32 magic;
+            u32 count;
+            bluetooth::Address addresses[MaxBleControllers];
+        };
+
+        constinit os::SdkMutex g_known_stadia_lock;
+        bluetooth::Address g_known_stadia[MaxBleControllers] = {};
+        size_t g_known_stadia_count = 0;
 
         struct PairingFailure {
             bluetooth::Address address = {};
@@ -237,17 +253,131 @@ namespace ams::ble {
             return fallback;
         }
 
-        bool IsAddressConnected(const bluetooth::Address &address, u32 exclude_slot = InvalidSlot) {
+        u32 FindConnectedSlotByAddress(const bluetooth::Address &address, u32 exclude_slot = InvalidSlot) {
             std::scoped_lock lk(g_slots_lock);
             for (size_t i = 0; i < MaxBleControllers; ++i) {
                 if (i == exclude_slot) {
                     continue;
                 }
                 if ((g_host_slots[i].state != BleDeviceSlot::State::Vacant) && AddressEqual(g_host_slots[i].address, address)) {
+                    return static_cast<u32>(i);
+                }
+            }
+            return InvalidSlot;
+        }
+
+        bool IsAddressConnected(const bluetooth::Address &address, u32 exclude_slot = InvalidSlot) {
+            return FindConnectedSlotByAddress(address, exclude_slot) != InvalidSlot;
+        }
+
+        bool IsKnownStadia(const bluetooth::Address &address) {
+            std::scoped_lock lk(g_known_stadia_lock);
+            for (size_t i = 0; i < g_known_stadia_count; ++i) {
+                if (AddressEqual(g_known_stadia[i], address)) {
                     return true;
                 }
             }
             return false;
+        }
+
+        bool HasDisconnectedKnownStadia() {
+            bluetooth::Address snapshot[MaxBleControllers] = {};
+            size_t count = 0;
+            {
+                std::scoped_lock lk(g_known_stadia_lock);
+                count = g_known_stadia_count;
+                for (size_t i = 0; i < count; ++i) {
+                    snapshot[i] = g_known_stadia[i];
+                }
+            }
+            for (size_t i = 0; i < count; ++i) {
+                if (!IsAddressConnected(snapshot[i]) && !PairingBackoffActive(snapshot[i])) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        void SaveKnownStadiaLocked() {
+            KnownStadiaStore store = {};
+            store.magic = KnownStadiaMagic;
+            store.count = static_cast<u32>(g_known_stadia_count);
+            for (size_t i = 0; i < g_known_stadia_count; ++i) {
+                store.addresses[i] = g_known_stadia[i];
+            }
+
+            static_cast<void>(fs::CreateDirectory("sdmc:/config"));
+            static_cast<void>(fs::CreateDirectory("sdmc:/config/MissionControl"));
+
+            fs::FileHandle file;
+            Result rc = fs::OpenFile(std::addressof(file), KnownStadiaFilePath, fs::OpenMode_Write);
+            if (R_FAILED(rc)) {
+                static_cast<void>(fs::CreateFile(KnownStadiaFilePath, sizeof(store)));
+                rc = fs::OpenFile(std::addressof(file), KnownStadiaFilePath, fs::OpenMode_Write);
+                if (R_FAILED(rc)) {
+                    return;
+                }
+            }
+            ON_SCOPE_EXIT { fs::CloseFile(file); };
+            static_cast<void>(fs::SetFileSize(file, sizeof(store)));
+            static_cast<void>(fs::WriteFile(file, 0, &store, sizeof(store), fs::WriteOption::Flush));
+        }
+
+        void RememberKnownStadia(const bluetooth::Address &address) {
+            bool changed = false;
+            {
+                std::scoped_lock lk(g_known_stadia_lock);
+                bool exists = false;
+                for (size_t i = 0; i < g_known_stadia_count; ++i) {
+                    if (AddressEqual(g_known_stadia[i], address)) {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists) {
+                    if (g_known_stadia_count < MaxBleControllers) {
+                        g_known_stadia[g_known_stadia_count++] = address;
+                    } else {
+                        for (size_t i = 1; i < MaxBleControllers; ++i) {
+                            g_known_stadia[i - 1] = g_known_stadia[i];
+                        }
+                        g_known_stadia[MaxBleControllers - 1] = address;
+                    }
+                    SaveKnownStadiaLocked();
+                    changed = true;
+                }
+            }
+            if (changed) {
+                events::LogAddress("remembered Stadia controller for auto-reconnect", address);
+            }
+        }
+
+        void LoadKnownStadia() {
+            fs::FileHandle file;
+            if (R_FAILED(fs::OpenFile(std::addressof(file), KnownStadiaFilePath, fs::OpenMode_Read))) {
+                return;
+            }
+            ON_SCOPE_EXIT { fs::CloseFile(file); };
+
+            KnownStadiaStore store = {};
+            size_t read_size = 0;
+            if (R_FAILED(fs::ReadFile(std::addressof(read_size), file, 0, &store, sizeof(store))) ||
+                (read_size < sizeof(store)) || (store.magic != KnownStadiaMagic)) {
+                return;
+            }
+
+            const size_t n = std::min<size_t>(store.count, MaxBleControllers);
+            {
+                std::scoped_lock lk(g_known_stadia_lock);
+                g_known_stadia_count = n;
+                for (size_t i = 0; i < n; ++i) {
+                    g_known_stadia[i] = store.addresses[i];
+                }
+            }
+            for (size_t i = 0; i < n; ++i) {
+                RememberControllerType(store.addresses[i], BleControllerType::Stadia);
+                events::LogAddress("loaded known Stadia controller", store.addresses[i]);
+            }
         }
 
         /* LE HID event stream: bounded lookup with ownership across dispatch */
@@ -296,7 +426,9 @@ namespace ams::ble {
                     } else {
                         events::PushRecord(g_le_hid_record);
                     }
-                } else if (!((notify.op_type == GattNotifyType_WriteCharacteristic) && IsUuid16(notify.char_uuid, GattCharReport))) {
+                } else if ((notify.op_type == GattNotifyType_WriteCharacteristic) && IsUuid16(notify.char_uuid, GattCharReport)) {
+                    events::NoteRumbleWriteCompletion(notify.conn_id, notify.result);
+                } else {
                     events::NoteGattResult(notify.conn_id, notify.op_type, notify.char_uuid, notify.result);
                     events::PushRecord(g_le_hid_record);
                 }
@@ -406,10 +538,12 @@ namespace ams::ble {
 
         /* Scanning and connection */
 
-        Result ConfigureScanFilter(u32 action) {
+        Result ConfigureScanFilter(u32 action, bool quiet = false) {
             events::ExpectFilterEvent();
             Result rc = action == 2 ? btdrvClearBleScanFilters() : btdrvEnableBleScanFilter(action == 3);
-            log::Write("scan filter request action=%u rc=0x%x", action, rc.GetValue());
+            if (!quiet || R_FAILED(rc)) {
+                log::Write("scan filter request action=%u rc=0x%x", action, rc.GetValue());
+            }
             if (R_FAILED(rc)) {
                 // A rejected IPC does not have an asynchronous completion.
                 events::CancelExpectedFilterEvent();
@@ -424,7 +558,19 @@ namespace ams::ble {
             R_SUCCEED();
         }
 
-        Result Scan(bluetooth::Address *out_address, BleControllerType *out_type, u8 *out_flags, TimeSpan duration) {
+        Result Scan(bluetooth::Address *out_address, BleControllerType *out_type, u8 *out_flags, TimeSpan duration, bool background_reconnect = false, u32 *out_stale_slot = nullptr) {
+            if (out_stale_slot) {
+                *out_stale_slot = InvalidSlot;
+            }
+            const auto should_abort_scan = [&] {
+                if (!events::IsRadioEnabled() || events::HasAdoptedConnection()) {
+                    return true;
+                }
+                return background_reconnect ? events::IsPairingWindowOpen() : !events::IsPairingWindowOpen();
+            };
+
+            events::SetQuietScanLogs(background_reconnect);
+            ON_SCOPE_EXIT { events::SetQuietScanLogs(false); };
             events::SetScanning(true);
             ON_SCOPE_EXIT { events::SetScanning(false); };
 
@@ -432,19 +578,36 @@ namespace ams::ble {
             // their completions have been drained, including when no pad is found.
             ON_SCOPE_EXIT {
                 if (events::IsRadioEnabled()) {
-                    Result restore_rc = ConfigureScanFilter(3);
+                    Result restore_rc = ConfigureScanFilter(3, background_reconnect);
                     if (R_FAILED(restore_rc)) log::Write("scan filter restore failed rc=0x%x", restore_rc.GetValue());
                 }
             };
-            R_TRY(ConfigureScanFilter(2));
-            R_TRY(ConfigureScanFilter(4));
-            R_UNLESS(events::IsPairingWindowOpen() && events::IsRadioEnabled(), svc::ResultCancelled());
+            R_TRY(ConfigureScanFilter(2, background_reconnect));
+            R_TRY(ConfigureScanFilter(4, background_reconnect));
+            R_UNLESS(!should_abort_scan(), svc::ResultCancelled());
 
             Result rc = btdrvStartBleScan();
-            log::Write("btdrvStartBleScan rc=0x%x", rc.GetValue());
+            if (!background_reconnect && ResultScanAlreadyActive::Includes(rc) && events::IsRadioEnabled()) {
+                // btm starts its own 10-second BLE scan when "Change Grip/Order" opens, causing
+                // btdrvStartBleScan to fail with 0x2a871 for 10 seconds. Stop that scan and claim it immediately.
+                log::Write("btdrvStartBleScan hit 0x2a871 (already active); stopping existing scan and retrying");
+                const Result preempt_rc = btdrvStopBleScan();
+                if (R_SUCCEEDED(preempt_rc)) {
+                    events::WaitFor(BtdrvBleEventType_ScanResult, TimeSpan::FromMilliSeconds(500), nullptr,
+                        [](const EventRecord &r) { return r.info.scan_result.status == 1; });
+                    if (!should_abort_scan()) {
+                        rc = btdrvStartBleScan();
+                    }
+                }
+            }
+            if (!background_reconnect || (R_FAILED(rc) && !ResultScanAlreadyActive::Includes(rc))) {
+                log::Write("btdrvStartBleScan rc=0x%x", rc.GetValue());
+            }
             if (R_FAILED(rc)) {
-                // Give the shared radio time before retrying a rejected scan.
-                events::Pump(TimeSpan::FromSeconds(2));
+                if (!background_reconnect) {
+                    // Give the shared radio time before retrying a rejected scan.
+                    events::Pump(TimeSpan::FromSeconds(2));
+                }
                 return rc;
             }
 
@@ -452,9 +615,10 @@ namespace ams::ble {
             bluetooth::Address logged_addresses[8] = {};
             size_t logged_count = 0;
             bool scan_complete = false;
+            u32 stale_slot = InvalidSlot;
             EventRecord e = {};
             const bool found = events::WaitFor(events::InvalidType, duration, &e, [&](const EventRecord &r) {
-                if (!events::IsPairingWindowOpen() || events::HasAdoptedConnection() || !events::IsRadioEnabled()) {
+                if (should_abort_scan()) {
                     return true;
                 }
                 if (r.type != BtdrvBleEventType_ScanResult) {
@@ -470,19 +634,37 @@ namespace ams::ble {
                 const auto summary = ParseAdvertisements(scan.ad_list, scan.count);
                 BleControllerType candidate_type = BleControllerType::Unknown;
                 const char *decision = "candidate";
-                if (scan.result != 0) { ++failed; decision = "scan-error"; }
-                else if (!IsBleAdvertisement(summary, scan.device_type)) { ++rejected_transport; decision = "classic"; }
-                else if (!IsSupportedBleCandidate(summary, &candidate_type)) { ++rejected_identity; decision = "identity"; }
-                else if (IsAddressConnected(scan.address) || PairingBackoffActive(scan.address)) { ++unavailable; decision = "active-or-backoff"; }
-                const bool candidate = std::strcmp(decision, "candidate") == 0;
+                if (background_reconnect) {
+                    if (scan.result != 0) { ++failed; decision = "scan-error"; }
+                    else if (!IsKnownStadia(scan.address)) { ++rejected_identity; decision = "not-known-stadia"; }
+                    else if (IsAddressConnected(scan.address) || PairingBackoffActive(scan.address)) { ++unavailable; decision = "active-or-backoff"; }
+                    else { candidate_type = BleControllerType::Stadia; }
+                } else {
+                    if (scan.result != 0) { ++failed; decision = "scan-error"; }
+                    else if (!IsBleAdvertisement(summary, scan.device_type)) { ++rejected_transport; decision = "classic"; }
+                    else if (!IsSupportedBleCandidate(summary, &candidate_type)) { ++rejected_identity; decision = "identity"; }
+                    else if (IsAddressConnected(scan.address)) {
+                        const u32 existing_slot = FindConnectedSlotByAddress(scan.address);
+                        // If a connected Stadia controller is actively advertising Limited Discoverable
+                        // (flags=0x05, orange pairing mode), the old slot is stale/dead; preempt it immediately.
+                        if ((candidate_type == BleControllerType::Stadia) && ((summary.flags & 0x01) != 0) && (existing_slot != InvalidSlot)) {
+                            stale_slot = existing_slot;
+                            decision = "stale-reconnect";
+                        } else {
+                            ++unavailable;
+                            decision = "active-or-backoff";
+                        }
+                    } else if (PairingBackoffActive(scan.address)) { ++unavailable; decision = "active-or-backoff"; }
+                }
+                const bool candidate = (std::strcmp(decision, "candidate") == 0) || (std::strcmp(decision, "stale-reconnect") == 0);
 
                 // Bound diagnostic SD writes: one detail per address (up to eight
                 // per scan), plus the selected candidate. No input-thread I/O.
-                if (log::IsEnabled() && (candidate || (logged_count < std::size(logged_addresses) &&
+                if (log::IsEnabled() && (candidate || (!background_reconnect && logged_count < std::size(logged_addresses) &&
                         std::none_of(logged_addresses, logged_addresses + logged_count,
                             [&](const auto &address) { return AddressEqual(address, scan.address); })))) {
                     if (logged_count < std::size(logged_addresses)) logged_addresses[logged_count++] = scan.address;
-                    events::LogAddress("scan device", scan.address);
+                    events::LogAddress(background_reconnect ? "bg reconnect scan device" : "scan device", scan.address);
                     log::Write("  result=%u type=%u addr_type=%u rssi=%ld name='%s' appearance=0x%04x flags=0x%02x hid=%u decision=%s",
                         scan.result, scan.device_type, scan.ble_addr_type, static_cast<long>(scan.rssi), summary.name,
                         summary.appearance, summary.flags, summary.has_hid_service, decision);
@@ -492,7 +674,9 @@ namespace ams::ble {
 
             if (!scan_complete && events::IsRadioEnabled()) {
                 Result stop_rc = btdrvStopBleScan();
-                log::Write("btdrvStopBleScan rc=0x%x", stop_rc.GetValue());
+                if (!background_reconnect || R_FAILED(stop_rc)) {
+                    log::Write("btdrvStopBleScan rc=0x%x", stop_rc.GetValue());
+                }
                 if (R_SUCCEEDED(stop_rc)) {
                     scan_complete = events::WaitFor(BtdrvBleEventType_ScanResult, TimeSpan::FromSeconds(1), nullptr,
                         [](const EventRecord &r) { return r.info.scan_result.status == 1; });
@@ -502,10 +686,18 @@ namespace ams::ble {
                 R_UNLESS(scan_complete, svc::ResultTimedOut());
             }
 
-            log::Write("scan summary: advertisements=%u classic=%u identity=%u unavailable=%u errors=%u dropped=%u",
-                advertisements, rejected_transport, rejected_identity, unavailable, failed, events::TakeRingDropped());
+            if (!background_reconnect) {
+                log::Write("scan summary: advertisements=%u classic=%u identity=%u unavailable=%u errors=%u dropped=%u",
+                    advertisements, rejected_transport, rejected_identity, unavailable, failed, events::TakeRingDropped());
+            }
 
-            R_UNLESS(events::IsPairingWindowOpen() && !events::HasAdoptedConnection() && events::IsRadioEnabled(), svc::ResultCancelled());
+            R_UNLESS(!should_abort_scan(), svc::ResultCancelled());
+            if (stale_slot != InvalidSlot) {
+                if (out_stale_slot) {
+                    *out_stale_slot = stale_slot;
+                }
+                R_SUCCEED();
+            }
             R_UNLESS(found && (e.type == BtdrvBleEventType_ScanResult) &&
                 (e.info.scan_result.status == BleScanStatus_NewDevice), svc::ResultTimedOut());
 
@@ -517,6 +709,9 @@ namespace ams::ble {
                 }
                 if (out_type) {
                     *out_type = IdentifyCandidate(summary);
+                    if (*out_type == BleControllerType::Unknown && background_reconnect && IsKnownStadia(*out_address)) {
+                        *out_type = BleControllerType::Stadia;
+                    }
                     if (*out_type != BleControllerType::Unknown) {
                         RememberControllerType(*out_address, *out_type);
                     } else {
@@ -524,7 +719,7 @@ namespace ams::ble {
                     }
                 }
             }
-            events::LogAddress("found controller", *out_address);
+            events::LogAddress(background_reconnect ? "bg reconnect found Stadia" : "found controller", *out_address);
 
             if (log::IsEnabled()) {
                 SetSysBluetoothDevicesSettings settings = {};
@@ -575,6 +770,9 @@ namespace ams::ble {
             const BleControllerType controller_type = ResolveControllerType(slot);
             slot.controller_type = controller_type;
             RememberControllerType(slot.address, controller_type);
+            if (controller_type == BleControllerType::Stadia) {
+                RememberKnownStadia(slot.address);
+            }
 
             std::shared_ptr<controller::EmulatedSwitchController> controller;
             if (controller_type == BleControllerType::Stadia) {
@@ -766,7 +964,7 @@ namespace ams::ble {
             }
         }
 
-        void ScanAndPairNextController() {
+        void ScanAndPairNextController(bool background_reconnect = false) {
             if (events::ConsumeControllerCountChanged()) {
                 RebalanceConnectionParameters();
             }
@@ -788,10 +986,18 @@ namespace ams::ble {
                 scanned_type = RecallControllerType(address);
             } else {
                 const bool another_controller_connected = (events::GetActiveConnectionCount() > 0) || (controller::GetConnectedControllerCount() > 0);
-                const TimeSpan scan_duration = TimeSpan::FromSeconds(another_controller_connected ? 2 : 5);
-                Result rc = Scan(&address, &scanned_type, &scanned_flags, scan_duration);
+                const TimeSpan scan_duration = background_reconnect
+                    ? TimeSpan::FromMilliSeconds(another_controller_connected ? 800 : 1000)
+                    : TimeSpan::FromSeconds(another_controller_connected ? 2 : 5);
+                u32 stale_slot = InvalidSlot;
+                Result rc = Scan(&address, &scanned_type, &scanned_flags, scan_duration, background_reconnect, &stale_slot);
                 if (events::ConsumeControllerCountChanged()) {
                     RebalanceConnectionParameters();
+                }
+                if (stale_slot != InvalidSlot) {
+                    log::Write("slot %u: Stadia re-advertised in pairing mode (flags=0x05); dismissing stale slot immediately", stale_slot);
+                    DismissSlot(stale_slot);
+                    return;
                 }
                 if (Adopt(&address, &conn_id)) {
                     connected = true;
@@ -816,13 +1022,13 @@ namespace ams::ble {
                         (FindOrAllocStadiaStrategy(address)->failures_in_cycle == 0);
                     connected = R_SUCCEEDED(pairing::Connect(slot, client_if, address, &conn_id, TimeSpan::FromSeconds(15), !preserve_bond));
                     if (!connected) {
-                        NotePairingFailure(address);
+                        NotePairingFailure(address, background_reconnect ? BackgroundReconnectBackoffMs : PairingRetryBackoffMs);
                         DismissSlot(slot);
                         return;
                     }
                 } else {
                     // With another controller connected, pair a two-second scan with this two-second pause.
-                    if (svc::ResultTimedOut::Includes(rc) && events::IsPairingWindowOpen() && another_controller_connected) {
+                    if (!background_reconnect && svc::ResultTimedOut::Includes(rc) && events::IsPairingWindowOpen() && another_controller_connected) {
                         events::Pump(TimeSpan::FromSeconds(2));
                     }
                     return;
@@ -896,14 +1102,20 @@ namespace ams::ble {
 
             const auto handle_attempt_failure = [&](const char *phase) {
                 if (is_stadia) {
-                    const bool cycle_exhausted = AdvanceStadiaStrategy(address);
-                    const s64 backoff = cycle_exhausted ? PairingRetryBackoffMs : StadiaRetryBackoffMs;
-                    if (cycle_exhausted) {
-                        g_radio_recovery.Request();
+                    if (background_reconnect) {
+                        NotePairingFailure(address, BackgroundReconnectBackoffMs);
+                        log::Write("slot %u: Stadia bg reconnect %s failed (flags=0x%02x backoff=%ldms)",
+                            slot, phase, scanned_flags, static_cast<long>(BackgroundReconnectBackoffMs));
+                    } else {
+                        const bool cycle_exhausted = AdvanceStadiaStrategy(address);
+                        const s64 backoff = cycle_exhausted ? PairingRetryBackoffMs : StadiaRetryBackoffMs;
+                        if (cycle_exhausted) {
+                            g_radio_recovery.Request();
+                        }
+                        NotePairingFailure(address, backoff);
+                        log::Write("slot %u: Stadia %s failed (stage=%u next=%u cycle_exhausted=%u backoff=%ldms)",
+                            slot, phase, stadia_stage, GetStadiaStrategyStage(address), cycle_exhausted, static_cast<long>(backoff));
                     }
-                    NotePairingFailure(address, backoff);
-                    log::Write("slot %u: Stadia %s failed (stage=%u next=%u cycle_exhausted=%u backoff=%ldms)",
-                        slot, phase, stadia_stage, GetStadiaStrategyStage(address), cycle_exhausted, static_cast<long>(backoff));
                 } else {
                     g_radio_recovery.Request();
                     NotePairingFailure(address, PairingRetryBackoffMs);
@@ -1015,7 +1227,8 @@ namespace ams::ble {
             bluetooth::ble::WaitInitialized();
 
             os::SleepThread(TimeSpan::FromSeconds(20));
-            log::Write("starting multi-device BLE host (stadia-ble-v6-hos2250, HOS=0x%x)", static_cast<u32>(hos::GetVersion()));
+            log::Write("starting multi-device BLE host (stadia-ble-v7-hos2250, HOS=0x%x)", static_cast<u32>(hos::GetVersion()));
+            LoadKnownStadia();
 
             if (R_FAILED(PrepareClient())) {
                 log::Write("giving up: no gatt client available");
@@ -1025,6 +1238,7 @@ namespace ams::ble {
             StartLeHidListener();
             events::SetSink(gatt::OnEvent);
             u32 pairing_window_generation = events::PairingWindowGeneration();
+            s64 last_bg_scan_ms = 0;
 
             for (;;) {
                 WaitForRadio();
@@ -1042,7 +1256,17 @@ namespace ams::ble {
                 if (!RecoverRadioIfNeeded()) continue;
 
                 if ((events::IsPairingWindowOpen() || events::HasAdoptedConnection()) && events::IsRadioEnabled() && (FindFreeSlot() >= 0)) {
-                    ScanAndPairNextController();
+                    ScanAndPairNextController(false);
+                } else if (events::IsRadioEnabled() && (FindFreeSlot() >= 0) && HasDisconnectedKnownStadia()) {
+                    const s64 now_ms = os::GetSystemTick().ToTimeSpan().GetMilliSeconds();
+                    const bool other_pads = (events::GetActiveConnectionCount() > 0) || (controller::GetConnectedControllerCount() > 0);
+                    const s64 period_ms = other_pads ? BackgroundScanBusyPeriodMs : BackgroundScanIdlePeriodMs;
+                    if ((last_bg_scan_ms == 0) || ((now_ms - last_bg_scan_ms) >= period_ms)) {
+                        last_bg_scan_ms = now_ms;
+                        ScanAndPairNextController(true);
+                    } else {
+                        events::Pump(TimeSpan::FromMilliSeconds(100));
+                    }
                 } else {
                     events::Pump(TimeSpan::FromMilliSeconds(100));
                 }

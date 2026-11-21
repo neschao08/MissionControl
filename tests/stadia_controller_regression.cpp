@@ -69,57 +69,74 @@ int main() {
         assert(ctrl.HandleBleInputReport(pkt10, 0).value == 10);
         assert(ctrl.TestDataEvents() == 2);
 
-        // 2. Rumble: 4-byte LE strong/weak, auth_req=None, with_response=true, inst=1
+        // 2. Rumble: 4-byte LE strong/weak (with dual-motor startup curve), auth_req=None, with_response=true, inst=1
         SwitchMotorData motor{};
         motor.left_motor.low_band_amp = 1.0f;   // strong = 0xFFFF
-        motor.right_motor.high_band_amp = 0.5f; // weak = 0x7FFF
+        motor.right_motor.high_band_amp = 0.5f; // weak = MapRumbleMagnitude(0.5f, false)
+        const u16 exp_weak = stadia::MapRumbleMagnitude(0.5f, false);
         assert(R_SUCCEEDED(ctrl.TestSetVibration(&motor)));
         assert(g_writes.size() == 1);
         assert(g_writes[0].conn_id == 259 && g_writes[0].char_inst == 1);
         assert(g_writes[0].auth_req == BtdrvGattAuthReqType_None && g_writes[0].with_response == true);
-        assert(g_writes[0].payload == std::vector<u8>({0xFF, 0xFF, 0xFF, 0x7F}));
+        assert(g_writes[0].payload == std::vector<u8>({0xFF, 0xFF, static_cast<u8>(exp_weak & 0xFF), static_cast<u8>(exp_weak >> 8)}));
+
+        // ATT error on rumble write auto-escalates auth None -> NoMitm, then WithRsp -> NoRsp
+        ble::events::g_pending_rumble_error = 5;
+        os::g_now_ms += 60;
+        motor.left_motor.low_band_amp = 0.7f;
+        assert(R_SUCCEEDED(ctrl.TestSetVibration(&motor)));
+        assert(g_writes.size() == 2);
+        assert(g_writes[1].auth_req == BtdrvGattAuthReqType_NoMitm && g_writes[1].with_response == true);
+
+        // Reset back to baseline controller for remaining throttle tests
+        g_writes.clear();
+        ble::events::g_pending_rumble_error = 0;
+        StadiaBleController ctrl_t(addr, 259, svc_id, true, out_id, true, true, BtdrvGattAuthReqType_None);
+        motor.left_motor.low_band_amp = 1.0f;
+        assert(R_SUCCEEDED(ctrl_t.TestSetVibration(&motor)));
+        assert(g_writes.size() == 1);
 
         // Write-With-Response throttle: 32ms is throttled (< 48ms), 48ms passes!
         os::g_now_ms += 32;
         motor.left_motor.low_band_amp = 0.8f;
-        assert(R_SUCCEEDED(ctrl.TestSetVibration(&motor)));
+        assert(R_SUCCEEDED(ctrl_t.TestSetVibration(&motor)));
         assert(g_writes.size() == 1); // Throttled!
 
         os::g_now_ms += 16; // total 48ms
-        assert(R_SUCCEEDED(ctrl.TestSetVibration(&motor)));
+        assert(R_SUCCEEDED(ctrl_t.TestSetVibration(&motor)));
         assert(g_writes.size() == 2);
 
         // Transient GATT BUSY (0x2a671) on non-stop update backs off m_last_rumble_tick
         os::g_now_ms += 60;
         g_write_rc = 0x2a671;
         motor.left_motor.low_band_amp = 0.6f;
-        assert(ctrl.TestSetVibration(&motor).value == 0x2a671);
+        assert(ctrl_t.TestSetVibration(&motor).value == 0x2a671);
         assert(g_writes.size() == 3);
         // 16ms later: backed off, does NOT hammer GATT channel immediately
         os::g_now_ms += 16;
-        assert(R_SUCCEEDED(ctrl.TestSetVibration(&motor)));
+        assert(R_SUCCEEDED(ctrl_t.TestSetVibration(&motor)));
         assert(g_writes.size() == 3);
 
         // Transient GATT BUSY on STOP packet must NOT clear m_last_rumble_* so next frame retries STOP (no stuck rumble!)
         SwitchMotorData stop_motor{};
         os::g_now_ms += 16;
-        assert(ctrl.TestSetVibration(&stop_motor).value == 0x2a671);
+        assert(ctrl_t.TestSetVibration(&stop_motor).value == 0x2a671);
         assert(g_writes.size() == 4);
         g_write_rc = 0;
         os::g_now_ms += 16; // Even 16ms later, STOP is retried immediately!
-        assert(R_SUCCEEDED(ctrl.TestSetVibration(&stop_motor)));
+        assert(R_SUCCEEDED(ctrl_t.TestSetVibration(&stop_motor)));
         assert(g_writes.size() == 5);
         assert(g_writes[4].payload == std::vector<u8>({0x00, 0x00, 0x00, 0x00}));
 
         // Duplicate STOP is suppressed
         os::g_now_ms += 100;
-        assert(R_SUCCEEDED(ctrl.TestSetVibration(&stop_motor)));
+        assert(R_SUCCEEDED(ctrl_t.TestSetVibration(&stop_motor)));
         assert(g_writes.size() == 5);
 
         // Radio off blocks GATT writes safely
         ble::events::g_radio_enabled = false;
         motor.left_motor.low_band_amp = 0.9f;
-        assert(R_FAILED(ctrl.TestSetVibration(&motor)));
+        assert(R_FAILED(ctrl_t.TestSetVibration(&motor)));
         ble::events::g_radio_enabled = true;
 
         // DisconnectBle blocks subsequent input & output reports safely

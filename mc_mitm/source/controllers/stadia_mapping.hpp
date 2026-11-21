@@ -15,6 +15,7 @@
  */
 #pragma once
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
@@ -135,6 +136,22 @@ namespace ams::controller::stadia {
         if (right_norm > trigger_threshold) out.buttons_mask |= ButtonBit::ZR;
 
         return out;
+    }
+
+    // Stadia dual-motor rumble mapping:
+    //   Left strong motor (2100 RPM) <- Switch HD Rumble low-frequency band
+    //   Right weak motor  (3350 RPM) <- Switch HD Rumble high-frequency band
+    // Switch HD Rumble often emits small amplitudes (0.04..0.30) that fall below a DC
+    // eccentric motor's static friction deadzone when scaled linearly. Apply a gentle
+    // sqrt response curve above a small cutoff while preserving exact zero for stop.
+    inline uint16_t MapRumbleMagnitude(float amp, bool strong_motor) {
+        const float clamped = std::clamp(amp, 0.0f, 1.0f);
+        if (clamped <= 0.005f) {
+            return 0;
+        }
+        const float floor_level = strong_motor ? 0.28f : 0.22f;
+        const float shaped = std::clamp(floor_level + (1.0f - floor_level) * std::sqrt(clamped), 0.0f, 1.0f);
+        return static_cast<uint16_t>(shaped * 65535.0f + 0.5f);
     }
 
 }

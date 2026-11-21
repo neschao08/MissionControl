@@ -101,6 +101,14 @@ int main() {
     assert(events::TakeRingDropped() == 0);
     assert(!events::Pop(&popped));
 
+    // Non-zero rumble write ATT error is captured for Stadia auto-fallback without entering the control ring
+    wr_ack.client_notify.result = 5;
+    assert(events::OnBleEvent(BtdrvBleEventType_ClientNotify, &wr_ack) == true);
+    assert(!events::Pop(&popped));
+    u32 captured_rumble_err = 0;
+    assert(events::TakeRumbleWriteError(259, &captured_rumble_err) && captured_rumble_err == 5);
+    assert(!events::TakeRumbleWriteError(259, &captured_rumble_err));
+
     // Subsequent disconnect event MUST arrive intact without being dropped
     BtdrvBleEventInfo disc{};
     disc.client_connection.result = 0;

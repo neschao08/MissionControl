@@ -98,7 +98,7 @@ namespace ams::ble::gatt {
             return false;
         }
 
-        Result WaitForOperation(u32 slot, u32 conn_id, u8 operation, u16 characteristic, TimeSpan timeout, EventRecord *out_event = nullptr, u32 *out_gatt_status = nullptr) {
+        Result WaitForOperation(u32 slot, u32 conn_id, u8 operation, u16 characteristic, TimeSpan timeout, EventRecord *out_event = nullptr, u32 *out_gatt_status = nullptr, bool accept_notification_for_cccd = true) {
             if (out_gatt_status) {
                 *out_gatt_status = 0;
             }
@@ -114,7 +114,7 @@ namespace ams::ble::gatt {
                         (IsUuid16(notify.char_uuid, GattDescClientCharConfig) || IsUuid16(notify.desc_uuid, GattDescClientCharConfig))) {
                         return true;
                     }
-                    if ((notify.op_type == BtdrvGattOperationType_Notification) && IsUuid16(notify.char_uuid, GattCharReport)) {
+                    if (accept_notification_for_cccd && (notify.op_type == BtdrvGattOperationType_Notification) && IsUuid16(notify.char_uuid, GattCharReport)) {
                         return true;
                     }
                 }
@@ -140,20 +140,25 @@ namespace ams::ble::gatt {
             R_SUCCEED();
         }
 
-        Result WriteCccdWithAuth(u32 slot_index, u32 conn_id, const BtdrvGattAttribute &service, const BtdrvGattAttribute &chr, const BtdrvGattAttribute &cccd, u8 auth_req, TimeSpan timeout, u32 *out_gatt_status = nullptr) {
-            const u8 enable_notifications[2] = { 0x01, 0x00 };
+        Result WriteCccdValueWithAuth(u32 slot_index, u32 conn_id, const BtdrvGattAttribute &service, const BtdrvGattAttribute &chr, const BtdrvGattAttribute &cccd, const u8 value[2], u8 auth_req, TimeSpan timeout, u32 *out_gatt_status = nullptr, bool accept_notification = true) {
             Result rc = ResultSuccess();
             for (int attempt = 0; ; ++attempt) {
                 R_UNLESS(!events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled(), ResultNoConnection());
-                rc = btdrvWriteGattDescriptor(conn_id, service.is_primary, &service.id, &chr.id, &cccd.id, enable_notifications, sizeof(enable_notifications), auth_req);
-                log::Write("btdrvWriteGattDescriptor(CCCD) slot=%u handle=0x%04x auth=%u rc=0x%x", slot_index, cccd.handle, auth_req, rc.GetValue());
+                rc = btdrvWriteGattDescriptor(conn_id, service.is_primary, &service.id, &chr.id, &cccd.id, value, 2, auth_req);
+                log::Write("btdrvWriteGattDescriptor(CCCD=%02x%02x) slot=%u handle=0x%04x auth=%u rc=0x%x",
+                    value[0], value[1], slot_index, cccd.handle, auth_req, rc.GetValue());
                 if ((auth_req != BtdrvGattAuthReqType_NoMitm) || !ResultInsufficientAuthentication::Includes(rc) || (attempt >= 4) || events::IsSlotDisconnected(slot_index) || !events::IsRadioEnabled()) {
                     break;
                 }
                 events::Pump(TimeSpan::FromSeconds(1));
             }
             R_TRY(rc);
-            R_RETURN(WaitForOperation(slot_index, conn_id, BtdrvGattOperationType_DescriptorWrite, GattCharReport, timeout, nullptr, out_gatt_status));
+            R_RETURN(WaitForOperation(slot_index, conn_id, BtdrvGattOperationType_DescriptorWrite, GattCharReport, timeout, nullptr, out_gatt_status, accept_notification));
+        }
+
+        Result WriteCccdWithAuth(u32 slot_index, u32 conn_id, const BtdrvGattAttribute &service, const BtdrvGattAttribute &chr, const BtdrvGattAttribute &cccd, u8 auth_req, TimeSpan timeout, u32 *out_gatt_status = nullptr) {
+            const u8 enable_notifications[2] = { 0x01, 0x00 };
+            R_RETURN(WriteCccdValueWithAuth(slot_index, conn_id, service, chr, cccd, enable_notifications, auth_req, timeout, out_gatt_status, true));
         }
 
         const BtdrvGattAttribute *FindCharacteristic(u32 slot_index, const BtdrvGattAttribute &service, u16 uuid16) {
@@ -404,9 +409,19 @@ namespace ams::ble::gatt {
             }
         }
 
+        if (out->has_output_report) {
+            log::Write("slot %u: output Report handle=0x%04x inst=%u prop=0x%02x with_rsp=%u auth=%u",
+                slot_index, out->output_report.handle, out->output_report.id.instance_id,
+                out->output_report.property, out->output_write_with_response ? 1u : 0u, out->write_auth_req);
+        }
+
         u8 active_auth = (auth_mode == SubscribeAuthMode::StandardNoMitm || auth_mode == SubscribeAuthMode::NoMitmCccdOnly)
             ? static_cast<u8>(BtdrvGattAuthReqType_NoMitm)
             : static_cast<u8>(BtdrvGattAuthReqType_None);
+
+        const bool toggle_cccd_for_stadia =
+            (auth_mode == SubscribeAuthMode::PlainOnlyAfterBond) ||
+            (auth_mode == SubscribeAuthMode::NoMitmCccdOnly);
 
         Result result = svc::ResultNotFound();
         for (size_t i = 0; i < count; ++i) {
@@ -425,9 +440,32 @@ namespace ams::ble::gatt {
 
             R_UNLESS(!events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled(), ResultNoConnection());
 
+            // Work around bt_nso 0x2c26c bug: when a previous connection ended with ClientConnection result != 0
+            // (e.g. result=26 on supervision timeout), bt_nso skipped BSA_GattcDeregisterNotification and left a
+            // stale entry in g_gatt_manager, causing btdrvRegisterGattNotification to early-return 0 without
+            // calling BSA_GattcRegisterNotification. Unregistering on the live conn_id first purges any stale entry.
+            const Result unreg_rc = btdrvUnregisterGattNotification(conn_id, service.is_primary, &service.id, &attr.id);
+            log::Write("btdrvUnregisterGattNotification(pre-clean) slot=%u handle=0x%04x rc=0x%x", slot_index, attr.handle, unreg_rc.GetValue());
+
             Result rc = btdrvRegisterGattNotification(conn_id, service.is_primary, &service.id, &attr.id);
             log::Write("btdrvRegisterGattNotification slot=%u handle=0x%04x rc=0x%x", slot_index, attr.handle, rc.GetValue());
             R_TRY(rc);
+
+            if (toggle_cccd_for_stadia) {
+                // Stadia BLE firmware quirk: on reconnect or post-pair sessions, writing 0x0000 -> 0x0001
+                // guarantees a clean rising-edge transition that restarts Input Report 0x03 notifications.
+                const u8 disable_notifications[2] = { 0x00, 0x00 };
+                u32 disable_status = 0;
+                const Result disable_rc = WriteCccdValueWithAuth(slot_index, conn_id, service, attr, *cccd, disable_notifications, active_auth, TimeSpan::FromSeconds(3), &disable_status, false);
+                R_UNLESS(!events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled(), ResultNoConnection());
+                if (R_FAILED(disable_rc)) {
+                    // If the disable write timed out, bt_nso's GATT channel stays BUSY (0x2a671); abort cleanly.
+                    if (svc::ResultTimedOut::Includes(disable_rc)) {
+                        R_TRY(disable_rc);
+                    }
+                    log::Write("slot %u: CCCD disable pre-toggle returned rc=0x%x status=%u; proceeding to enable", slot_index, disable_rc.GetValue(), disable_status);
+                }
+            }
 
             u32 gatt_status = 0;
             const TimeSpan initial_timeout = (auth_mode == SubscribeAuthMode::NoMitmCccdOnly)

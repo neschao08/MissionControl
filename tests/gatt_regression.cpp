@@ -145,7 +145,7 @@ Result btdrvReadGattCharacteristic(u32 conn_id, bool, const BtdrvGattId *, const
 Result btdrvRegisterGattNotification(u32, bool, const BtdrvGattId *, const BtdrvGattId *) { ++notification_registrations; return register_result; }
 Result btdrvUnregisterGattNotification(u32, bool, const BtdrvGattId *, const BtdrvGattId *) { ++unregister_count; return {0}; }
 Result btdrvWriteGattDescriptor(u32 conn_id, bool, const BtdrvGattId *, const BtdrvGattId *attr, const BtdrvGattId *, const u8 *data, size_t size, int auth) {
-    assert((auth == BtdrvGattAuthReqType_None || auth == BtdrvGattAuthReqType_NoMitm) && size == 2 && data[0] == 1 && data[1] == 0);
+    assert((auth == BtdrvGattAuthReqType_None || auth == BtdrvGattAuthReqType_NoMitm) && size == 2 && (data[0] == 0 || data[0] == 1) && data[1] == 0);
     cccd_auths.push_back(auth);
     if (auth == BtdrvGattAuthReqType_NoMitm && auth_refusals > 0) { --auth_refusals; return ResultInsufficientAuthentication(); }
     Complete(conn_id, BtdrvGattOperationType_DescriptorWrite, attr->uuid, auth);
@@ -214,8 +214,9 @@ int main() {
     assert(query_times.size() == 1 && query_times[0] >= 2000);
     assert(mtu_connections == std::vector<u32>{260});
     AssertSubscribed(0, 260);
+    assert(unregister_count == 1); // pre-clean before RegisterGattNotification
     gatt::Unsubscribe(0, 260);
-    assert(unregister_count == 1);
+    assert(unregister_count == 2);
 
     Reset(DiscoveryMode::AfterMtu);
     assert(R_SUCCEEDED(gatt::Discover(0, 260, a)));
@@ -420,12 +421,14 @@ int main() {
         assert(cccd_auths.empty());
         events::completed = true;
 
-        // NoMitmCccdOnly (Stadia Stage 0): skips 0x2A4A AND skips 0x2A50/0x2A00 (which stall 28.36s on Stadia),
-        // writes CCCD directly with NoMitm so bt_nso triggers real BTM_SetEncryption -> SMP_Pair!
+        // NoMitmCccdOnly (Stadia Stage 1): skips 0x2A4A AND skips 0x2A50/0x2A00 (which stall 28.36s on Stadia),
+        // pre-cleans stale bt_nso notif table via Unregister, toggles CCCD 0x0000 -> 0x0001 with NoMitm!
         read_uuids.clear(); read_auths.clear(); cccd_auths.clear();
+        const int unreg_before = unregister_count;
         gatt::HidService nomitm_direct{};
         assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &nomitm_direct, gatt::SubscribeAuthMode::NoMitmCccdOnly)));
-        assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_NoMitm}));
+        assert(unregister_count == unreg_before + 1);
+        assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_NoMitm, BtdrvGattAuthReqType_NoMitm}));
         assert(nomitm_direct.write_auth_req == BtdrvGattAuthReqType_NoMitm);
         assert(nomitm_direct.has_output_report && nomitm_direct.output_report.handle == out_handle);
         assert(read_uuids.empty()); // Zero DIS/GAP/HID-Info reads!
@@ -457,18 +460,18 @@ int main() {
         assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_None}));
         cccd_completed = true;
 
-        // PlainOnlyAfterBond (Stadia Stage 1 & 2): skips 0x2A4A & 0x2A50, writes CCCD with None only, never escalates to NoMitm
+        // PlainOnlyAfterBond (Stadia Stage 0 & 2): skips 0x2A4A & 0x2A50, toggles CCCD 0x0000 -> 0x0001 with None only
         read_uuids.clear(); cccd_auths.clear();
         gatt::HidService after_bond{};
         assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &after_bond, gatt::SubscribeAuthMode::PlainOnlyAfterBond)));
-        assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_None}));
+        assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_None, BtdrvGattAuthReqType_None}));
         assert(after_bond.write_auth_req == BtdrvGattAuthReqType_None);
         assert(read_uuids.empty());
 
         cccd_auths.clear();
         cccd_plain_failure = 5;
         assert(gatt::Subscribe(0, 260, &after_bond, gatt::SubscribeAuthMode::PlainOnlyAfterBond).value == 8);
-        assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_None}));
+        assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_None, BtdrvGattAuthReqType_None}));
         cccd_plain_failure = 0;
     }
 

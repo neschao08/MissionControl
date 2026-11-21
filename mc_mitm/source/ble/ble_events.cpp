@@ -45,8 +45,12 @@ namespace ams::ble::events {
         os::Event g_radio_event(os::EventClearMode_ManualClear);
         os::Event g_sleep_prepared_event(os::EventClearMode_ManualClear);
         std::atomic<bool> g_controller_count_changed{false};
+        std::atomic<bool> g_quiet_scan_logs{false};
         std::atomic<u64> g_input_report_count{0};
         std::atomic<u64> g_slot_input_report_counts[MaxBleControllers] = {};
+        std::atomic<u32> g_slot_rumble_ack_logs[MaxBleControllers] = {};
+        std::atomic<u32> g_slot_rumble_err_logs[MaxBleControllers] = {};
+        std::atomic<u32> g_slot_rumble_last_error[MaxBleControllers] = {};
 
         /* Guarded by g_lock */
         constinit bool g_active = false;
@@ -202,6 +206,10 @@ namespace ams::ble::events {
         g_slots[slot].disconnect_reason = 0;
         g_slots[slot].bond_complete = false;
         g_slots[slot].gatt_failure = 0;
+        g_slot_input_report_counts[slot].store(0, std::memory_order_release);
+        g_slot_rumble_ack_logs[slot].store(0, std::memory_order_release);
+        g_slot_rumble_err_logs[slot].store(0, std::memory_order_release);
+        g_slot_rumble_last_error[slot].store(0, std::memory_order_release);
 
         g_attempted = address;
         g_have_attempted = true;
@@ -249,6 +257,10 @@ namespace ams::ble::events {
         }
         UnregisterSlotController(slot);
         g_slots[slot] = {};
+        g_slot_input_report_counts[slot].store(0, std::memory_order_release);
+        g_slot_rumble_ack_logs[slot].store(0, std::memory_order_release);
+        g_slot_rumble_err_logs[slot].store(0, std::memory_order_release);
+        g_slot_rumble_last_error[slot].store(0, std::memory_order_release);
         return true;
     }
 
@@ -305,21 +317,59 @@ namespace ams::ble::events {
 
     void NoteReceivedInputReport(const char *path, u32 conn_id, const u8 *data, size_t size) {
         const u32 slot = FindSlotByConnId(conn_id);
+        u64 slot_seq = 0;
         if (slot < MaxBleControllers) {
-            g_slot_input_report_counts[slot].fetch_add(1, std::memory_order_acq_rel);
+            slot_seq = g_slot_input_report_counts[slot].fetch_add(1, std::memory_order_acq_rel) + 1;
         }
         const u64 seq = g_input_report_count.fetch_add(1, std::memory_order_acq_rel) + 1;
-        if (seq <= 5 && log::IsEnabled()) {
+        const bool should_log = (slot < MaxBleControllers) ? (slot_seq <= 3) : (seq <= 5);
+        if (should_log && log::IsEnabled()) {
             const auto b = [&](size_t i) -> u8 { return i < size ? data[i] : 0; };
-            log::Write("ble input #%llu [%s] conn_id=%u len=%zu data=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-                static_cast<unsigned long long>(seq), path, conn_id, size,
+            log::Write("ble input slot=%u #%llu (total=%llu) [%s] conn_id=%u len=%zu data=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+                slot, static_cast<unsigned long long>(slot_seq), static_cast<unsigned long long>(seq), path, conn_id, size,
                 b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7), b(8), b(9));
         }
+    }
+
+    void NoteRumbleWriteCompletion(u32 conn_id, u32 result) {
+        const u32 slot = FindSlotByConnId(conn_id);
+        if (slot < MaxBleControllers) {
+            if (result != 0) {
+                g_slot_rumble_last_error[slot].store(result, std::memory_order_release);
+                const u32 err_n = g_slot_rumble_err_logs[slot].fetch_add(1, std::memory_order_acq_rel) + 1;
+                if (err_n <= 10 && log::IsEnabled()) {
+                    log::Write("ble rumble write err #%u slot=%u conn_id=%u result=%u", err_n, slot, conn_id, result);
+                }
+            } else {
+                const u32 ack_n = g_slot_rumble_ack_logs[slot].fetch_add(1, std::memory_order_acq_rel) + 1;
+                if (ack_n <= 5 && log::IsEnabled()) {
+                    log::Write("ble rumble write ack #%u slot=%u conn_id=%u result=0", ack_n, slot, conn_id);
+                }
+            }
+        } else if (result != 0 && log::IsEnabled()) {
+            log::Write("ble rumble write err conn_id=%u result=%u", conn_id, result);
+        }
+    }
+
+    bool TakeRumbleWriteError(u32 conn_id, u32 *out_result) {
+        const u32 slot = FindSlotByConnId(conn_id);
+        if (slot >= MaxBleControllers) {
+            return false;
+        }
+        const u32 err = g_slot_rumble_last_error[slot].exchange(0, std::memory_order_acq_rel);
+        if (err == 0) {
+            return false;
+        }
+        if (out_result) {
+            *out_result = err;
+        }
+        return true;
     }
 
     bool OnBleEvent(bluetooth::BleEventType type, const bluetooth::BleEventInfo *info) {
         bool ours = false;
         bool is_input_report_notify = false;
+        bool is_rumble_write_ack = false;
         {
             std::scoped_lock lk(g_lock);
 
@@ -437,17 +487,22 @@ namespace ams::ble::events {
                 // so high-frequency Write-With-Response rumble acks (e.g. Stadia handle 0x0044)
                 // never overflow the 64-entry control ring and drop disconnect events.
                 if ((notify.op_type == GattNotifyType_WriteCharacteristic) && IsUuid16(notify.char_uuid, GattCharReport)) {
-                    return true;
-                }
-                if ((notify.op_type == GattNotifyType_Notification) && (notify.result == 0) && IsUuid16(notify.char_uuid, GattCharReport)) {
+                    is_rumble_write_ack = true;
+                } else if ((notify.op_type == GattNotifyType_Notification) && (notify.result == 0) && IsUuid16(notify.char_uuid, GattCharReport)) {
                     is_input_report_notify = true;
                 }
             }
 
-            if (!is_input_report_notify) {
+            if (!is_input_report_notify && !is_rumble_write_ack) {
                 EnqueueRecordLocked(type, !ours, info);
                 return ours;
             }
+        }
+
+        if (is_rumble_write_ack) {
+            const auto &notify = info->client_notify;
+            NoteRumbleWriteCompletion(notify.conn_id, notify.result);
+            return true;
         }
 
         // Fast-path fallback: if HID Report notifications arrive on the managed BLE stream
@@ -577,6 +632,10 @@ namespace ams::ble::events {
     void SetScanning(bool scanning) {
         std::scoped_lock lk(g_lock);
         g_scanning = scanning;
+    }
+
+    void SetQuietScanLogs(bool quiet) {
+        g_quiet_scan_logs.store(quiet, std::memory_order_release);
     }
 
     void ExpectFilterEvent() {
@@ -837,12 +896,15 @@ namespace ams::ble::events {
                 LogAddress("  address", info.client_connection.address);
                 break;
             case BtdrvBleEventType_ScanResult:
-                if (info.scan_result.status != BleScanStatus_NewDevice) {
+                if ((info.scan_result.status != BleScanStatus_NewDevice) &&
+                    (!g_quiet_scan_logs.load(std::memory_order_acquire) || (info.scan_result.result != 0))) {
                     log::Write("evt ScanResult result=%u status=0x%02x", info.scan_result.result, info.scan_result.status);
                 }
                 break;
             case BtdrvBleEventType_ScanFilter:
-                log::Write("evt ScanFilter result=%u action=%u", info.scan_filter.result, info.scan_filter.action);
+                if (!g_quiet_scan_logs.load(std::memory_order_acquire) || (info.scan_filter.result != 0)) {
+                    log::Write("evt ScanFilter result=%u action=%u", info.scan_filter.result, info.scan_filter.action);
+                }
                 break;
             case BtdrvBleEventType_ClientNotify: {
                 auto &notify = info.client_notify;

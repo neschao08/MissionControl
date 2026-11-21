@@ -40,6 +40,7 @@ namespace ams::ble::events {
     void TakeOwnership();
     void SetRegistering(bool registering);
     void SetScanning(bool scanning);
+    void SetQuietScanLogs(bool quiet);
     void ExpectFilterEvent();
     void CancelExpectedFilterEvent();
 
@@ -66,6 +67,8 @@ namespace ams::ble::events {
     std::shared_ptr<controller::EmulatedSwitchController> GetActiveController(u32 conn_id);
     u64 GetSlotInputReportCount(u32 slot);
     void NoteReceivedInputReport(const char *path, u32 conn_id, const u8 *data, size_t size);
+    void NoteRumbleWriteCompletion(u32 conn_id, u32 result);
+    bool TakeRumbleWriteError(u32 conn_id, u32 *out_result);
 
     u16 GetTargetMaxConnectionInterval(size_t active_count);
     u16 RequestLowLatencyConnectionParameters(const bluetooth::Address &address, size_t active_count = 0);

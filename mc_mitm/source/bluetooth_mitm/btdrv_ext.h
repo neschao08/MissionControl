@@ -20,12 +20,13 @@
 #define BtdrvEventType_MissionControlCustomEvent 0x69
 
 typedef enum {
-    BtdrvExtCustomEventType_GetHciHandle    = 0x0,
-    BtdrvExtCustomEventType_SendHciCommand  = 0x1,
-    BtdrvExtCustomEventType_DmSetConfig     = 0x2,
-    BtdrvExtCustomEventType_SecAddDevice    = 0x3,
-    BtdrvExtCustomEventType_SecRemoveDevice = 0x4,
-    BtdrvExtCustomEventType_SetEncryption   = 0x5,
+    BtdrvExtCustomEventType_GetHciHandle     = 0x0,
+    BtdrvExtCustomEventType_SendHciCommand   = 0x1,
+    BtdrvExtCustomEventType_DmSetConfig      = 0x2,
+    BtdrvExtCustomEventType_SecAddDevice     = 0x3,
+    BtdrvExtCustomEventType_SecRemoveDevice  = 0x4,
+    BtdrvExtCustomEventType_SetEncryption    = 0x5,
+    BtdrvExtCustomEventType_BleSecurityGrant = 0x6,
 } BtdrvExtCustomEventType;
 
 typedef struct {
@@ -57,6 +58,7 @@ Result btdrvextSendHciCommand(u16 opcode, const void *data, size_t size);
 Result btdrvextDmSetConfig(const tBSA_DM_SET_CONFIG *add_dev);
 Result btdrvextSecRemoveDevice(BtdrvAddress address);
 Result btdrvextSetEncryption(BtdrvAddress address, u8 transport, u8 sec_act);
+Result btdrvextBleSecurityGrant(BtdrvAddress address, u8 res);
 
 #ifdef __cplusplus
 }

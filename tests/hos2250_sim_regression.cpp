@@ -20,6 +20,7 @@ namespace {
         StadiaRequireEncViaAtt0F,         // Rejects plaintext CCCD with ATT 0x0F; Stage 0 SMP times out -> Stage 1 DirectSetEncryption succeeds
         StadiaOnlyStage2CreateBondPlain,  // Stage 0 & Stage 1 fail -> Stage 2 CreateBond (sec_state=1) + AuthReq=None bypasses 0xc56fc stall
         StadiaStaleSecRecord,             // Fails SMP with 0x89 unless IPS cmd4 cleared stale BLE security record
+        StadiaProactiveSlaveSecReq,       // Exact real StadiaQPRV-4967 trace: sends SMP Slave Security Request at +80ms -> WAIT_APP_DECISION (sec_state=1, 30.15s disconnect unless cmd 6 grants!)
         XboxClassicBondThenNoMitm,        // Xbox One BLE: CreateBond completes cleanly at 120ms, sec_state=0, encrypted=true
     };
 
@@ -41,6 +42,9 @@ namespace {
         bool connected = false;
         bool encrypted = false;
         u8 sec_state = 0;           // 0 = IDLE, 1 = BUSY/BONDING (causes NoMitm to stall at 0xc56fc)
+        u8 smp_state = 0;           // 0 = IDLE, 1 = SMP_ST_WAIT_APP_DECISION
+        u8 smp_cb_evt = 0;          // 2 = SMP_SEC_REQUEST_EVT (cleared by SMP_SecurityGrant 0xf5bf0)
+        bool smp_timeout_armed = false;
         u8 gatt_state = 6;          // 6 = IDLE, !=6 = BUSY -> 0x2a671
         bool cccd_enabled = false;
         bool notif_registered = false;
@@ -50,14 +54,19 @@ namespace {
         u32 next_conn_id = 3;
         std::map<u32, SimConn> conns;
         std::map<u64, bool> stale_ble_sec_records;
+        std::map<u64, bool> stored_ble_ltk;
         std::map<u64, PeripheralBehavior> peer_behaviors;
         bool ips_cmd4_enabled = true;
         bool ips_cmd5_enabled = true;
+        bool ips_cmd6_enabled = true;
         u32 busy_0x2a671_count = 0;
         u32 create_bond_count = 0;
         u32 ext_remove_count = 0;
         u32 ext_set_enc_count = 0;
+        u32 ext_sec_grant_count = 0;
         u32 smp_pair_count = 0;
+        u32 ltk_fast_encrypt_count = 0;
+        u32 smp_30s_timeout_disconnects = 0;
         u32 zombie_timer_fires = 0;
         u32 cccd_write_count = 0;
         bool force_disconnect_after_ms_enabled = false;
@@ -78,14 +87,19 @@ namespace {
             next_conn_id = 3;
             conns.clear();
             stale_ble_sec_records.clear();
+            stored_ble_ltk.clear();
             peer_behaviors.clear();
             ips_cmd4_enabled = true;
             ips_cmd5_enabled = true;
+            ips_cmd6_enabled = true;
             busy_0x2a671_count = 0;
             create_bond_count = 0;
             ext_remove_count = 0;
             ext_set_enc_count = 0;
+            ext_sec_grant_count = 0;
             smp_pair_count = 0;
+            ltk_fast_encrypt_count = 0;
+            smp_30s_timeout_disconnects = 0;
             zombie_timer_fires = 0;
             cccd_write_count = 0;
             force_disconnect_after_ms_enabled = false;
@@ -175,6 +189,7 @@ Result btdrvextSecRemoveDevice(ams::bluetooth::Address addr) {
         return {0x2a605};
     }
     g_sim.stale_ble_sec_records[BtNsoSim::AddrKey(addr)] = false;
+    g_sim.stored_ble_ltk[BtNsoSim::AddrKey(addr)] = false;
     return {0};
 }
 
@@ -213,6 +228,40 @@ Result btdrvConnectGattServer(u8 client_if, ams::bluetooth::Address addr, bool, 
     ev.info.client_connection.conn_id = cid;
     ev.info.client_connection.address = addr;
     events::ScheduleEvent(ev, 25);
+
+    if (conn.behavior == PeripheralBehavior::StadiaProactiveSlaveSecReq) {
+        // Real StadiaQPRV-4967 trace: sends SMP Slave Security Request ~80ms after ACL connect.
+        // Faithful to btm_ble_link_sec_check (0xa43b0) + smp_proc_sec_req (0xf4b40) + btm_proc_smp_cback (0xa49b0):
+        // - If peer LTK is already stored in bt_nso RAM (key_type & 1), immediately encrypts without WAIT_APP_DECISION.
+        // - Otherwise sets sec_state=1, smp_state=1 (SMP_ST_WAIT_APP_DECISION), cb_evt=2 (SMP_SEC_REQUEST_EVT),
+        //   and arms 30.15s SMP_WAIT_FOR_RSP_TOUT that disconnects with reason=0x0016 unless BTA_DmBleSecurityGrant is called!
+        events::ScheduleCallback(80, [cid]() {
+            auto *live = g_sim.FindConnById(cid);
+            if (!live) return;
+            if (g_sim.stored_ble_ltk[BtNsoSim::AddrKey(live->addr)]) {
+                ++g_sim.ltk_fast_encrypt_count;
+                live->encrypted = true;
+                live->sec_state = 0;
+                live->smp_state = 0;
+                live->smp_cb_evt = 0;
+                return;
+            }
+            live->sec_state = 1;
+            live->smp_state = 1;
+            live->smp_cb_evt = 2;
+            live->smp_timeout_armed = true;
+            events::ScheduleCallback(30150, [cid]() {
+                auto *c2 = g_sim.FindConnById(cid);
+                if (!c2) return;
+                if (c2->smp_timeout_armed && c2->smp_state == 1 && c2->smp_cb_evt == 2) {
+                    ++g_sim.smp_30s_timeout_disconnects;
+                    c2->smp_timeout_armed = false;
+                    c2->sec_state = 0;
+                    g_sim.DisconnectConn(cid, 0x0016);
+                }
+            });
+        });
+    }
 
     if (g_sim.force_disconnect_after_ms_enabled) {
         events::ScheduleCallback(g_sim.force_disconnect_delay_ms, [cid]() {
@@ -276,7 +325,9 @@ Result btdrvextSetEncryption(ams::bluetooth::Address addr, u8 transport, u8 sec_
     auto *c = g_sim.FindConnByAddr(addr);
     if (!c) return {0xDEADBEEF};
 
+    // Faithful to bt_nso: if SMP is stalled in WAIT_APP_DECISION (sec_state==1), SetEncryption is queued/blocked!
     if (g_sim.ips_cmd5_enabled &&
+        c->sec_state == 0 &&
         c->behavior != PeripheralBehavior::StadiaOnlyStage2CreateBondPlain &&
         !g_sim.stale_ble_sec_records[BtNsoSim::AddrKey(addr)]) {
         ++g_sim.smp_pair_count;
@@ -290,6 +341,36 @@ Result btdrvextSetEncryption(ams::bluetooth::Address addr, u8 transport, u8 sec_
     }
     // Faithful to HOS 22.5.0 IPS cave: BTA_DmSetEncryption is void, w0 retains non-zero garbage!
     return {0x00117924u};
+}
+
+Result btdrvextBleSecurityGrant(ams::bluetooth::Address addr, u8 res) {
+    ++g_sim.ext_sec_grant_count;
+    if (!g_sim.ips_cmd6_enabled) {
+        return {0x0011792cu};
+    }
+    auto *c = g_sim.FindConnByAddr(addr);
+    if (!c) return {0};
+    // Faithful to SMP_SecurityGrant (0xf5bf0): only acts if state==1 && cb_evt==2; otherwise safe no-op.
+    if (c->smp_state == 1 && c->smp_cb_evt == 2) {
+        c->smp_cb_evt = 0;
+        c->smp_timeout_armed = false;
+        if (res == 0) {
+            // smp_proc_sec_grant -> SMP_IO_CAP_REQ_EVT -> SMP_API_IO_RSP_EVT -> Legacy Just Works Pairing + Encryption + LTK!
+            ++g_sim.smp_pair_count;
+            const u32 cid = c->conn_id;
+            events::ScheduleCallback(220, [cid]() {
+                if (auto *live = g_sim.FindConnById(cid)) {
+                    live->smp_state = 0;
+                    live->sec_state = 0;
+                    live->encrypted = true;
+                    g_sim.stored_ble_ltk[BtNsoSim::AddrKey(live->addr)] = true;
+                }
+            });
+        } else {
+            g_sim.DisconnectConn(c->conn_id, 0x0016);
+        }
+    }
+    return {0};
 }
 
 static Result SimStartGattOp(SimConn *c, u8 op_type, u16 uuid, int auth, bool is_cccd) {
@@ -691,6 +772,72 @@ static void Test8_StressReconnectDisconnectSleep50Cycles() {
     assert(g_sim.busy_0x2a671_count == 0);
 }
 
+static void Test9_StadiaProactiveSlaveSecReq30sTimeoutAndCmd6Fix() {
+    // Part A: Reproduce exact real ble_v5_test1.log failure (without IPS cmd 6):
+    // Stadia connects, sends Slave Security Request at +80ms -> SMP_ST_WAIT_APP_DECISION (sec_state=1).
+    // Even if plaintext CCCD succeeds, SetEncryption stalls on sec_state==1, and at +30.15s bt_nso drops link (0x0016)!
+    g_sim.Reset();
+    g_sim.ips_cmd6_enabled = false;
+    g_sim.peer_behaviors[BtNsoSim::AddrKey(StadiaAddr)] = PeripheralBehavior::StadiaProactiveSlaveSecReq;
+    u32 cid = InvalidConnId;
+    assert(R_SUCCEEDED(pairing::Connect(0, 6, StadiaAddr, &cid, TimeSpan::FromSeconds(15), true)));
+    assert(R_SUCCEEDED(gatt::Discover(0, cid, StadiaAddr)));
+    assert(g_sim.conns[cid].sec_state == 1 && g_sim.conns[cid].smp_state == 1);
+    assert(pairing::PrepareSecurityWithStrategy(0, StadiaAddr, pairing::SecurityStrategy::DirectSetEncryption));
+    gatt::HidService hid{};
+    assert(R_SUCCEEDED(gatt::Subscribe(0, cid, &hid, gatt::SubscribeAuthMode::PlainOnlyAfterBond)));
+    assert(!g_sim.conns[cid].encrypted);
+    // Advance 32 seconds -> reproduces the exact 30.15s reason=0x0016 local host disconnect!
+    events::Pump(TimeSpan::FromSeconds(32));
+    assert(g_sim.smp_30s_timeout_disconnects == 1);
+    assert(!g_sim.conns[cid].connected && events::IsSlotDisconnected(0));
+    assert(events::GetSlotDisconnectReason(0) == 0x0016);
+
+    // Part B: With IPS cmd 6 (BTA_DmBleSecurityGrant(addr, 0)) enabled:
+    // Pairing mode (flags=0x05, clear_existing_bond=true): cmd 6 grants SMP request -> Legacy Just Works encrypts,
+    // stores LTK, clears sec_state=0, subscribes CCCD, and stays connected >120 seconds with ZERO disconnects!
+    g_sim.Reset();
+    g_sim.ips_cmd6_enabled = true;
+    g_sim.peer_behaviors[BtNsoSim::AddrKey(StadiaAddr)] = PeripheralBehavior::StadiaProactiveSlaveSecReq;
+    u32 cid2 = InvalidConnId;
+    assert(R_SUCCEEDED(pairing::Connect(0, 6, StadiaAddr, &cid2, TimeSpan::FromSeconds(15), true)));
+    assert(R_SUCCEEDED(gatt::Discover(0, cid2, StadiaAddr)));
+    assert(g_sim.conns[cid2].sec_state == 1 && g_sim.conns[cid2].smp_state == 1);
+    assert(pairing::PrepareSecurityWithStrategy(0, StadiaAddr, pairing::SecurityStrategy::BleSecurityGrant));
+    assert(g_sim.ext_sec_grant_count == 2);
+    assert(g_sim.smp_pair_count == 1);
+    assert(g_sim.conns[cid2].encrypted && g_sim.conns[cid2].sec_state == 0 && g_sim.conns[cid2].smp_state == 0);
+    assert(g_sim.stored_ble_ltk[BtNsoSim::AddrKey(StadiaAddr)] == true);
+    gatt::HidService hid2{};
+    assert(R_SUCCEEDED(gatt::Subscribe(0, cid2, &hid2, gatt::SubscribeAuthMode::PlainOnlyAfterBond)));
+    assert(g_sim.conns[cid2].cccd_enabled && g_sim.busy_0x2a671_count == 0);
+    // Run 120 full seconds (4x past the 30.15s SMP timer) -> ZERO disconnects!
+    events::Pump(TimeSpan::FromSeconds(120));
+    assert(g_sim.smp_30s_timeout_disconnects == 0);
+    assert(g_sim.conns[cid2].connected && !events::IsSlotDisconnected(0));
+
+    // Part C: User turns Stadia off & turns it back on (flags=0x06 reconnect, LTK preserved in bt_nso):
+    // DismissSlot preserves LTK (no ClearPeer), Connect uses clear_existing_bond=false ->
+    // Slave Security Request hits stored LTK -> instant HCI LE Start Encryption, >120s ZERO disconnects!
+    g_sim.DisconnectConn(cid2, 0x0013);
+    events::Pump(TimeSpan::FromMilliSeconds(50));
+    gatt::ResetSlot(0);
+    assert(g_sim.stored_ble_ltk[BtNsoSim::AddrKey(StadiaAddr)] == true);
+
+    u32 cid3 = InvalidConnId;
+    assert(R_SUCCEEDED(pairing::Connect(0, 6, StadiaAddr, &cid3, TimeSpan::FromSeconds(15), false)));
+    assert(R_SUCCEEDED(gatt::Discover(0, cid3, StadiaAddr)));
+    assert(g_sim.ltk_fast_encrypt_count == 1);
+    assert(g_sim.conns[cid3].encrypted && g_sim.conns[cid3].sec_state == 0 && g_sim.conns[cid3].smp_state == 0);
+    assert(pairing::PrepareSecurityWithStrategy(0, StadiaAddr, pairing::SecurityStrategy::BleSecurityGrant));
+    gatt::HidService hid3{};
+    assert(R_SUCCEEDED(gatt::Subscribe(0, cid3, &hid3, gatt::SubscribeAuthMode::PlainOnlyAfterBond)));
+    assert(g_sim.conns[cid3].cccd_enabled);
+    events::Pump(TimeSpan::FromSeconds(120));
+    assert(g_sim.smp_30s_timeout_disconnects == 0);
+    assert(g_sim.conns[cid3].connected && !events::IsSlotDisconnected(0));
+}
+
 int main() {
     Test1_ReproduceOldV3BugAndProveFix();
     Test2_Stage0_DirectNoMitmEncryptsEvenWhenPlainCccdWouldHaveReturnedOk();
@@ -700,5 +847,6 @@ int main() {
     Test6_StaleBleSecRecordRequiresIpsCmd4Cleanup();
     Test7_CoexistenceXboxAndStadiaSimultaneous();
     Test8_StressReconnectDisconnectSleep50Cycles();
-    std::cout << "HOS 22.5.0 bt_nso simulator end-to-end regressions (8 scenarios, 50 stress cycles) passed\n";
+    Test9_StadiaProactiveSlaveSecReq30sTimeoutAndCmd6Fix();
+    std::cout << "HOS 22.5.0 bt_nso simulator end-to-end regressions (9 scenarios, 50 stress cycles + 120s soak) passed\n";
 }

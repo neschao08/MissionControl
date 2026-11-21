@@ -46,7 +46,7 @@ namespace ams::ble::pairing {
         R_SUCCEED();
     }
 
-    Result Connect(u32 slot, u8 client_if, const bluetooth::Address &address, u32 *out_conn_id, TimeSpan timeout) {
+    Result Connect(u32 slot, u8 client_if, const bluetooth::Address &address, u32 *out_conn_id, TimeSpan timeout, bool clear_existing_bond) {
         events::SetSlotConnecting(slot, address);
         R_UNLESS(events::IsRadioEnabled(), ResultNoConnection());
 
@@ -55,29 +55,33 @@ namespace ams::ble::pairing {
             return ResultNoConnection();
         }
 
-        const Result remove_rc = btdrvRemoveBond(address);
-        log::Write("btdrvRemoveBond slot=%u rc=0x%x", slot, remove_rc.GetValue());
-        R_TRY(remove_rc);
-        R_UNLESS(events::IsRadioEnabled(), ResultNoConnection());
-        // A previously cancelled direct request can complete during the IPC.
-        // Retain that live handle rather than opening twice.
-        if (const u32 late_conn_id = events::GetSlotConnectionId(slot); late_conn_id != InvalidConnId) {
-            *out_conn_id = late_conn_id;
-            log::Write("slot %u: adopting late connection conn_id=%u", slot, late_conn_id);
-            R_SUCCEED();
+        if (clear_existing_bond) {
+            const Result remove_rc = btdrvRemoveBond(address);
+            log::Write("btdrvRemoveBond slot=%u rc=0x%x", slot, remove_rc.GetValue());
+            R_TRY(remove_rc);
+            R_UNLESS(events::IsRadioEnabled(), ResultNoConnection());
+            // A previously cancelled direct request can complete during the IPC.
+            // Retain that live handle rather than opening twice.
+            if (const u32 late_conn_id = events::GetSlotConnectionId(slot); late_conn_id != InvalidConnId) {
+                *out_conn_id = late_conn_id;
+                log::Write("slot %u: adopting late connection conn_id=%u", slot, late_conn_id);
+                R_SUCCEED();
+            }
+            // On HOS 22.5.0+, standard btdrvRemoveBond returns early when a BLE-only peer is absent from the
+            // Classic peer table. Best-effort invoke the IPS BSA_SecRemoveDevice hook (cmd 4) to clear BLE records.
+            const Result ext_remove_rc = btdrvextSecRemoveDevice(address);
+            log::Write("btdrvextSecRemoveDevice slot=%u rc=0x%x", slot, ext_remove_rc.GetValue());
+            R_UNLESS(events::IsRadioEnabled(), ResultNoConnection());
+            if (const u32 late_conn_id = events::GetSlotConnectionId(slot); late_conn_id != InvalidConnId) {
+                *out_conn_id = late_conn_id;
+                log::Write("slot %u: adopting late connection conn_id=%u", slot, late_conn_id);
+                R_SUCCEED();
+            }
+            // Arm the slot after any synchronous cleanup events.
+            events::SetSlotConnecting(slot, address);
+        } else {
+            log::Write("slot %u: preserving existing BLE bond record for reconnect", slot);
         }
-        // On HOS 22.5.0+, standard btdrvRemoveBond returns early when a BLE-only peer is absent from the
-        // Classic peer table. Best-effort invoke the IPS BSA_SecRemoveDevice hook (cmd 4) to clear BLE records.
-        const Result ext_remove_rc = btdrvextSecRemoveDevice(address);
-        log::Write("btdrvextSecRemoveDevice slot=%u rc=0x%x", slot, ext_remove_rc.GetValue());
-        R_UNLESS(events::IsRadioEnabled(), ResultNoConnection());
-        if (const u32 late_conn_id = events::GetSlotConnectionId(slot); late_conn_id != InvalidConnId) {
-            *out_conn_id = late_conn_id;
-            log::Write("slot %u: adopting late connection conn_id=%u", slot, late_conn_id);
-            R_SUCCEED();
-        }
-        // Arm the slot after any synchronous cleanup events.
-        events::SetSlotConnecting(slot, address);
 
         Result rc = btdrvConnectGattServer(client_if, address, true, 0);
         log::Write("btdrvConnectGattServer slot=%u client_if=%u rc=0x%x", slot, client_if, rc.GetValue());
@@ -194,12 +198,58 @@ namespace ams::ble::pairing {
 
         static_cast<void>(events::TakeSlotBondComplete(slot));
 
+        if (strategy == SecurityStrategy::BleSecurityGrant) {
+            // Stadia proactively sends SMP Slave Security Request right after ACL connect (~0.1s).
+            // HOS 22.5.0 bt_nso enters SMP_ST_WAIT_APP_DECISION (sec_state=1, 30s timeout) and drops
+            // BSA_SEC_AUTHORIZE_EVT at 0x2fb50. Invoke IPS cmd 6 (BTA_DmBleSecurityGrant(addr, 0))
+            // so SMP proceeds with Legacy Just Works pairing & encryption instead of disconnecting
+            // at t + 30.15s with reason=0x0016.
+            log::Write("slot %u: granting pending BLE SMP security request via BTA_DmBleSecurityGrant(res=0)", slot);
+            const Result grant_rc1 = btdrvextBleSecurityGrant(address, 0);
+            log::Write("btdrvextBleSecurityGrant(#1) slot=%u rc=0x%x", slot, grant_rc1.GetValue());
+            if (events::IsSlotDisconnected(slot) || !events::IsRadioEnabled()) {
+                log::Write("slot %u: BLE security grant aborted immediately (disconnected=%u reason=0x%04x radio=%u)",
+                    slot, events::IsSlotDisconnected(slot), events::GetSlotDisconnectReason(slot), events::IsRadioEnabled());
+                return false;
+            }
+
+            // Re-issue once after 250ms in case Slave Security Request arrived after a fast cached
+            // GATT discovery; SMP_SecurityGrant (0xf5bf0) is a safe no-op once out of WAIT_APP_DECISION.
+            events::WaitFor(events::InvalidType, TimeSpan::FromMilliSeconds(250), nullptr, [&](const EventRecord &) {
+                return events::IsSlotDisconnected(slot) || !events::IsRadioEnabled();
+            });
+            if (events::IsSlotDisconnected(slot) || !events::IsRadioEnabled()) {
+                log::Write("slot %u: BLE security grant failed at 250ms (disconnected=%u reason=0x%04x radio=%u)",
+                    slot, events::IsSlotDisconnected(slot), events::GetSlotDisconnectReason(slot), events::IsRadioEnabled());
+                return false;
+            }
+
+            const Result grant_rc2 = btdrvextBleSecurityGrant(address, 0);
+            log::Write("btdrvextBleSecurityGrant(#2) slot=%u rc=0x%x", slot, grant_rc2.GetValue());
+
+            // Wait up to 1500ms for Legacy Just Works pairing + HCI LE Start Encryption + key distribution.
+            events::WaitFor(events::InvalidType, TimeSpan::FromMilliSeconds(1500), nullptr, [&](const EventRecord &) {
+                return events::IsSlotDisconnected(slot) || !events::IsRadioEnabled();
+            });
+            if (events::IsSlotDisconnected(slot) || !events::IsRadioEnabled()) {
+                log::Write("slot %u: BLE security grant failed during SMP settle (disconnected=%u reason=0x%04x radio=%u)",
+                    slot, events::IsSlotDisconnected(slot), events::GetSlotDisconnectReason(slot), events::IsRadioEnabled());
+                return false;
+            }
+
+            log::Write("slot %u: link alive after BTA_DmBleSecurityGrant settle; proceeding to GATT", slot);
+            return true;
+        }
+
         if (strategy == SecurityStrategy::GattOnDemand) {
             log::Write("slot %u: deferring LE security to GATT on-demand encryption (no CreateBond)", slot);
             return true;
         }
 
         // SecurityStrategy::DirectSetEncryption:
+        // First best-effort grant any pending Slave Security Request so sec_state does not stall SetEncryption.
+        const Result pre_grant_rc = btdrvextBleSecurityGrant(address, 0);
+        log::Write("btdrvextBleSecurityGrant(pre-enc) slot=%u rc=0x%x", slot, pre_grant_rc.GetValue());
         // Invoke BTA_DmSetEncryption(addr, LE=2, cb, BTM_BLE_SEC_ENCRYPT_NO_MITM=2) via IPS cmd 5.
         // Note: BTA_DmSetEncryption is void and the IPS cave epilogue preserves residual w0, so a
         // non-zero raw_rc does NOT indicate IPC failure; rely on live link / radio state instead.

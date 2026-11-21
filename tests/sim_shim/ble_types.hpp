@@ -131,6 +131,7 @@ Result btdrvCancelConnectGattServer(u8, ams::bluetooth::Address, bool);
 Result btdrvCreateBond(ams::bluetooth::Address, u32);
 Result btdrvextSecRemoveDevice(ams::bluetooth::Address);
 Result btdrvextSetEncryption(ams::bluetooth::Address, u8, u8);
+Result btdrvextBleSecurityGrant(ams::bluetooth::Address, u8);
 Result btdrvGetGattAttribute(ams::bluetooth::Address, u32);
 Result btdrvConfigureAttMtu(u32, u16);
 Result btdrvReadGattCharacteristic(u32, bool, const BtdrvGattId *, const BtdrvGattId *, int);

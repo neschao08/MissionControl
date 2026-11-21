@@ -139,6 +139,7 @@ namespace ams::ble {
 
             State state = State::Vacant;
             BleControllerType controller_type = BleControllerType::Unknown;
+            bool was_connected = false;
             u32 conn_id = InvalidConnId;
             u8 client_if = InvalidClientIf;
             u16 negotiated_max_interval = 0;
@@ -423,7 +424,7 @@ namespace ams::ble {
             R_SUCCEED();
         }
 
-        Result Scan(bluetooth::Address *out_address, BleControllerType *out_type, TimeSpan duration) {
+        Result Scan(bluetooth::Address *out_address, BleControllerType *out_type, u8 *out_flags, TimeSpan duration) {
             events::SetScanning(true);
             ON_SCOPE_EXIT { events::SetScanning(false); };
 
@@ -509,13 +510,18 @@ namespace ams::ble {
                 (e.info.scan_result.status == BleScanStatus_NewDevice), svc::ResultTimedOut());
 
             *out_address = e.info.scan_result.address;
-            if (out_type) {
+            if (out_type || out_flags) {
                 const auto summary = ParseAdvertisements(e.info.scan_result.ad_list, e.info.scan_result.count);
-                *out_type = IdentifyCandidate(summary);
-                if (*out_type != BleControllerType::Unknown) {
-                    RememberControllerType(*out_address, *out_type);
-                } else {
-                    *out_type = RecallControllerType(*out_address);
+                if (out_flags) {
+                    *out_flags = summary.flags;
+                }
+                if (out_type) {
+                    *out_type = IdentifyCandidate(summary);
+                    if (*out_type != BleControllerType::Unknown) {
+                        RememberControllerType(*out_address, *out_type);
+                    } else {
+                        *out_type = RecallControllerType(*out_address);
+                    }
                 }
             }
             events::LogAddress("found controller", *out_address);
@@ -586,6 +592,7 @@ namespace ams::ble {
                 std::scoped_lock lk(g_slots_lock);
                 slot.controller = controller;
                 slot.state = BleDeviceSlot::State::Connected;
+                slot.was_connected = true;
             }
 
             // Initialize settings and storage before the input thread can see this controller.
@@ -682,9 +689,16 @@ namespace ams::ble {
             }
 
             if (close_transport && events::IsRadioEnabled() && events::IsSlotDisconnected(slot_index)) {
-                const Result rc = pairing::ClearPeer(slot_index, address);
-                if (R_FAILED(rc)) {
-                    log::Write("slot %u: failed to clear disconnected peer security state rc=0x%x", slot_index, rc.GetValue());
+                const bool preserve_stadia_ltk =
+                    (g_host_slots[slot_index].controller_type == BleControllerType::Stadia) &&
+                    g_host_slots[slot_index].was_connected;
+                if (preserve_stadia_ltk) {
+                    log::Write("slot %u: preserving Stadia BLE bond record after connected session disconnect", slot_index);
+                } else {
+                    const Result rc = pairing::ClearPeer(slot_index, address);
+                    if (R_FAILED(rc)) {
+                        log::Write("slot %u: failed to clear disconnected peer security state rc=0x%x", slot_index, rc.GetValue());
+                    }
                 }
             }
 
@@ -767,6 +781,7 @@ namespace ams::ble {
             u32 conn_id = InvalidConnId;
             u32 session_generation = events::GetClientRegistrationGeneration();
             BleControllerType scanned_type = BleControllerType::Unknown;
+            u8 scanned_flags = 0;
             bool connected = Adopt(&address, &conn_id);
 
             if (connected) {
@@ -774,7 +789,7 @@ namespace ams::ble {
             } else {
                 const bool another_controller_connected = (events::GetActiveConnectionCount() > 0) || (controller::GetConnectedControllerCount() > 0);
                 const TimeSpan scan_duration = TimeSpan::FromSeconds(another_controller_connected ? 2 : 5);
-                Result rc = Scan(&address, &scanned_type, scan_duration);
+                Result rc = Scan(&address, &scanned_type, &scanned_flags, scan_duration);
                 if (events::ConsumeControllerCountChanged()) {
                     RebalanceConnectionParameters();
                 }
@@ -788,11 +803,18 @@ namespace ams::ble {
                     slot = FindSlotForAddress(address, slot);
                     g_host_slots[slot].state = BleDeviceSlot::State::Connecting;
                     g_host_slots[slot].controller_type = scanned_type;
+                    g_host_slots[slot].was_connected = false;
                     g_host_slots[slot].address = address;
                     const u8 client_if = events::GetClientIfForSlot(slot);
                     g_host_slots[slot].client_if = client_if;
                     session_generation = events::GetClientRegistrationGeneration();
-                    connected = R_SUCCEEDED(pairing::Connect(slot, client_if, address, &conn_id, TimeSpan::FromSeconds(15)));
+                    // Preserve bt_nso's in-RAM LTK for Stadia general-discoverable reconnect (flags=0x06)
+                    // when not retrying a failure; clear old bond records for pairing mode (flags=0x05) or retries.
+                    const bool preserve_bond =
+                        (scanned_type == BleControllerType::Stadia) &&
+                        ((scanned_flags & 0x01) == 0) &&
+                        (FindOrAllocStadiaStrategy(address)->failures_in_cycle == 0);
+                    connected = R_SUCCEEDED(pairing::Connect(slot, client_if, address, &conn_id, TimeSpan::FromSeconds(15), !preserve_bond));
                     if (!connected) {
                         NotePairingFailure(address);
                         DismissSlot(slot);
@@ -850,24 +872,26 @@ namespace ams::ble {
                 stadia_stage = GetStadiaStrategyStage(address);
                 switch (stadia_stage) {
                     case 0:
-                        // Primary: skip CreateBond (keep sec_state==0) and write CCCD with NoMitm so
-                        // gatt_determine_sec_act (0xc5848) triggers real BTM_SetEncryption -> SMP_Pair.
-                        sec_strategy = pairing::SecurityStrategy::GattOnDemand;
-                        sub_mode = gatt::SubscribeAuthMode::NoMitmCccdOnly;
+                        // Primary: grant Stadia's proactive SMP Slave Security Request via IPS cmd 6
+                        // (BTA_DmBleSecurityGrant(addr, 0)) so SMP executes Legacy Just Works pairing +
+                        // encryption instead of stalling in SMP_ST_WAIT_APP_DECISION until 30.15s timeout,
+                        // then write CCCD with AuthReq=None on the encrypted link.
+                        sec_strategy = pairing::SecurityStrategy::BleSecurityGrant;
+                        sub_mode = gatt::SubscribeAuthMode::PlainOnlyAfterBond;
                         break;
                     case 1:
-                        // Fallback 1: invoke IPS cmd 5 (BTA_DmSetEncryption LE/NoMitm) directly, then write CCCD with None.
+                        // Fallback 1: grant any pending Slave Security Request and trigger GATT NoMitm encryption.
+                        sec_strategy = pairing::SecurityStrategy::BleSecurityGrant;
+                        sub_mode = gatt::SubscribeAuthMode::NoMitmCccdOnly;
+                        break;
+                    default:
+                        // Fallback 2: grant pending request + IPS cmd 5 BTA_DmSetEncryption + AuthReq=None CCCD.
                         sec_strategy = pairing::SecurityStrategy::DirectSetEncryption;
                         sub_mode = gatt::SubscribeAuthMode::PlainOnlyAfterBond;
                         break;
-                    default:
-                        // Fallback 2: plaintext CCCD without 0x2A50 DIS read (no 28.36s ATT timeout).
-                        sec_strategy = pairing::SecurityStrategy::GattOnDemand;
-                        sub_mode = gatt::SubscribeAuthMode::PlainOnlyAfterBond;
-                        break;
                 }
-                log::Write("slot %u: Stadia security plan stage=%u (sec=%u sub=%u)",
-                    slot, stadia_stage, static_cast<u32>(sec_strategy), static_cast<u32>(sub_mode));
+                log::Write("slot %u: Stadia security plan stage=%u (sec=%u sub=%u flags=0x%02x)",
+                    slot, stadia_stage, static_cast<u32>(sec_strategy), static_cast<u32>(sub_mode), scanned_flags);
             }
 
             const auto handle_attempt_failure = [&](const char *phase) {
@@ -991,7 +1015,7 @@ namespace ams::ble {
             bluetooth::ble::WaitInitialized();
 
             os::SleepThread(TimeSpan::FromSeconds(20));
-            log::Write("starting multi-device BLE host (stadia-ble-v5-hos2250, HOS=0x%x)", static_cast<u32>(hos::GetVersion()));
+            log::Write("starting multi-device BLE host (stadia-ble-v6-hos2250, HOS=0x%x)", static_cast<u32>(hos::GetVersion()));
 
             if (R_FAILED(PrepareClient())) {
                 log::Write("giving up: no gatt client available");

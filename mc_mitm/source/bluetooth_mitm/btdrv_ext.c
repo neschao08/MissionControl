@@ -78,3 +78,14 @@ Result btdrvextSetEncryption(BtdrvAddress address, u8 transport, u8 sec_act) {
 
     return _btdrvCustomCommand(&cmd, sizeof(cmd));
 }
+
+Result btdrvextBleSecurityGrant(BtdrvAddress address, u8 res) {
+    const struct NX_PACKED {
+        u32 type;
+        BtdrvAddress address;
+        u8 res;
+    } cmd = { BtdrvExtCustomEventType_BleSecurityGrant, address, res };
+    _Static_assert(sizeof(cmd) == 11, "BleSecurityGrant custom command layout mismatch");
+
+    return _btdrvCustomCommand(&cmd, sizeof(cmd));
+}

@@ -21,9 +21,10 @@ namespace ams::ble::pairing {
         CreateBond,
         GattOnDemand,
         DirectSetEncryption,
+        BleSecurityGrant,
     };
 
-    Result Connect(u32 slot, u8 client_if, const bluetooth::Address &address, u32 *out_conn_id, TimeSpan timeout);
+    Result Connect(u32 slot, u8 client_if, const bluetooth::Address &address, u32 *out_conn_id, TimeSpan timeout, bool clear_existing_bond = true);
     Result ClearPeer(u32 slot, const bluetooth::Address &address);
     // A fresh security indication only permits Subscribe to verify authenticated GATT access.
     bool PrepareSecurity(u32 slot, const bluetooth::Address &address);

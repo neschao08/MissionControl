@@ -3,7 +3,7 @@
 #include <iostream>
 using namespace ams::ble;
 static constexpr ams::bluetooth::Address Target = {{0x14,0xcb,0x65,0xe8,0x2b,0xe2}};
-static unsigned removes, ext_removes, connects, cancels, bond_cancels, bonds, set_encryptions;
+static unsigned removes, ext_removes, connects, cancels, bond_cancels, bonds, set_encryptions, ble_sec_grants;
 static u64 connected_at;
 static bool remove_fails, ext_remove_fails, cancel_bond_fails, connect_fails, respond, late_connection, new_bond, bond_fails;
 static u32 set_encryption_raw_rc;
@@ -62,11 +62,16 @@ Result btdrvextSetEncryption(ams::bluetooth::Address addr, u8 transport, u8 sec_
     if (set_encryption_emits_bond) events::Schedule(events::Bond, 250);
     return {set_encryption_raw_rc};
 }
+Result btdrvextBleSecurityGrant(ams::bluetooth::Address addr, u8 res) {
+    assert(AddressEqual(addr, Target) && res == 0 && events::radio && !events::disconnected);
+    ++ble_sec_grants;
+    return {0};
+}
 static void Reset() {
     events::queue.clear(); events::now_ms = 0;
     events::radio = true;
     events::SetSlotConnecting(0, Target);
-    removes = ext_removes = connects = cancels = bond_cancels = bonds = set_encryptions = 0; connected_at = 0;
+    removes = ext_removes = connects = cancels = bond_cancels = bonds = set_encryptions = ble_sec_grants = 0; connected_at = 0;
     remove_fails = ext_remove_fails = cancel_bond_fails = connect_fails = late_connection = bond_fails = false;
     set_encryption_raw_rc = 0;
     set_encryption_emits_bond = false;
@@ -201,7 +206,30 @@ int main() {
     // Strategy 2: CreateBond delegates directly to PrepareSecurity
     Reset();
     assert(pairing::PrepareSecurityWithStrategy(0, Target, pairing::SecurityStrategy::CreateBond));
-    assert(bonds == 1 && set_encryptions == 0 && events::now_ms == 600);
+    assert(bonds == 1 && set_encryptions == 0 && ble_sec_grants == 0 && events::now_ms == 600);
+
+    // Strategy 3: BleSecurityGrant invokes IPS cmd 6 twice (0ms + 250ms) and settles for 1500ms
+    Reset();
+    assert(pairing::PrepareSecurityWithStrategy(0, Target, pairing::SecurityStrategy::BleSecurityGrant));
+    assert(ble_sec_grants == 2 && bonds == 0 && set_encryptions == 0 && events::now_ms == 1750);
+
+    // BleSecurityGrant aborts promptly if link drops during 250ms or 1500ms window
+    Reset();
+    events::Schedule(BtdrvBleEventType_ClientConnection, 100, refused);
+    assert(!pairing::PrepareSecurityWithStrategy(0, Target, pairing::SecurityStrategy::BleSecurityGrant));
+    assert(ble_sec_grants == 1 && events::now_ms == 100);
+    Reset();
+    events::Schedule(BtdrvBleEventType_ClientConnection, 500, refused);
+    assert(!pairing::PrepareSecurityWithStrategy(0, Target, pairing::SecurityStrategy::BleSecurityGrant));
+    assert(ble_sec_grants == 2 && events::now_ms == 500);
+
+    // Connect with clear_existing_bond=false preserves existing LTK record (no RemoveBond / SecRemoveDevice)
+    Reset();
+    {
+        u32 cid = InvalidConnId;
+        assert(R_SUCCEEDED(pairing::Connect(0, 3, Target, &cid, TimeSpan::FromSeconds(15), false)));
+        assert(removes == 0 && ext_removes == 0 && connects == 1);
+    }
 
     std::cout << "BLE production reconnect/pairing regressions passed\n";
 }

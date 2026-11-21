@@ -531,6 +531,38 @@ namespace ams::ble::gatt {
         R_RETURN(result);
     }
 
+    Result RearmInputNotifications(u32 slot_index, u32 conn_id, u8 auth_req) {
+        if (slot_index >= MaxBleControllers) {
+            R_THROW(svc::ResultInvalidArgument());
+        }
+        R_UNLESS(!events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled(), ResultNoConnection());
+
+        const auto *found = FindService(slot_index, GattServiceHid);
+        if (!found) {
+            R_THROW(svc::ResultNotFound());
+        }
+
+        const BtdrvGattAttribute service = *found;
+        const auto &s = g_slots[slot_index];
+        Result result = svc::ResultNotFound();
+        for (size_t i = 0; i < s.table.count; ++i) {
+            const auto &attr = s.table.attributes[i];
+            if ((attr.type != BtdrvGattAttributeType_Characteristic) || !IsWithinService(attr, service) ||
+                !IsUuid16(attr.id.uuid, GattCharReport) || !(attr.property & BtdrvGattCharacteristicProperty_Notify)) {
+                continue;
+            }
+            const auto *cccd = FindDescriptor(slot_index, attr, GattDescClientCharConfig);
+            if (!cccd) {
+                continue;
+            }
+            const Result rc = WriteCccdWithAuth(slot_index, conn_id, service, attr, *cccd, auth_req, TimeSpan::FromSeconds(2));
+            log::Write("slot %u: re-armed input CCCD handle=0x%04x rc=0x%x", slot_index, cccd->handle, rc.GetValue());
+            R_TRY(rc);
+            result = ResultSuccess();
+        }
+        R_RETURN(result);
+    }
+
     void Unsubscribe(u32 slot_index, u32 conn_id) {
         // Intentional no-op matching upstream stek_ble_gatt: never call btdrvUnregisterGattNotification,
         // as real hardware testing showed it disrupts notification delivery across subsequent connections.

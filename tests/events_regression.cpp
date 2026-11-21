@@ -152,7 +152,8 @@ int main() {
     os::g_tick_ms += 13000;
     assert(!events::ClassicActivityWithin(TimeSpan::FromSeconds(12)));
 
-    // Dirty notification table flag: set on non-zero disconnect (result=26) or radio disable (sleep), cleared by ClientRegistration
+    // Dirty notification table flag: NOT set by single-link disconnects (avoids spurious Unregister=0x25a71),
+    // set only on stack-wide teardown (InvalidConnId/InvalidClientIf) or radio disable (sleep), cleared by ClientRegistration.
     events::TakeNotifTableDirty();
     events::SetRadioEnabled(true);
     events::SetSlotConnection(0, stadia_addr, 888);
@@ -160,9 +161,19 @@ int main() {
     dirty_disc.client_connection.result = 26;
     dirty_disc.client_connection.status = BleConnectionStatus_Disconnected;
     dirty_disc.client_connection.conn_id = 888;
+    dirty_disc.client_connection.client_if = 6;
     dirty_disc.client_connection.address = stadia_addr;
     dirty_disc.client_connection.reason = 0x0008;
     assert(events::OnBleEvent(BtdrvBleEventType_ClientConnection, &dirty_disc) == true);
+    assert(events::TakeNotifTableDirty() == false);
+
+    // Stack-wide teardown (conn_id=InvalidConnId, client_if=InvalidClientIf) marks notification table dirty.
+    BtdrvBleEventInfo stack_reset{};
+    stack_reset.client_connection.result = 55;
+    stack_reset.client_connection.status = BleConnectionStatus_Disconnected;
+    stack_reset.client_connection.conn_id = InvalidConnId;
+    stack_reset.client_connection.client_if = InvalidClientIf;
+    assert(events::OnBleEvent(BtdrvBleEventType_ClientConnection, &stack_reset) == true);
     assert(events::TakeNotifTableDirty() == true);
     assert(events::TakeNotifTableDirty() == false);
 

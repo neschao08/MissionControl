@@ -227,10 +227,10 @@ int main() {
     assert(pairing::PrepareSecurityWithStrategy(0, Target, pairing::SecurityStrategy::BleSecurityGrant));
     assert(ble_sec_grants == 2 && bonds == 0 && set_encryptions == 0 && events::now_ms == 900);
 
-    // BleSecurityGrant fast_reconnect shortens waits to 100ms + 350ms = 450ms
+    // BleSecurityGrant fast_reconnect keeps steady 150ms + 750ms = 900ms settle so CCCD clears Stadia ~2.0s SMP
     Reset();
     assert(pairing::PrepareSecurityWithStrategy(0, Target, pairing::SecurityStrategy::BleSecurityGrant, true));
-    assert(ble_sec_grants == 2 && bonds == 0 && set_encryptions == 0 && events::now_ms == 450);
+    assert(ble_sec_grants == 2 && bonds == 0 && set_encryptions == 0 && events::now_ms == 900);
 
     // BleSecurityGrant aborts promptly if link drops during 150ms or 750ms window
     Reset();

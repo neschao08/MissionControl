@@ -105,6 +105,7 @@ namespace ams::controller {
             u32 TestDataEvents() const { return m_data_report_events; }
             u32 TestOutputCalls() const { return m_output_calls; }
             u32 TestInjectCalls() const { return m_inject_calls; }
+            u8 TestDeviceType() const { return m_device_info.device_type; }
             void TestSetTriggerThreshold(float t) { m_trigger_threshold = t; }
 
         protected:
@@ -125,6 +126,14 @@ namespace ams::controller {
 
             bluetooth::Address m_address;
             HardwareID m_id;
+            struct {
+                u8 device_type = 0x06;
+                const char *device_name = "Lic Pro Controller";
+            } m_device_info;
+            struct {
+                bool enabled = true;
+                bool GetEnabled() const { return enabled; }
+            } m_vibration_processor;
             SwitchAnalogStick m_left_stick;
             SwitchAnalogStick m_right_stick;
             SwitchButtons m_buttons;

@@ -40,7 +40,11 @@ namespace ams::controller {
             , m_output_report_id(output_report_id)
             , m_has_output_report(has_output_report)
             , m_output_write_with_response(output_write_with_response)
-            , m_write_auth_req(write_auth_req) { }
+            , m_write_auth_req(write_auth_req) {
+                // Report as Official Pro Controller (0x03) so HOS enables 0x6050 custom colors and full HD rumble.
+                m_device_info.device_type = 0x03;
+                m_device_info.device_name = "Pro Controller";
+            }
 
             Result Initialize() override;
             Result HandleBleInputReport(const u8 *data, size_t size) override;
@@ -69,6 +73,7 @@ namespace ams::controller {
             u16 m_last_rumble_weak = 0;
             s64 m_last_rumble_tick = 0;
             u32 m_cmd_log_count = 0;
+            u32 m_basic_out_log_count = 0;
             u32 m_rumble_log_count = 0;
             u8  m_rumble_fallback_stage = 0;
 

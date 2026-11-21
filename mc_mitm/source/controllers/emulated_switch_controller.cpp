@@ -51,6 +51,8 @@ namespace ams::controller {
     }
 
     Result EmulatedSwitchController::WriteControllerColours(RGBColour body, RGBColour buttons, RGBColour left_grip, RGBColour right_grip) {
+        const u8 color_flag = 0x02;
+        R_TRY(m_virtual_memory.Write(0x601b, &color_flag, sizeof(color_flag)));
         const SwitchControllerColours colours = { body, buttons, left_grip, right_grip };
         R_RETURN(m_virtual_memory.Write(0x6050, &colours, sizeof(colours)));
     }
@@ -141,6 +143,7 @@ namespace ams::controller {
         mcu_report->motion_data = m_sixaxis_processor.GetState();
 
         std::memset(&mcu_report->mcu_data, 0, sizeof(mcu_report->mcu_data));
+        mcu_report->mcu_data.data[0] = static_cast<u8>(SwitchMcuCommandId::StateReport);
 
         return sizeof(SwitchHidMcuInputReport);
     }

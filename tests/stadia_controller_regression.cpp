@@ -44,6 +44,7 @@ int main() {
         os::g_now_ms = 1000;
 
         StadiaBleController ctrl(addr, 259, svc_id, true, out_id, true, true, BtdrvGattAuthReqType_None);
+        assert(ctrl.TestDeviceType() == 0x03);
 
         // 10-byte stripped HOGP packet: East (printed B = 0x20) -> Switch A, L+R (0x06)
         const u8 pkt10[10] = {0x08, 0x00, 0x26, 0x80, 0x80, 0x80, 0x80, 0x00, 0x00, 0x00};

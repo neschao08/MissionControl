@@ -25,6 +25,7 @@
 #include "../mcmitm_config.hpp"
 #include "../mcmitm_initialization.hpp"
 #include "../bluetooth_mitm/bluetooth/bluetooth_ble.hpp"
+#include "../btm_mitm/btm_device_info.hpp"
 #include "../controllers/controller_management.hpp"
 #include "../controllers/stadia_ble_controller.hpp"
 #include "../controllers/xbox_one_ble_controller.hpp"
@@ -171,8 +172,10 @@ namespace ams::ble {
             BleControllerType controller_type = BleControllerType::Unknown;
             bool was_connected = false;
             bool disconnect_requested = false;
+            bool cccd_rearmed = false;
             ConnectRumbleState connect_rumble_state = ConnectRumbleState::None;
             s64 connect_rumble_tick = 0;
+            s64 presented_tick = 0;
             u32 conn_id = InvalidConnId;
             u8 client_if = InvalidClientIf;
             u16 negotiated_max_interval = 0;
@@ -368,6 +371,7 @@ namespace ams::ble {
             }
             if (changed) {
                 events::LogAddress("remembered Stadia controller for auto-reconnect", address);
+                mitm::btm::info::Signal();
             }
         }
 
@@ -396,6 +400,9 @@ namespace ams::ble {
             for (size_t i = 0; i < n; ++i) {
                 RememberControllerType(store.addresses[i], BleControllerType::Stadia);
                 events::LogAddress("loaded known Stadia controller", store.addresses[i]);
+            }
+            if (n > 0) {
+                mitm::btm::info::Signal();
             }
         }
 
@@ -619,8 +626,15 @@ namespace ams::ble {
                 u16 strong;
                 u16 weak;
             };
+            struct RearmTask {
+                u32 slot;
+                u32 conn_id;
+                u8 auth_req;
+            };
             RumblePulse actions[MaxBleControllers] = {};
+            RearmTask rearm_tasks[MaxBleControllers] = {};
             size_t count = 0;
+            size_t rearm_count = 0;
             {
                 std::scoped_lock lk(g_slots_lock);
                 const s64 now = os::GetSystemTick().GetInt64Value();
@@ -629,6 +643,8 @@ namespace ams::ble {
                     if ((slot.state != BleDeviceSlot::State::Connected) || !slot.controller) {
                         slot.connect_rumble_state = BleDeviceSlot::ConnectRumbleState::None;
                         slot.connect_rumble_tick = 0;
+                        slot.cccd_rearmed = false;
+                        slot.presented_tick = 0;
                         continue;
                     }
                     if (slot.connect_rumble_state == BleDeviceSlot::ConnectRumbleState::PendingStart) {
@@ -644,10 +660,21 @@ namespace ams::ble {
                             actions[count++] = { slot.controller, 0x0000, 0x0000 };
                         }
                     }
+                    if ((slot.controller_type == BleControllerType::Stadia) && !slot.cccd_rearmed &&
+                        (slot.presented_tick != 0) &&
+                        ((os::Tick(now) - os::Tick(slot.presented_tick)).ToTimeSpan() >= TimeSpan::FromMilliSeconds(900))) {
+                        slot.cccd_rearmed = true;
+                        if (events::GetSlotInputReportCount(static_cast<u32>(i)) == slot.attach_input_reports) {
+                            rearm_tasks[rearm_count++] = { static_cast<u32>(i), slot.conn_id, slot.hid.write_auth_req };
+                        }
+                    }
                 }
             }
             for (size_t i = 0; i < count; ++i) {
                 static_cast<void>(actions[i].controller->SendConnectRumble(actions[i].strong, actions[i].weak));
+            }
+            for (size_t i = 0; i < rearm_count; ++i) {
+                static_cast<void>(gatt::RearmInputNotifications(rearm_tasks[i].slot, rearm_tasks[i].conn_id, rearm_tasks[i].auth_req));
             }
         }
 
@@ -994,10 +1021,12 @@ namespace ams::ble {
             {
                 std::scoped_lock lk(g_slots_lock);
                 slot.attach_input_reports = events::GetSlotInputReportCount(slot_index);
+                slot.cccd_rearmed = false;
+                slot.presented_tick = os::GetSystemTick().GetInt64Value();
                 ScheduleNeutralReportsLocked(slot);
                 if (controller_type == BleControllerType::Stadia) {
                     slot.connect_rumble_state = BleDeviceSlot::ConnectRumbleState::PendingStart;
-                    slot.connect_rumble_tick = os::GetSystemTick().GetInt64Value();
+                    slot.connect_rumble_tick = slot.presented_tick;
                 } else {
                     slot.connect_rumble_state = BleDeviceSlot::ConnectRumbleState::None;
                     slot.connect_rumble_tick = 0;
@@ -1043,6 +1072,8 @@ namespace ams::ble {
                     controller = std::move(slot.controller);
                     slot.controller = nullptr;
                     slot.negotiated_max_interval = 0;
+                    slot.cccd_rearmed = false;
+                    slot.presented_tick = 0;
                     slot.connect_rumble_state = BleDeviceSlot::ConnectRumbleState::None;
                     slot.connect_rumble_tick = 0;
                 }
@@ -1525,7 +1556,7 @@ namespace ams::ble {
             bluetooth::ble::WaitInitialized();
 
             os::SleepThread(TimeSpan::FromSeconds(20));
-            log::Write("starting multi-device BLE host (stadia-ble-v13-hos2250, HOS=0x%x)", static_cast<u32>(hos::GetVersion()));
+            log::Write("starting multi-device BLE host (stadia-ble-v14-hos2250, HOS=0x%x)", static_cast<u32>(hos::GetVersion()));
             LoadKnownStadia();
 
             if (R_FAILED(PrepareClient())) {
@@ -1650,6 +1681,15 @@ namespace ams::ble {
             events::NotifyControllerCountChanged();
         }
         return matched;
+    }
+
+    size_t GetKnownStadiaAddresses(bluetooth::Address *out, size_t max) {
+        std::scoped_lock lk(g_known_stadia_lock);
+        const size_t count = std::min(max, g_known_stadia_count);
+        for (size_t i = 0; i < count; ++i) {
+            out[i] = g_known_stadia[i];
+        }
+        return count;
     }
 
 }

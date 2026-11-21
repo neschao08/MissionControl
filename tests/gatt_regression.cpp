@@ -482,6 +482,12 @@ int main() {
         assert(gatt::Subscribe(0, 260, &after_bond, gatt::SubscribeAuthMode::PlainOnlyAfterBond).value == 8);
         assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_None}));
         cccd_plain_failure = 0;
+
+        // RearmInputNotifications re-writes CCCD=0x0001 cleanly without reading 0x2A4A again
+        read_uuids.clear(); cccd_auths.clear();
+        assert(R_SUCCEEDED(gatt::RearmInputNotifications(0, 260, BtdrvGattAuthReqType_None)));
+        assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_None}));
+        assert(read_uuids.empty());
     }
 
     std::cout << "GATT discovery/authentication/completion isolation/cache/cancellation regressions passed\n";

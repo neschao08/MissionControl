@@ -268,8 +268,11 @@ namespace ams::ble::pairing {
 
             // Re-issue once after a short gap in case Slave Security Request arrived after a fast cached
             // GATT discovery; SMP_SecurityGrant (0xf5bf0) is a safe no-op once out of WAIT_APP_DECISION.
-            const s64 grant_gap_ms = fast_reconnect ? 100 : 150;
-            const s64 settle_ms    = fast_reconnect ? 350 : 750;
+            // Wait steadily (150ms + 750ms = 900ms, regardless of fast_reconnect) unless bond completes early,
+            // so CCCD subscription lands safely after Stadia's ~2.0s SMP encryption settle.
+            (void)fast_reconnect;
+            const s64 grant_gap_ms = 150;
+            const s64 settle_ms    = 750;
             bool bond_complete = false;
             events::WaitFor(events::InvalidType, TimeSpan::FromMilliSeconds(grant_gap_ms), nullptr, [&](const EventRecord &) {
                 bond_complete = bond_complete || events::TakeSlotBondComplete(slot);

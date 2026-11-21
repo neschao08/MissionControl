@@ -37,5 +37,6 @@ namespace ams::ble {
     void Launch();
     void WaitFinished();
     bool RequestDisconnect(const bluetooth::Address &address);
+    size_t GetKnownStadiaAddresses(bluetooth::Address *out, size_t max);
 
 }

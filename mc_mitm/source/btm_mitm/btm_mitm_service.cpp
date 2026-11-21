@@ -17,6 +17,7 @@
 #include "btm_shim.h"
 #include "btm_device_condition.hpp"
 #include "btm_device_info.hpp"
+#include "../ble/ble_hid_host.hpp"
 #include "../ble/ble_log.hpp"
 #include "../controllers/controller_management.hpp"
 #include <atomic>
@@ -84,15 +85,37 @@ namespace ams::mitm::btm {
 
         template <typename T>
         void AppendVirtualDeviceInfos(T *device_info, size_t max_size, sf::Out<s32> &total_out) {
-            bluetooth::Address virtual_devices[4];
-            const size_t virtual_count = controller::GetVirtualDevices(virtual_devices, util::size(virtual_devices));
+            bluetooth::Address known_devices[4];
+            const size_t known_count = ble::GetKnownStadiaAddresses(known_devices, util::size(known_devices));
+
+            bluetooth::Address active_devices[4];
+            const size_t active_count = controller::GetVirtualDevices(active_devices, util::size(active_devices));
+
+            bluetooth::Address combined_devices[8];
+            size_t combined_count = 0;
+            const auto add_unique = [&](const bluetooth::Address &addr) {
+                for (size_t k = 0; k < combined_count; ++k) {
+                    if (std::memcmp(&combined_devices[k], &addr, sizeof(bluetooth::Address)) == 0) {
+                        return;
+                    }
+                }
+                if (combined_count < util::size(combined_devices)) {
+                    combined_devices[combined_count++] = addr;
+                }
+            };
+            for (size_t i = 0; i < known_count; ++i) {
+                add_unique(known_devices[i]);
+            }
+            for (size_t i = 0; i < active_count; ++i) {
+                add_unique(active_devices[i]);
+            }
 
             s32 total = total_out.GetValue();
             const s32 existing_count = total;
-            for (size_t i = 0; (i < virtual_count) && (static_cast<size_t>(total) < max_size); ++i) {
+            for (size_t i = 0; (i < combined_count) && (static_cast<size_t>(total) < max_size); ++i) {
                 bool already_present = false;
                 for (s32 j = 0; j < existing_count; ++j) {
-                    if (std::memcmp(&device_info[j].addr, &virtual_devices[i], sizeof(bluetooth::Address)) == 0) {
+                    if (std::memcmp(&device_info[j].addr, &combined_devices[i], sizeof(bluetooth::Address)) == 0) {
                         already_present = true;
                         break;
                     }
@@ -103,7 +126,7 @@ namespace ams::mitm::btm {
 
                 auto device = &device_info[total++];
                 std::memset(device, 0, sizeof(*device));
-                device->addr = virtual_devices[i];
+                device->addr = combined_devices[i];
                 device->class_of_device = { 0x00, 0x25, 0x08 };
                 std::memset(device->link_key.link_key, 0xAA, sizeof(device->link_key.link_key));
                 device->key_type = 4;

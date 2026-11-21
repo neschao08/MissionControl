@@ -409,7 +409,6 @@ namespace ams::controller {
         }
 
         mitm::btm::condition::Signal();
-        mitm::btm::info::Signal();
     }
 
     size_t GetVirtualDevices(bluetooth::Address *out, size_t max) {

@@ -441,13 +441,11 @@ namespace ams::ble::events {
             if (type == BtdrvBleEventType_ClientConnection) {
                 auto &connection = info->client_connection;
                 const bool connected = (connection.result == 0) && (connection.status == BleConnectionStatus_Connected);
-                if (!connected && (connection.result != 0)) {
-                    g_notif_table_dirty.store(true, std::memory_order_release);
-                }
                 if (!connected && g_adopted && connection.conn_id == g_adopted_conn_id) g_adopted = false;
 
                 if (!connected && (connection.conn_id == InvalidConnId) && (connection.client_if == InvalidClientIf)) {
                     // Stack-wide BLE teardown/reset (e.g. result=55 status=2 client_if=255 conn_id=0xFFFFFFFF)
+                    g_notif_table_dirty.store(true, std::memory_order_release);
                     for (size_t s = 0; s < MaxBleControllers; ++s) {
                         if (g_slots[s].active) {
                             g_slots[s].disconnected = true;

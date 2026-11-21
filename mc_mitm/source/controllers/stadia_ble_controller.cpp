@@ -95,6 +95,20 @@ namespace ams::controller {
         if (report_id == SwitchHidReportId::BasicOutputReport) {
             std::scoped_lock lk(m_rumble_mutex);
             R_UNLESS(m_connected, svc::ResultInvalidState());
+            if ((size >= 10) && (m_basic_out_log_count < 8) && ble::log::IsEnabled()) {
+                // Ignore neutral rumble [00 01 40 40 00 01 40 40] so only real vibration packets take log slots.
+                const bool is_neutral = (report_buffer[2] == 0x00) && (report_buffer[3] == 0x01) &&
+                                        (report_buffer[4] == 0x40) && (report_buffer[5] == 0x40) &&
+                                        (report_buffer[6] == 0x00) && (report_buffer[7] == 0x01) &&
+                                        (report_buffer[8] == 0x40) && (report_buffer[9] == 0x40);
+                if (!is_neutral) {
+                    ++m_basic_out_log_count;
+                    ble::log::Write("stadia basic-out #%u conn_id=%u en=%u m=%02x%02x%02x%02x_%02x%02x%02x%02x",
+                        m_basic_out_log_count, m_conn_id, m_vibration_processor.GetEnabled() ? 1u : 0u,
+                        report_buffer[2], report_buffer[3], report_buffer[4], report_buffer[5],
+                        report_buffer[6], report_buffer[7], report_buffer[8], report_buffer[9]);
+                }
+            }
             R_RETURN(EmulatedSwitchController::HandleOutputDataReport(report_buffer, size));
         }
 

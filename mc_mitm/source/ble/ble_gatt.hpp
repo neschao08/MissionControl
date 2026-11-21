@@ -65,6 +65,7 @@ namespace ams::ble::gatt {
     // Enables notifications on the HID input Report characteristic(s). Fails with InsufficientAuthentication
     // when the link isn't encrypted; returns NotFound if the table holds no HID service.
     Result Subscribe(u32 slot_index, u32 conn_id, HidService *out, SubscribeAuthMode auth_mode = SubscribeAuthMode::StandardNoMitm);
+    Result RearmInputNotifications(u32 slot_index, u32 conn_id, u8 auth_req = BtdrvGattAuthReqType_None);
 
     // Resets slot connection state while retaining cached attributes for the address
     void ResetSlot(u32 slot_index);

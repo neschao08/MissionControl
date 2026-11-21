@@ -46,6 +46,7 @@ namespace ams::ble::events {
         os::Event g_sleep_prepared_event(os::EventClearMode_ManualClear);
         std::atomic<bool> g_controller_count_changed{false};
         std::atomic<bool> g_quiet_scan_logs{false};
+        std::atomic<bool> g_notif_table_dirty{false};
         std::atomic<u64> g_input_report_count{0};
         std::atomic<u64> g_slot_input_report_counts[MaxBleControllers] = {};
         std::atomic<u32> g_slot_rumble_ack_logs[MaxBleControllers] = {};
@@ -278,6 +279,10 @@ namespace ams::ble::events {
         return g_slots[slot].conn_id;
     }
 
+    bool TakeNotifTableDirty() {
+        return g_notif_table_dirty.exchange(false, std::memory_order_acq_rel);
+    }
+
     u16 GetSlotDisconnectReason(u32 slot) {
         std::scoped_lock lk(g_lock);
         if (slot >= MaxBleControllers) {
@@ -460,6 +465,9 @@ namespace ams::ble::events {
                         if (!connected && ((g_slots[slot].conn_id == InvalidConnId) || (connection.conn_id == g_slots[slot].conn_id))) {
                             g_slots[slot].disconnected = true;
                             g_slots[slot].disconnect_reason = connection.reason;
+                            if (connection.result != 0) {
+                                g_notif_table_dirty.store(true, std::memory_order_release);
+                            }
                             UnregisterSlotController(slot);
                         } else if (connected) {
                             g_slots[slot].conn_id = connection.conn_id;

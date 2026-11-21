@@ -214,9 +214,17 @@ int main() {
     assert(query_times.size() == 1 && query_times[0] >= 2000);
     assert(mtu_connections == std::vector<u32>{260});
     AssertSubscribed(0, 260);
-    assert(unregister_count == 1); // pre-clean before RegisterGattNotification
+    assert(unregister_count == 0); // clean first connect: NEVER Unregister before Register (v7/v8 zero-input regression)
     gatt::Unsubscribe(0, 260);
-    assert(unregister_count == 2);
+    assert(unregister_count == 1);
+
+    // After a dirty (result != 0) disconnect, the next subscription must purge the stale bt_nso entry exactly once.
+    Reset();
+    events::notif_dirty = true;
+    assert(R_SUCCEEDED(gatt::Discover(0, 260, a)));
+    AssertSubscribed(0, 260);
+    assert(unregister_count == 1);
+    assert(!events::notif_dirty);
 
     Reset(DiscoveryMode::AfterMtu);
     assert(R_SUCCEEDED(gatt::Discover(0, 260, a)));
@@ -422,12 +430,14 @@ int main() {
         events::completed = true;
 
         // NoMitmCccdOnly (Stadia Stage 1): skips 0x2A4A AND skips 0x2A50/0x2A00 (which stall 28.36s on Stadia),
-        // pre-cleans stale bt_nso notif table via Unregister, writes CCCD=0x0001 ONCE with NoMitm (never 0x0000)!
+        // pre-cleans stale bt_nso notif table via Unregister ONLY after a dirty disconnect, writes CCCD=0x0001 ONCE with NoMitm (never 0x0000)!
         read_uuids.clear(); read_auths.clear(); cccd_auths.clear();
         const int unreg_before = unregister_count;
+        events::notif_dirty = true;
         gatt::HidService nomitm_direct{};
         assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &nomitm_direct, gatt::SubscribeAuthMode::NoMitmCccdOnly)));
         assert(unregister_count == unreg_before + 1);
+        assert(!events::notif_dirty);
         assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_NoMitm}));
         assert(nomitm_direct.write_auth_req == BtdrvGattAuthReqType_NoMitm);
         assert(nomitm_direct.has_output_report && nomitm_direct.output_report.handle == out_handle);

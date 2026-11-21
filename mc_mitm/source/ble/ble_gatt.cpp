@@ -419,6 +419,7 @@ namespace ams::ble::gatt {
             ? static_cast<u8>(BtdrvGattAuthReqType_NoMitm)
             : static_cast<u8>(BtdrvGattAuthReqType_None);
 
+        const bool notif_preclean = events::TakeNotifTableDirty();
         Result result = svc::ResultNotFound();
         for (size_t i = 0; i < count; ++i) {
             const auto attr = s.table.attributes[i];
@@ -437,12 +438,15 @@ namespace ams::ble::gatt {
             R_UNLESS(!events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled(), ResultNoConnection());
 
             // Work around bt_nso 0x2c26c bug: when a previous connection ended with ClientConnection result != 0
-            // (e.g. result=26 on supervision timeout), bt_nso skipped BSA_GattcDeregisterNotification and left a
-            // stale entry in g_gatt_manager, causing btdrvRegisterGattNotification to early-return 0 without
-            // calling BSA_GattcRegisterNotification. Unregistering on the live conn_id first purges any stale entry
-            // (and is a pure no-op at bt_nso 0x6578 when the table is empty on first connect).
-            const Result unreg_rc = btdrvUnregisterGattNotification(conn_id, service.is_primary, &service.id, &attr.id);
-            log::Write("btdrvUnregisterGattNotification(pre-clean) slot=%u handle=0x%04x rc=0x%x", slot_index, attr.handle, unreg_rc.GetValue());
+            // (e.g. result=26), bt_nso skipped BSA_GattcDeregisterNotification and left a stale entry in
+            // g_gatt_manager, causing btdrvRegisterGattNotification to early-return 0 without calling
+            // BSA_GattcRegisterNotification. ONLY purge when such a dirty disconnect actually happened:
+            // real hardware (v7/v8) showed an unconditional Unregister right before Register on a clean
+            // first connection leaves Stadia with zero input reports, while v6 (no pre-clean) worked.
+            if (notif_preclean) {
+                const Result unreg_rc = btdrvUnregisterGattNotification(conn_id, service.is_primary, &service.id, &attr.id);
+                log::Write("btdrvUnregisterGattNotification(pre-clean after dirty disconnect) slot=%u handle=0x%04x rc=0x%x", slot_index, attr.handle, unreg_rc.GetValue());
+            }
 
             Result rc = btdrvRegisterGattNotification(conn_id, service.is_primary, &service.id, &attr.id);
             log::Write("btdrvRegisterGattNotification slot=%u handle=0x%04x rc=0x%x", slot_index, attr.handle, rc.GetValue());

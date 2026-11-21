@@ -60,6 +60,8 @@ namespace ams::ble::events {
         slots[slot] = {true, addr, InvalidConnId, false, 0, false};
     }
     inline bool IsRadioEnabled() { return radio; }
+    inline bool notif_dirty = false;
+    inline bool TakeNotifTableDirty() { const bool v = notif_dirty; notif_dirty = false; return v; }
     inline bool IsSlotDisconnected(u32 slot) { return slot >= MaxBleControllers || slots[slot].disconnected; }
     inline u32 GetSlotConnectionId(u32 slot) {
         if (slot >= MaxBleControllers || !slots[slot].active || slots[slot].disconnected) return InvalidConnId;
@@ -97,6 +99,7 @@ namespace ams::ble::events {
                     } else if (slots[s].conn_id == InvalidConnId || slots[s].conn_id == c.conn_id) {
                         slots[s].disconnected = true;
                         slots[s].disconnect_reason = c.reason;
+                        if (c.result != 0) notif_dirty = true;
                     }
                     break;
                 }

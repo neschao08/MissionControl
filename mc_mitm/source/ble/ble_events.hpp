@@ -59,6 +59,7 @@ namespace ams::ble::events {
     bool IsSlotDisconnected(u32 slot);
     u32 GetSlotConnectionId(u32 slot);
     u16 GetSlotDisconnectReason(u32 slot);
+    bool TakeNotifTableDirty();
     bool TakeSlotBondComplete(u32 slot);
 
     /* Bounded four-slot lookup; the returned reference protects in-flight dispatch during teardown. */

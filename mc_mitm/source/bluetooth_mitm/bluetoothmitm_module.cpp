@@ -59,7 +59,7 @@ namespace ams::mitm::bluetooth {
         }
 
         constexpr s32 ThreadPriority = -11;
-        constexpr size_t ThreadStackSize = 0x1000;
+        constexpr size_t ThreadStackSize = 0x3000;
         alignas(os::ThreadStackAlignment) constinit u8 g_thread_stack[ThreadStackSize];
         constinit os::ThreadType g_thread;
 

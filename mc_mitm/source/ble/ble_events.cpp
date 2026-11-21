@@ -309,13 +309,11 @@ namespace ams::ble::events {
             g_slot_input_report_counts[slot].fetch_add(1, std::memory_order_acq_rel);
         }
         const u64 seq = g_input_report_count.fetch_add(1, std::memory_order_acq_rel) + 1;
-        if (seq <= 3 && log::IsEnabled()) {
-            const u8 b0 = size > 0 ? data[0] : 0;
-            const u8 b1 = size > 1 ? data[1] : 0;
-            const u8 b2 = size > 2 ? data[2] : 0;
-            const u8 b3 = size > 3 ? data[3] : 0;
-            log::Write("ble input #%llu [%s] conn_id=%u len=%zu head=%02x %02x %02x %02x",
-                static_cast<unsigned long long>(seq), path, conn_id, size, b0, b1, b2, b3);
+        if (seq <= 5 && log::IsEnabled()) {
+            const auto b = [&](size_t i) -> u8 { return i < size ? data[i] : 0; };
+            log::Write("ble input #%llu [%s] conn_id=%u len=%zu data=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+                static_cast<unsigned long long>(seq), path, conn_id, size,
+                b(0), b(1), b(2), b(3), b(4), b(5), b(6), b(7), b(8), b(9));
         }
     }
 

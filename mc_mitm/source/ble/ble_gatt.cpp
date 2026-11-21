@@ -343,7 +343,7 @@ namespace ams::ble::gatt {
         out->output_report = {};
         out->has_output_report = false;
         out->output_write_with_response = false;
-        out->write_auth_req = (auth_mode == SubscribeAuthMode::StandardNoMitm)
+        out->write_auth_req = (auth_mode == SubscribeAuthMode::StandardNoMitm || auth_mode == SubscribeAuthMode::NoMitmCccdOnly)
             ? static_cast<u8>(BtdrvGattAuthReqType_NoMitm)
             : static_cast<u8>(BtdrvGattAuthReqType_None);
         out->vendor_id = 0;
@@ -404,7 +404,7 @@ namespace ams::ble::gatt {
             }
         }
 
-        u8 active_auth = (auth_mode == SubscribeAuthMode::StandardNoMitm)
+        u8 active_auth = (auth_mode == SubscribeAuthMode::StandardNoMitm || auth_mode == SubscribeAuthMode::NoMitmCccdOnly)
             ? static_cast<u8>(BtdrvGattAuthReqType_NoMitm)
             : static_cast<u8>(BtdrvGattAuthReqType_None);
 
@@ -430,11 +430,13 @@ namespace ams::ble::gatt {
             R_TRY(rc);
 
             u32 gatt_status = 0;
-            const TimeSpan initial_timeout = (auth_mode == SubscribeAuthMode::PlainThenNoMitm && active_auth == BtdrvGattAuthReqType_None)
-                ? TimeSpan::FromSeconds(3)
-                : (active_auth == BtdrvGattAuthReqType_NoMitm && auth_mode == SubscribeAuthMode::PlainThenNoMitm)
-                    ? TimeSpan::FromSeconds(8)
-                    : TimeSpan::FromSeconds(5);
+            const TimeSpan initial_timeout = (auth_mode == SubscribeAuthMode::NoMitmCccdOnly)
+                ? TimeSpan::FromSeconds(8)
+                : (auth_mode == SubscribeAuthMode::PlainThenNoMitm && active_auth == BtdrvGattAuthReqType_None)
+                    ? TimeSpan::FromSeconds(3)
+                    : (active_auth == BtdrvGattAuthReqType_NoMitm && auth_mode == SubscribeAuthMode::PlainThenNoMitm)
+                        ? TimeSpan::FromSeconds(8)
+                        : TimeSpan::FromSeconds(5);
 
             rc = WriteCccdWithAuth(slot_index, conn_id, service, attr, *cccd, active_auth, initial_timeout, &gatt_status);
             if (R_FAILED(rc) && (auth_mode == SubscribeAuthMode::PlainThenNoMitm) &&
@@ -453,20 +455,24 @@ namespace ams::ble::gatt {
         }
 
         if (R_SUCCEEDED(result)) {
-            // Best-effort device identification (PnP ID / GAP Device Name); failure does not abort setup.
-            // Stop immediately if a read times out so we never follow a timed-out op with another GATT request.
-            u8 pnp_buf[16] = {};
-            size_t pnp_len = 0;
-            bool read_timed_out = false;
-            if (ReadCharacteristicBestEffort(slot_index, conn_id, GattServiceDeviceInfo, GattCharPnpId, out->write_auth_req, pnp_buf, sizeof(pnp_buf), &pnp_len, &read_timed_out) && pnp_len >= 7) {
-                out->vendor_id = static_cast<u16>(pnp_buf[1] | (pnp_buf[2] << 8));
-                out->product_id = static_cast<u16>(pnp_buf[3] | (pnp_buf[4] << 8));
-                out->has_pnp_id = true;
-                log::Write("slot %u: PnP ID vid=0x%04x pid=0x%04x", slot_index, out->vendor_id, out->product_id);
-            } else if (!read_timed_out && !events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled() &&
-                       ReadCharacteristicBestEffort(slot_index, conn_id, GattServiceGap, GattCharDeviceName, out->write_auth_req, reinterpret_cast<u8 *>(out->device_name), sizeof(out->device_name) - 1, &pnp_len, &read_timed_out)) {
-                out->device_name[std::min(pnp_len, sizeof(out->device_name) - 1)] = '\0';
-                log::Write("slot %u: GAP device name='%s'", slot_index, out->device_name);
+            // Only read PnP ID / GAP Name in StandardNoMitm mode.
+            // On Stadia BLE (HOS 22.5.0), reading DIS PnP ID (0x2A50, handle 0x0032) never receives an
+            // ATT response and arms bt_nso's 28.36s ATT transaction timeout which disconnects the link
+            // with reason 0x0016 / 0x0022. Stadia is already identified from its scan advertisement.
+            if (auth_mode == SubscribeAuthMode::StandardNoMitm) {
+                u8 pnp_buf[16] = {};
+                size_t pnp_len = 0;
+                bool read_timed_out = false;
+                if (ReadCharacteristicBestEffort(slot_index, conn_id, GattServiceDeviceInfo, GattCharPnpId, out->write_auth_req, pnp_buf, sizeof(pnp_buf), &pnp_len, &read_timed_out) && pnp_len >= 7) {
+                    out->vendor_id = static_cast<u16>(pnp_buf[1] | (pnp_buf[2] << 8));
+                    out->product_id = static_cast<u16>(pnp_buf[3] | (pnp_buf[4] << 8));
+                    out->has_pnp_id = true;
+                    log::Write("slot %u: PnP ID vid=0x%04x pid=0x%04x", slot_index, out->vendor_id, out->product_id);
+                } else if (!read_timed_out && !events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled() &&
+                           ReadCharacteristicBestEffort(slot_index, conn_id, GattServiceGap, GattCharDeviceName, out->write_auth_req, reinterpret_cast<u8 *>(out->device_name), sizeof(out->device_name) - 1, &pnp_len, &read_timed_out)) {
+                    out->device_name[std::min(pnp_len, sizeof(out->device_name) - 1)] = '\0';
+                    log::Write("slot %u: GAP device name='%s'", slot_index, out->device_name);
+                }
             }
             R_UNLESS(!events::IsSlotDisconnected(slot_index) && events::IsRadioEnabled(), ResultNoConnection());
         }

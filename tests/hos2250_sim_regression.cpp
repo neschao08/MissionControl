@@ -433,7 +433,7 @@ struct StadiaHostSim {
         if (is_stadia) {
             if (stage == 0) {
                 sec = pairing::SecurityStrategy::GattOnDemand;
-                sub = gatt::SubscribeAuthMode::PlainThenNoMitm;
+                sub = gatt::SubscribeAuthMode::NoMitmCccdOnly;
             } else if (stage == 1) {
                 sec = pairing::SecurityStrategy::DirectSetEncryption;
                 sub = gatt::SubscribeAuthMode::PlainOnlyAfterBond;
@@ -495,7 +495,10 @@ static void Test1_ReproduceOldV3BugAndProveFix() {
     assert(g_sim.zombie_timer_fires == 1);
 }
 
-static void Test2_Stage0_PlaintextSuccess() {
+static void Test2_Stage0_DirectNoMitmEncryptsEvenWhenPlainCccdWouldHaveReturnedOk() {
+    // Reproduces real StadiaQPRV-4967 hardware finding from 22:40 ble.log:
+    // Stadia returns result=0 to plaintext CCCD without encrypting, so Stage 0 MUST use NoMitmCccdOnly
+    // to force bt_nso 0xc5848 -> BTM_SetEncryption -> SMP_Pair AND skip 0x2A50 (which stalled 28.36s).
     g_sim.Reset();
     g_sim.peer_behaviors[BtNsoSim::AddrKey(StadiaAddr)] = PeripheralBehavior::StadiaAcceptPlaintext;
     StadiaHostSim host;
@@ -504,15 +507,17 @@ static void Test2_Stage0_PlaintextSuccess() {
     assert(host.AttemptConnect(0, StadiaAddr, &hid, &conn_id, true));
     assert(host.stage == 0 && host.radio_cycles == 0);
     assert(g_sim.create_bond_count == 0);
+    assert(g_sim.smp_pair_count == 1);      // Actually encrypted the link!
+    assert(g_sim.cccd_write_count == 1);    // Direct NoMitm CCCD write!
     assert(g_sim.busy_0x2a671_count == 0);
-    assert(g_sim.conns[conn_id].cccd_enabled);
-    assert(hid.write_auth_req == BtdrvGattAuthReqType_None);
-    assert(hid.has_pnp_id && hid.vendor_id == 0x18D1 && hid.product_id == 0x9400);
+    assert(g_sim.conns[conn_id].encrypted && g_sim.conns[conn_id].cccd_enabled);
+    assert(hid.write_auth_req == BtdrvGattAuthReqType_NoMitm);
+    assert(!hid.has_pnp_id);                // Must NOT read 0x2A50 on Stadia!
     assert(hid.has_output_report && hid.output_report.handle == 0x0044 && hid.output_report.id.instance_id == 1);
     assert(hid.output_write_with_response == true);
 }
 
-static void Test3_Stage0_Att05EscalatesToOnDemandSmp() {
+static void Test3_Stage0_Att05DeviceDirectNoMitmSmp() {
     g_sim.Reset();
     g_sim.peer_behaviors[BtNsoSim::AddrKey(StadiaAddr)] = PeripheralBehavior::StadiaRequireEncViaAtt05;
     StadiaHostSim host;
@@ -522,12 +527,12 @@ static void Test3_Stage0_Att05EscalatesToOnDemandSmp() {
     assert(host.stage == 0 && host.radio_cycles == 0);
     assert(g_sim.create_bond_count == 0);        // Never touched broken CreateBond!
     assert(g_sim.smp_pair_count == 1);           // Triggered real on-demand SMP_Pair via 0xc5848!
-    assert(g_sim.cccd_write_count == 2);         // 1st None -> ATT 0x05 (IDLE) -> 2nd NoMitm -> OK!
+    assert(g_sim.cccd_write_count == 1);         // Direct NoMitm CCCD write -> SMP -> OK!
     assert(g_sim.busy_0x2a671_count == 0);       // Zero 0x2a671 BUSY!
     assert(g_sim.zombie_timer_fires == 0);
     assert(g_sim.conns[conn_id].encrypted && g_sim.conns[conn_id].cccd_enabled);
     assert(hid.write_auth_req == BtdrvGattAuthReqType_NoMitm);
-    assert(hid.has_pnp_id && hid.vendor_id == 0x18D1 && hid.product_id == 0x9400);
+    assert(!hid.has_pnp_id);
 }
 
 static void Test4_Stage0TimeoutRotatesToStage1DirectSetEncryptionAndRemembers() {
@@ -688,8 +693,8 @@ static void Test8_StressReconnectDisconnectSleep50Cycles() {
 
 int main() {
     Test1_ReproduceOldV3BugAndProveFix();
-    Test2_Stage0_PlaintextSuccess();
-    Test3_Stage0_Att05EscalatesToOnDemandSmp();
+    Test2_Stage0_DirectNoMitmEncryptsEvenWhenPlainCccdWouldHaveReturnedOk();
+    Test3_Stage0_Att05DeviceDirectNoMitmSmp();
     Test4_Stage0TimeoutRotatesToStage1DirectSetEncryptionAndRemembers();
     Test5_FallbackToStage2CreateBondWithPlainOnlyBypass();
     Test6_StaleBleSecRecordRequiresIpsCmd4Cleanup();

@@ -47,6 +47,7 @@ namespace ams::ble::gatt {
 
     enum class SubscribeAuthMode : u8 {
         StandardNoMitm,
+        NoMitmCccdOnly,
         PlainThenNoMitm,
         PlainOnlyAfterBond,
     };

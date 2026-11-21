@@ -182,7 +182,7 @@ int main() {
     // Strategy 1: DirectSetEncryption ignores non-zero residual w0 return value from void BTA_DmSetEncryption
     Reset(); set_encryption_raw_rc = 0xDEADBEEF;
     assert(pairing::PrepareSecurityWithStrategy(0, Target, pairing::SecurityStrategy::DirectSetEncryption));
-    assert(bonds == 0 && set_encryptions == 1 && events::now_ms == 1500);
+    assert(bonds == 0 && set_encryptions == 1 && events::now_ms == 2000);
 
     // DirectSetEncryption with bond event settles 500ms after event
     Reset(); set_encryption_raw_rc = 0x123456; set_encryption_emits_bond = true;

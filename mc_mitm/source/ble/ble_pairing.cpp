@@ -215,7 +215,7 @@ namespace ams::ble::pairing {
         }
 
         bool bond_evt = false;
-        events::WaitFor(events::InvalidType, TimeSpan::FromMilliSeconds(1500), nullptr, [&](const EventRecord &) {
+        events::WaitFor(events::InvalidType, TimeSpan::FromMilliSeconds(2000), nullptr, [&](const EventRecord &) {
             bond_evt = bond_evt || events::TakeSlotBondComplete(slot);
             return bond_evt || events::IsSlotDisconnected(slot) || !events::IsRadioEnabled();
         });

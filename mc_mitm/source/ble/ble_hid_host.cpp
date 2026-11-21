@@ -737,7 +737,9 @@ namespace ams::ble {
                         log::Write("slot %u: services re-discovered, subscribing again", slot_idx);
                         gatt::HidService hid;
                         const auto auth_mode = (g_host_slots[i].controller_type == BleControllerType::Stadia)
-                            ? gatt::SubscribeAuthMode::PlainThenNoMitm
+                            ? ((g_host_slots[i].hid.write_auth_req == BtdrvGattAuthReqType_NoMitm)
+                                ? gatt::SubscribeAuthMode::NoMitmCccdOnly
+                                : gatt::SubscribeAuthMode::PlainOnlyAfterBond)
                             : gatt::SubscribeAuthMode::StandardNoMitm;
                         static_cast<void>(gatt::Subscribe(slot_idx, g_host_slots[i].conn_id, &hid, auth_mode));
                     }
@@ -848,15 +850,19 @@ namespace ams::ble {
                 stadia_stage = GetStadiaStrategyStage(address);
                 switch (stadia_stage) {
                     case 0:
+                        // Primary: skip CreateBond (keep sec_state==0) and write CCCD with NoMitm so
+                        // gatt_determine_sec_act (0xc5848) triggers real BTM_SetEncryption -> SMP_Pair.
                         sec_strategy = pairing::SecurityStrategy::GattOnDemand;
-                        sub_mode = gatt::SubscribeAuthMode::PlainThenNoMitm;
+                        sub_mode = gatt::SubscribeAuthMode::NoMitmCccdOnly;
                         break;
                     case 1:
+                        // Fallback 1: invoke IPS cmd 5 (BTA_DmSetEncryption LE/NoMitm) directly, then write CCCD with None.
                         sec_strategy = pairing::SecurityStrategy::DirectSetEncryption;
                         sub_mode = gatt::SubscribeAuthMode::PlainOnlyAfterBond;
                         break;
                     default:
-                        sec_strategy = pairing::SecurityStrategy::CreateBond;
+                        // Fallback 2: plaintext CCCD without 0x2A50 DIS read (no 28.36s ATT timeout).
+                        sec_strategy = pairing::SecurityStrategy::GattOnDemand;
                         sub_mode = gatt::SubscribeAuthMode::PlainOnlyAfterBond;
                         break;
                 }
@@ -985,7 +991,7 @@ namespace ams::ble {
             bluetooth::ble::WaitInitialized();
 
             os::SleepThread(TimeSpan::FromSeconds(20));
-            log::Write("starting multi-device BLE host (stadia-ble-v4-hos2250, HOS=0x%x)", static_cast<u32>(hos::GetVersion()));
+            log::Write("starting multi-device BLE host (stadia-ble-v5-hos2250, HOS=0x%x)", static_cast<u32>(hos::GetVersion()));
 
             if (R_FAILED(PrepareClient())) {
                 log::Write("giving up: no gatt client available");

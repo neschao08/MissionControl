@@ -420,15 +420,24 @@ int main() {
         assert(cccd_auths.empty());
         events::completed = true;
 
-        // PlainThenNoMitm (Stadia Stage 0): skips 0x2A4A, tries plaintext CCCD first; succeeds with write_auth_req=None
+        // NoMitmCccdOnly (Stadia Stage 0): skips 0x2A4A AND skips 0x2A50/0x2A00 (which stall 28.36s on Stadia),
+        // writes CCCD directly with NoMitm so bt_nso triggers real BTM_SetEncryption -> SMP_Pair!
+        read_uuids.clear(); read_auths.clear(); cccd_auths.clear();
+        gatt::HidService nomitm_direct{};
+        assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &nomitm_direct, gatt::SubscribeAuthMode::NoMitmCccdOnly)));
+        assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_NoMitm}));
+        assert(nomitm_direct.write_auth_req == BtdrvGattAuthReqType_NoMitm);
+        assert(nomitm_direct.has_output_report && nomitm_direct.output_report.handle == out_handle);
+        assert(read_uuids.empty()); // Zero DIS/GAP/HID-Info reads!
+
+        // PlainThenNoMitm: skips 0x2A4A & 0x2A50, tries plaintext CCCD first; succeeds with write_auth_req=None
         read_uuids.clear(); read_auths.clear(); cccd_auths.clear();
         gatt::HidService plain_ok{};
         assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &plain_ok, gatt::SubscribeAuthMode::PlainThenNoMitm)));
         assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_None}));
         assert(plain_ok.write_auth_req == BtdrvGattAuthReqType_None);
         assert(plain_ok.has_output_report && plain_ok.output_report.handle == out_handle);
-        assert(std::find(read_uuids.begin(), read_uuids.end(), GattCharHidInformation) == read_uuids.end());
-        assert(!read_auths.empty() && read_auths[0] == BtdrvGattAuthReqType_None);
+        assert(read_uuids.empty());
 
         // PlainThenNoMitm: plaintext CCCD gets ATT 0x05 (Insufficient Auth -> GATT IDLE), escalates to NoMitm -> succeeds!
         read_uuids.clear(); read_auths.clear(); cccd_auths.clear();
@@ -437,7 +446,7 @@ int main() {
         assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &escalated, gatt::SubscribeAuthMode::PlainThenNoMitm)));
         assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_None, BtdrvGattAuthReqType_NoMitm}));
         assert(escalated.write_auth_req == BtdrvGattAuthReqType_NoMitm);
-        assert(!read_auths.empty() && read_auths[0] == BtdrvGattAuthReqType_NoMitm);
+        assert(read_uuids.empty());
         cccd_plain_failure = 0;
 
         // PlainThenNoMitm: plaintext CCCD times out -> must NOT escalate into 0x2a671 BUSY
@@ -448,13 +457,13 @@ int main() {
         assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_None}));
         cccd_completed = true;
 
-        // PlainOnlyAfterBond (Stadia Stage 1 & 2): skips 0x2A4A, writes CCCD with None only, never escalates to NoMitm
+        // PlainOnlyAfterBond (Stadia Stage 1 & 2): skips 0x2A4A & 0x2A50, writes CCCD with None only, never escalates to NoMitm
         read_uuids.clear(); cccd_auths.clear();
         gatt::HidService after_bond{};
         assert(R_SUCCEEDED(gatt::Subscribe(0, 260, &after_bond, gatt::SubscribeAuthMode::PlainOnlyAfterBond)));
         assert(cccd_auths == std::vector<int>({BtdrvGattAuthReqType_None}));
         assert(after_bond.write_auth_req == BtdrvGattAuthReqType_None);
-        assert(std::find(read_uuids.begin(), read_uuids.end(), GattCharHidInformation) == read_uuids.end());
+        assert(read_uuids.empty());
 
         cccd_auths.clear();
         cccd_plain_failure = 5;

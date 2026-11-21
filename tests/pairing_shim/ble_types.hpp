@@ -13,7 +13,12 @@ struct Result { unsigned value; unsigned GetValue() const { return value; } };
 #define R_TRY(r) do { auto rc_ = (r); if (R_FAILED(rc_)) return rc_; } while (0)
 #define R_UNLESS(p,r) do { if (!(p)) return (r); } while (0)
 inline Result ResultSuccess() { return {0}; }
-namespace svc { inline Result ResultTimedOut() { return {2}; } }
+namespace svc {
+    struct ResultTimedOut : Result {
+        ResultTimedOut() : Result{2} {}
+        static bool Includes(Result r) { return r.value == 2; }
+    };
+}
 struct TimeSpan {
     u64 milliseconds;
     static TimeSpan FromSeconds(int seconds) { return {u64(seconds) * 1000}; }

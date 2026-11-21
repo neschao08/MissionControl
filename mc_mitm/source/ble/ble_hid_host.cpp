@@ -54,12 +54,13 @@ namespace ams::ble {
         constexpr s64 StadiaRetryBackoffMs           = 1500;
         constexpr s64 BackgroundReconnectBackoffMs   = 6000;
         constexpr s64 BackgroundTransientBackoffMs   = 1000;
-        constexpr s64 BackgroundScanIdlePeriodMs     = 1200;
-        constexpr s64 BackgroundScanBusyPeriodMs     = 3500;
+        constexpr s64 BackgroundScanIdlePeriodMs     = 2000;
+        constexpr s64 BackgroundScanBusyPeriodMs     = 4500;
         constexpr TimeSpan ClassicActivityHoldOff    = TimeSpan::FromSeconds(12);
         constexpr u8  StadiaStrategyCount            = 3;
 
         constinit s64 g_last_controller_presented_tick = 0;
+        constinit s64 g_last_disconnect_tick = 0;
         constinit size_t g_next_known_probe_idx = 0;
 
         constexpr size_t NeutralReportCount = 4;
@@ -1030,6 +1031,7 @@ namespace ams::ble {
             if (controller) {
                 profile::FlushNow();
                 controller::DetachVirtualController(address);
+                g_last_disconnect_tick = os::GetSystemTick().GetInt64Value();
                 log::Write("slot %u: controller removed from system", slot_index);
             }
 
@@ -1121,6 +1123,10 @@ namespace ams::ble {
             if ((candidate_count == 0) || !events::IsRadioEnabled() || events::ClassicActivityWithin(ClassicActivityHoldOff)) {
                 return false;
             }
+            if ((g_last_disconnect_tick != 0) &&
+                ((os::GetSystemTick() - os::Tick(g_last_disconnect_tick)).ToTimeSpan() < TimeSpan::FromMilliSeconds(1500))) {
+                return false;
+            }
 
             bluetooth::Address target = {};
             bool have_target = false;
@@ -1149,9 +1155,9 @@ namespace ams::ble {
             g_host_slots[slot].client_if = client_if;
 
             const bool another_pad = (events::GetActiveConnectionCount() > 0) || (controller::GetConnectedControllerCount() > 0);
-            const TimeSpan probe_timeout = TimeSpan::FromMilliSeconds(another_pad ? 900 : 1400);
+            const TimeSpan probe_timeout = TimeSpan::FromMilliSeconds(another_pad ? 1800 : 2500);
             const bool preserve_bond = (FindOrAllocStadiaStrategy(target)->failures_in_cycle == 0);
-            const Result rc = pairing::Connect(slot, client_if, target, out_conn_id, probe_timeout, !preserve_bond);
+            const Result rc = pairing::Connect(slot, client_if, target, out_conn_id, probe_timeout, !preserve_bond, false);
             if (R_SUCCEEDED(rc)) {
                 events::LogAddress("direct reconnect probe connected Stadia", target);
                 *inout_slot = slot;
@@ -1162,8 +1168,16 @@ namespace ams::ble {
 
             if (events::GetSlotDisconnectReason(slot) == 0x003e) {
                 NotePairingFailure(target, BackgroundTransientBackoffMs);
+            } else if (!svc::ResultTimedOut::Includes(rc) && !ResultNoConnection::Includes(rc)) {
+                NotePairingFailure(target, 10000);
+                log::Write("slot %u: direct probe stack error rc=0x%x; backing off 10000ms", slot, rc.GetValue());
             }
-            DismissSlot(slot);
+            events::ClearSlot(slot, false);
+            gatt::ResetSlot(slot);
+            {
+                std::scoped_lock lk(g_slots_lock);
+                g_host_slots[slot] = {};
+            }
             return false;
         }
 
@@ -1443,7 +1457,7 @@ namespace ams::ble {
             bluetooth::ble::WaitInitialized();
 
             os::SleepThread(TimeSpan::FromSeconds(20));
-            log::Write("starting multi-device BLE host (stadia-ble-v11-hos2250, HOS=0x%x)", static_cast<u32>(hos::GetVersion()));
+            log::Write("starting multi-device BLE host (stadia-ble-v12-hos2250, HOS=0x%x)", static_cast<u32>(hos::GetVersion()));
             LoadKnownStadia();
 
             if (R_FAILED(PrepareClient())) {
@@ -1501,8 +1515,8 @@ namespace ams::ble {
                     const bool other_pads = (events::GetActiveConnectionCount() > 0) || (controller::GetConnectedControllerCount() > 0);
                     const s64 period_ms = other_pads ? BackgroundScanBusyPeriodMs : BackgroundScanIdlePeriodMs;
                     if ((last_bg_scan_ms == 0) || ((now_ms - last_bg_scan_ms) >= period_ms)) {
-                        last_bg_scan_ms = now_ms;
                         ScanAndPairNextController(true);
+                        last_bg_scan_ms = os::GetSystemTick().ToTimeSpan().GetMilliSeconds();
                     } else {
                         events::Pump(TimeSpan::FromMilliSeconds(100));
                     }

@@ -56,7 +56,7 @@ namespace ams::ble::pairing {
         R_SUCCEED();
     }
 
-    Result Connect(u32 slot, u8 client_if, const bluetooth::Address &address, u32 *out_conn_id, TimeSpan timeout, bool clear_existing_bond) {
+    Result Connect(u32 slot, u8 client_if, const bluetooth::Address &address, u32 *out_conn_id, TimeSpan timeout, bool clear_existing_bond, bool allow_refusal_retry) {
         events::SetSlotConnecting(slot, address);
         R_UNLESS(events::IsRadioEnabled(), ResultNoConnection());
 
@@ -111,11 +111,18 @@ namespace ams::ble::pairing {
                 break;
             }
             if (events::IsRadioEnabled()) {
-                static_cast<void>(btdrvCancelConnectGattServer(client_if, address, true));
+                const Result cancel_rc = btdrvCancelConnectGattServer(client_if, address, true);
+                if (svc::ResultTimedOut::Includes(rc) && R_SUCCEEDED(cancel_rc) && events::IsRadioEnabled()) {
+                    static_cast<void>(events::WaitFor(BtdrvBleEventType_ClientConnection, TimeSpan::FromMilliSeconds(500), nullptr,
+                        [&](const EventRecord &r) {
+                            return !events::IsRadioEnabled() || AddressEqual(r.info.client_connection.address, address);
+                        }));
+                }
             }
 
             const s64 now_ms = events::NowMs();
             const bool immediate_busy_refusal =
+                allow_refusal_retry &&
                 ResultNoConnection::Includes(rc) &&
                 refused_by_stack &&
                 ((now_ms - attempt_started_ms) < ConnectRefusedMaxElapsedMs) &&

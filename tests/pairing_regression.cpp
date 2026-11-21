@@ -108,7 +108,7 @@ int main() {
     assert(R_FAILED(Connect()) && cancels == 1);
     Reset(); remove_fails = true; assert(R_FAILED(Connect())); assert(connects == 0);
     Reset(); connect_fails = true; assert(R_FAILED(Connect()));
-    Reset(); respond = false; assert(R_FAILED(Connect())); assert(cancels == 1 && events::now_ms == 15000);
+    Reset(); respond = false; assert(R_FAILED(Connect())); assert(cancels == 1 && events::now_ms == 15500);
     Reset(); respond = false; events::Schedule(events::Sleep, 200); assert(R_FAILED(Connect())); assert(cancels == 0);
     Reset(); respond = false;
     EventRecord wrong;
@@ -250,6 +250,15 @@ int main() {
     fail_connect_event_once = 1;
     assert(R_SUCCEEDED(Connect()));
     assert(connects == 2 && removes == 1 && cancels == 1 && events::now_ms == 570);
+
+    // Direct background probe with allow_refusal_retry=false fails immediately without retry storm
+    Reset();
+    fail_connect_event_once = 1;
+    {
+        u32 cid = InvalidConnId;
+        assert(R_FAILED(pairing::Connect(0, 3, Target, &cid, TimeSpan::FromMilliSeconds(1800), false, false)));
+        assert(connects == 1 && cancels == 1 && removes == 0 && events::now_ms == 50);
+    }
 
     std::cout << "BLE production reconnect/pairing regressions passed\n";
 }

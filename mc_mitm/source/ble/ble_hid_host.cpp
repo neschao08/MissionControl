@@ -258,6 +258,21 @@ namespace ams::ble {
             return count;
         }
 
+        bool HasConnectedStadia() {
+            std::scoped_lock lk(g_slots_lock);
+            for (size_t i = 0; i < MaxBleControllers; ++i) {
+                if ((g_host_slots[i].state == BleDeviceSlot::State::Connected) &&
+                    (g_host_slots[i].controller_type == BleControllerType::Stadia)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        TimeSpan ActiveIdleSlice(TimeSpan fallback) {
+            return HasConnectedStadia() ? std::min(fallback, TimeSpan::FromMilliSeconds(20)) : fallback;
+        }
+
         int FindFreeSlot() {
             std::scoped_lock lk(g_slots_lock);
             for (size_t i = 0; i < MaxBleControllers; ++i) {
@@ -596,7 +611,8 @@ namespace ams::ble {
                 const s64 now = os::GetSystemTick().GetInt64Value();
                 for (size_t i = 0; i < MaxBleControllers; ++i) {
                     auto &slot = g_host_slots[i];
-                    if ((slot.state != BleDeviceSlot::State::Connected) || !slot.controller) {
+                    if ((slot.state != BleDeviceSlot::State::Connected) || !slot.controller ||
+                        (slot.controller_type == BleControllerType::Stadia)) {
                         continue;
                     }
                     if (events::GetSlotInputReportCount(static_cast<u32>(i)) != slot.attach_input_reports) {
@@ -633,8 +649,10 @@ namespace ams::ble {
             };
             RumblePulse actions[MaxBleControllers] = {};
             RearmTask rearm_tasks[MaxBleControllers] = {};
+            std::shared_ptr<controller::EmulatedSwitchController> task_controllers[MaxBleControllers] = {};
             size_t count = 0;
             size_t rearm_count = 0;
+            size_t task_count = 0;
             {
                 std::scoped_lock lk(g_slots_lock);
                 const s64 now = os::GetSystemTick().GetInt64Value();
@@ -647,6 +665,7 @@ namespace ams::ble {
                         slot.presented_tick = 0;
                         continue;
                     }
+                    task_controllers[task_count++] = slot.controller;
                     if (slot.connect_rumble_state == BleDeviceSlot::ConnectRumbleState::PendingStart) {
                         if ((os::Tick(now) - os::Tick(slot.connect_rumble_tick)).ToTimeSpan() >= TimeSpan::FromMilliSeconds(350)) {
                             slot.connect_rumble_state = BleDeviceSlot::ConnectRumbleState::Vibrating;
@@ -676,6 +695,9 @@ namespace ams::ble {
             for (size_t i = 0; i < rearm_count; ++i) {
                 static_cast<void>(gatt::RearmInputNotifications(rearm_tasks[i].slot, rearm_tasks[i].conn_id, rearm_tasks[i].auth_req));
             }
+            for (size_t i = 0; i < task_count; ++i) {
+                task_controllers[i]->ServiceBleTasks();
+            }
         }
 
         void IdleWithNeutralReports(TimeSpan duration, const auto &stop_pred) {
@@ -690,7 +712,7 @@ namespace ams::ble {
                 if (now >= deadline) {
                     return;
                 }
-                events::Pump(std::min(deadline - now, TimeSpan::FromMilliSeconds(200)));
+                events::Pump(std::min(deadline - now, ActiveIdleSlice(TimeSpan::FromMilliSeconds(200))));
             }
         }
 
@@ -756,6 +778,7 @@ namespace ams::ble {
             // pairing window stays open and back off immediately if a Classic controller connects.
             Result rc = ResultSuccess();
             int refused_attempts = 0;
+            const auto retry_deadline = os::GetSystemTick().ToTimeSpan() + TimeSpan::FromSeconds(15);
             for (;;) {
                 ServiceNeutralReports();
                 ServiceConnectRumble();
@@ -775,13 +798,14 @@ namespace ams::ble {
                 if (background_reconnect && ResultScanAlreadyActive::Includes(rc)) {
                     return rc;
                 }
-                if (!ResultScanAlreadyActive::Includes(rc) || (++refused_attempts >= 75)) {
+                ++refused_attempts;
+                if (!ResultScanAlreadyActive::Includes(rc) || (os::GetSystemTick().ToTimeSpan() >= retry_deadline)) {
                     break;
                 }
                 if (refused_attempts == 1) {
                     log::Write("btdrvStartBleScan rc=0x%x, retrying", rc.GetValue());
                 }
-                events::Pump(TimeSpan::FromMilliSeconds(200));
+                events::Pump(ActiveIdleSlice(TimeSpan::FromMilliSeconds(200)));
             }
             if (!background_reconnect || R_FAILED(rc)) {
                 log::Write("btdrvStartBleScan rc=0x%x", rc.GetValue());
@@ -822,7 +846,7 @@ namespace ams::ble {
                 if (now >= scan_deadline) {
                     break;
                 }
-                const TimeSpan slice = std::min(scan_deadline - now, TimeSpan::FromMilliSeconds(250));
+                const TimeSpan slice = std::min(scan_deadline - now, ActiveIdleSlice(TimeSpan::FromMilliSeconds(250)));
                 found = events::WaitFor(events::InvalidType, slice, &e, [&](const EventRecord &r) {
                     if (should_abort_scan()) {
                         return true;
@@ -1024,16 +1048,12 @@ namespace ams::ble {
                 slot.cccd_rearmed = false;
                 slot.presented_tick = os::GetSystemTick().GetInt64Value();
                 ScheduleNeutralReportsLocked(slot);
-                if (controller_type == BleControllerType::Stadia) {
-                    slot.connect_rumble_state = BleDeviceSlot::ConnectRumbleState::PendingStart;
-                    slot.connect_rumble_tick = slot.presented_tick;
-                } else {
-                    slot.connect_rumble_state = BleDeviceSlot::ConnectRumbleState::None;
-                    slot.connect_rumble_tick = 0;
-                }
+                slot.connect_rumble_state = BleDeviceSlot::ConnectRumbleState::None;
+                slot.connect_rumble_tick = 0;
             }
             events::RegisterSlotController(slot_index, slot.conn_id, controller);
             ServiceNeutralReports();
+            controller->ServiceBleTasks();
 
             // Request low-latency parameters and rebalance active BLE slots
             slot.negotiated_max_interval = 0;
@@ -1556,7 +1576,7 @@ namespace ams::ble {
             bluetooth::ble::WaitInitialized();
 
             os::SleepThread(TimeSpan::FromSeconds(20));
-            log::Write("starting multi-device BLE host (stadia-ble-v15-hos2250, HOS=0x%x)", static_cast<u32>(hos::GetVersion()));
+            log::Write("starting multi-device BLE host (stadia-ble-v16-hos2250, HOS=0x%x)", static_cast<u32>(hos::GetVersion()));
             LoadKnownStadia();
 
             if (R_FAILED(PrepareClient())) {
@@ -1618,10 +1638,10 @@ namespace ams::ble {
                         ScanAndPairNextController(true);
                         last_bg_scan_ms = os::GetSystemTick().ToTimeSpan().GetMilliSeconds();
                     } else {
-                        events::Pump(TimeSpan::FromMilliSeconds(100));
+                        events::Pump(ActiveIdleSlice(TimeSpan::FromMilliSeconds(100)));
                     }
                 } else {
-                    events::Pump(TimeSpan::FromMilliSeconds(100));
+                    events::Pump(ActiveIdleSlice(TimeSpan::FromMilliSeconds(100)));
                 }
             }
         }

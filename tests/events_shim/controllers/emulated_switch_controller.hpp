@@ -5,5 +5,6 @@ namespace ams::controller {
         public:
             virtual ~EmulatedSwitchController() = default;
             virtual Result HandleBleInputReport(const u8 *data, size_t size) = 0;
+            virtual void OnRumbleWriteComplete(u32 result) { (void)result; }
     };
 }

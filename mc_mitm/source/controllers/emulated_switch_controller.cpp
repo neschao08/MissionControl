@@ -57,6 +57,10 @@ namespace ams::controller {
         R_RETURN(m_virtual_memory.Write(0x6050, &colours, sizeof(colours)));
     }
 
+    Result EmulatedSwitchController::WriteSpiDeviceType(u8 device_type) {
+        R_RETURN(m_virtual_memory.Write(0x6012, &device_type, sizeof(device_type)));
+    }
+
     Result EmulatedSwitchController::InjectInputReport(const u8 *report_buffer, size_t size) {
         bluetooth::hid::report::WriteHidDataReport(m_address, report_buffer, size);
         R_SUCCEED();

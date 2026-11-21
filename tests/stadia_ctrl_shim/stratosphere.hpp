@@ -53,6 +53,7 @@ namespace ams::os {
         TimeSpan ToTimeSpan() const { return TimeSpan::FromMilliSeconds(ms); }
     };
     inline Tick GetSystemTick() { return {g_now_ms}; }
+    inline Tick ConvertToTick(TimeSpan ts) { return {ts.GetMilliSeconds()}; }
 }
 
 struct BtdrvGattAttributeUuid { u16 value; };

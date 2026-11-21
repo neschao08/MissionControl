@@ -75,15 +75,20 @@ namespace ams::controller {
             virtual Result Initialize() { return {0}; }
             virtual Result HandleBleInputReport(const u8 *data, size_t size) = 0;
             virtual Result SendConnectRumble(u16 strong, u16 weak) { (void)strong; (void)weak; return {0}; }
+            virtual void ServiceBleTasks() {}
+            virtual void OnRumbleWriteComplete(u32 result) { (void)result; }
             virtual Result HandleOutputDataReport(const u8 *report_buffer, size_t size) {
                 ++m_output_calls;
                 m_last_output_id = size > 0 ? report_buffer[0] : 0;
                 return {0};
             }
             virtual Result InjectInputReport(const u8 *report_buffer, size_t size) {
-                (void)report_buffer;
-                (void)size;
                 ++m_inject_calls;
+                if (report_buffer && size >= sizeof(u32) + 9) {
+                    std::memcpy(&m_last_injected_buttons, &report_buffer[1], sizeof(u32));
+                    std::memcpy(&m_last_injected_lx, &report_buffer[5], sizeof(u16));
+                    std::memcpy(&m_last_injected_ly, &report_buffer[7], sizeof(u16));
+                }
                 return {0};
             }
             virtual void DisconnectBle() = 0;
@@ -97,6 +102,8 @@ namespace ams::controller {
             Result TestSetVibration(const SwitchMotorData *m) { return this->SetVibration(m); }
             SwitchControllerColours TestColours() const { return m_test_colours; }
             u32 TestColourWrites() const { return m_colour_writes; }
+            u8 TestSpiDeviceType() const { return m_test_spi_device_type; }
+            u32 TestSpiDeviceTypeWrites() const { return m_spi_device_type_writes; }
             u32 TestButtons() const { return m_buttons.mask; }
             u16 TestLeftX() const { return m_left_stick.x; }
             u16 TestLeftY() const { return m_left_stick.y; }
@@ -105,6 +112,10 @@ namespace ams::controller {
             u32 TestDataEvents() const { return m_data_report_events; }
             u32 TestOutputCalls() const { return m_output_calls; }
             u32 TestInjectCalls() const { return m_inject_calls; }
+            void TestResetInjectCalls() { m_inject_calls = 0; }
+            u32 TestLastInjectedButtons() const { return m_last_injected_buttons; }
+            u16 TestLastInjectedLeftX() const { return m_last_injected_lx; }
+            u16 TestLastInjectedLeftY() const { return m_last_injected_ly; }
             u8 TestDeviceType() const { return m_device_info.device_type; }
             void TestSetTriggerThreshold(float t) { m_trigger_threshold = t; }
 
@@ -114,11 +125,28 @@ namespace ams::controller {
                 ++m_colour_writes;
                 return {0};
             }
+            Result WriteSpiDeviceType(u8 device_type) {
+                m_test_spi_device_type = device_type;
+                ++m_spi_device_type_writes;
+                return {0};
+            }
             size_t FillBasicInputReport(u8 *report_buffer, size_t size) {
                 const size_t n = std::min<size_t>(size, sizeof(SwitchHidBasicInputReport));
                 std::memset(report_buffer, 0, n);
-                if (n > 0) report_buffer[0] = 0x30;
+                if (n >= sizeof(u32) + 9) {
+                    report_buffer[0] = 0x30;
+                    std::memcpy(&report_buffer[1], &m_buttons.mask, sizeof(u32));
+                    std::memcpy(&report_buffer[5], &m_left_stick.x, sizeof(u16));
+                    std::memcpy(&report_buffer[7], &m_left_stick.y, sizeof(u16));
+                }
                 return n;
+            }
+            size_t FillInputReport(u8 *report_buffer, size_t size) {
+                return this->FillBasicInputReport(report_buffer, size);
+            }
+            void ModifyInputReport(u8 *report_buffer, size_t size) {
+                (void)report_buffer;
+                (void)size;
             }
             virtual void ParseInputReport(const u8 *report_buffer, size_t size) = 0;
             virtual Result SetVibration(const SwitchMotorData *motor_data) = 0;
@@ -141,8 +169,13 @@ namespace ams::controller {
             u32 m_data_report_events = 0;
             u32 m_output_calls = 0;
             u32 m_inject_calls = 0;
+            u32 m_last_injected_buttons = 0;
+            u16 m_last_injected_lx = 2048;
+            u16 m_last_injected_ly = 2048;
             u32 m_colour_writes = 0;
             SwitchControllerColours m_test_colours = {};
+            u8 m_test_spi_device_type = 0;
+            u32 m_spi_device_type_writes = 0;
             u8 m_last_output_id = 0;
     };
 }

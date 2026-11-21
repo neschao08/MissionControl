@@ -69,6 +69,7 @@ namespace ams::ble::events {
     void NoteReceivedInputReport(const char *path, u32 conn_id, const u8 *data, size_t size);
     void NoteRumbleWriteCompletion(u32 conn_id, u32 result);
     bool TakeRumbleWriteError(u32 conn_id, u32 *out_result);
+    void WakeHostLoop();
 
     u16 GetTargetMaxConnectionInterval(size_t active_count);
     u16 RequestLowLatencyConnectionParameters(const bluetooth::Address &address, size_t active_count = 0);

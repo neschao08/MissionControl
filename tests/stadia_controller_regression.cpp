@@ -82,12 +82,13 @@ int main() {
         assert(g_writes[0].payload == std::vector<u8>({0xFF, 0xFF, static_cast<u8>(exp_weak & 0xFF), static_cast<u8>(exp_weak >> 8)}));
 
         // ATT error on rumble write auto-escalates auth None -> NoMitm, then WithRsp -> NoRsp
-        ble::events::g_pending_rumble_error = 5;
+        ctrl.OnRumbleWriteComplete(5);
         os::g_now_ms += 60;
         motor.left_motor.low_band_amp = 0.7f;
         assert(R_SUCCEEDED(ctrl.TestSetVibration(&motor)));
         assert(g_writes.size() == 2);
         assert(g_writes[1].auth_req == BtdrvGattAuthReqType_NoMitm && g_writes[1].with_response == true);
+        ctrl.OnRumbleWriteComplete(0);
 
         // Reset back to baseline controller for remaining throttle tests
         g_writes.clear();
@@ -96,6 +97,7 @@ int main() {
         motor.left_motor.low_band_amp = 1.0f;
         assert(R_SUCCEEDED(ctrl_t.TestSetVibration(&motor)));
         assert(g_writes.size() == 1);
+        ctrl_t.OnRumbleWriteComplete(0);
 
         // Write-With-Response throttle: 32ms is throttled (< 48ms), 48ms passes!
         os::g_now_ms += 32;
@@ -106,6 +108,7 @@ int main() {
         os::g_now_ms += 16; // total 48ms
         assert(R_SUCCEEDED(ctrl_t.TestSetVibration(&motor)));
         assert(g_writes.size() == 2);
+        ctrl_t.OnRumbleWriteComplete(0);
 
         // Transient GATT BUSY (0x2a671) on non-stop update backs off m_last_rumble_tick
         os::g_now_ms += 60;
@@ -118,16 +121,17 @@ int main() {
         assert(R_SUCCEEDED(ctrl_t.TestSetVibration(&motor)));
         assert(g_writes.size() == 3);
 
-        // Transient GATT BUSY on STOP packet must NOT clear m_last_rumble_* so next frame retries STOP (no stuck rumble!)
+        // Transient GATT BUSY on STOP packet must queue pending STOP so ServiceBleTasks() / next frame retries STOP!
         SwitchMotorData stop_motor{};
         os::g_now_ms += 16;
         assert(ctrl_t.TestSetVibration(&stop_motor).value == 0x2a671);
         assert(g_writes.size() == 4);
         g_write_rc = 0;
-        os::g_now_ms += 16; // Even 16ms later, STOP is retried immediately!
-        assert(R_SUCCEEDED(ctrl_t.TestSetVibration(&stop_motor)));
+        os::g_now_ms += 16; // Even 16ms later, STOP is retried immediately via ServiceBleTasks()!
+        ctrl_t.ServiceBleTasks();
         assert(g_writes.size() == 5);
         assert(g_writes[4].payload == std::vector<u8>({0x00, 0x00, 0x00, 0x00}));
+        ctrl_t.OnRumbleWriteComplete(0);
 
         // Duplicate STOP is suppressed
         os::g_now_ms += 100;
@@ -190,12 +194,13 @@ int main() {
         assert(g_writes.size() == 3);
     }
 
-    // 4. Initialize() writes pure-white minimalist 0x6050 colours; SendConnectRumble() sends pulse & retries auth if non-busy error
+    // 4. Initialize() writes 0x6012=0x03 & pure-white 0x6050 colours; SendConnectRumble() sends pulse & retries auth
     {
         g_writes.clear(); g_write_rc = 0;
         ble::events::g_radio_enabled = true;
         StadiaBleController ctrl_c(addr, 259, svc_id, true, out_id, true, true, BtdrvGattAuthReqType_None);
         assert(R_SUCCEEDED(ctrl_c.Initialize()));
+        assert(ctrl_c.TestSpiDeviceTypeWrites() == 1 && ctrl_c.TestSpiDeviceType() == 0x03);
         assert(ctrl_c.TestColourWrites() == 1);
         const auto cols = ctrl_c.TestColours();
         assert(cols.body.r == 0xf5 && cols.body.g == 0xf5 && cols.body.b == 0xf5);
@@ -223,5 +228,124 @@ int main() {
         assert(g_writes.size() == 1 && g_writes[0].payload == std::vector<u8>({0, 0, 0, 0}));
     }
 
-    std::cout << "StadiaBleController production framing/rumble/auth/disconnect regressions passed\n";
+    // 5. Real-world v15 HOS pairing rumble trace (6ms start->stop collision), MinPulse 65ms, 0x2a671 retry, 200ms watchdog, and 33Hz held-state heartbeat
+    {
+        g_writes.clear(); g_write_rc = 0;
+        controller::g_connected_controllers = 1;
+        ble::events::g_radio_enabled = true;
+        ble::events::g_wake_calls = 0;
+        os::g_now_ms = 10000;
+
+        StadiaBleController ctrl_rt(addr, 6, svc_id, true, out_id, true, true, BtdrvGattAuthReqType_None);
+
+        // 5a. Connect pulse: t=0 start 0xd143 (low_band_amp ~0.5572) -> t=6ms STOP arrives while in-flight!
+        SwitchMotorData motor_on{};
+        motor_on.left_motor.low_band_amp = 0.5572f;
+        SwitchMotorData motor_off{};
+        assert(R_SUCCEEDED(ctrl_rt.TestSetVibration(&motor_on)));
+        assert(g_writes.size() == 1);
+
+        os::g_now_ms += 6; // t=10006: HOS cmd#15 stop arrives while ATT #1 is still in-flight!
+        assert(R_SUCCEEDED(ctrl_rt.TestSetVibration(&motor_off)));
+        assert(g_writes.size() == 1); // Did NOT collide with 0x2a671!
+
+        os::g_now_ms += 9; // t=10015: ATT ack #1 arrives, but < 65ms minimum pulse so motor stays running briefly
+        ctrl_rt.OnRumbleWriteComplete(0);
+        ctrl_rt.ServiceBleTasks();
+        assert(g_writes.size() == 1);
+
+        os::g_now_ms += 30; // t=10045 (< 65ms): still running
+        ctrl_rt.ServiceBleTasks();
+        assert(g_writes.size() == 1);
+
+        os::g_now_ms += 20; // t=10065 (== 65ms): minimum pulse elapsed -> ServiceBleTasks() delivers STOP!
+        ctrl_rt.ServiceBleTasks();
+        assert(g_writes.size() == 2);
+        assert(g_writes[1].payload == std::vector<u8>({0, 0, 0, 0}));
+        ctrl_rt.OnRumbleWriteComplete(0);
+
+        // 5b. Pending STOP retries automatically across transient 0x2a671 (GATT BUSY)
+        g_writes.clear();
+        os::g_now_ms = 12000;
+        assert(R_SUCCEEDED(ctrl_rt.TestSetVibration(&motor_on)));
+        assert(g_writes.size() == 1);
+        ctrl_rt.OnRumbleWriteComplete(0);
+        os::g_now_ms += 80; // past 65ms
+        g_write_rc = 0x2a671;
+        assert(ctrl_rt.TestSetVibration(&motor_off).value == 0x2a671);
+        assert(g_writes.size() == 2);
+        // Still busy on first retry
+        os::g_now_ms += 20;
+        ctrl_rt.ServiceBleTasks();
+        assert(g_writes.size() == 3);
+        // Succeeds on next ServiceBleTasks() tick once link clears!
+        g_write_rc = 0;
+        os::g_now_ms += 20;
+        ctrl_rt.ServiceBleTasks();
+        assert(g_writes.size() == 4);
+        assert(g_writes[3].payload == std::vector<u8>({0, 0, 0, 0}));
+        ctrl_rt.OnRumbleWriteComplete(0);
+
+        // 5c. Watchdog auto-stop at 200ms if HOS never sends a follow-up stop packet (e.g. Session 1 c2180372)
+        g_writes.clear();
+        os::g_now_ms = 14000;
+        assert(R_SUCCEEDED(ctrl_rt.TestSetVibration(&motor_on)));
+        assert(g_writes.size() == 1);
+        ctrl_rt.OnRumbleWriteComplete(0);
+        os::g_now_ms += 199;
+        ctrl_rt.ServiceBleTasks();
+        assert(g_writes.size() == 1); // Not expired yet
+        os::g_now_ms += 1; // t=14200
+        ctrl_rt.ServiceBleTasks();
+        assert(g_writes.size() == 2 && g_writes[1].payload == std::vector<u8>({0, 0, 0, 0}));
+        ctrl_rt.OnRumbleWriteComplete(0);
+
+        // 5d. Continuous stream (every 60ms) extends 200ms watchdog without premature cutoff, then stops cleanly 200ms after last frame
+        g_writes.clear();
+        os::g_now_ms = 16000;
+        for (int step = 0; step < 5; ++step) {
+            const size_t before = g_writes.size();
+            assert(R_SUCCEEDED(ctrl_rt.TestSetVibration(&motor_on)));
+            if (g_writes.size() > before) {
+                // Only non-zero motor_on refresh writes (every >=180ms) may occur, never a stop!
+                assert(g_writes.back().payload != std::vector<u8>({0, 0, 0, 0}));
+                ctrl_rt.OnRumbleWriteComplete(0);
+            }
+            os::g_now_ms += 60;
+            ctrl_rt.ServiceBleTasks();
+        }
+        assert(g_writes.size() == 2); // Initial write at t=16000 + one 180ms refresh at t=16180, zero premature stops!
+        os::g_now_ms += 140; // 200ms since last motor_on (step=4 was at 16240 -> 16300+140=16440)
+        ctrl_rt.ServiceBleTasks();
+        assert(g_writes.size() == 3 && g_writes[2].payload == std::vector<u8>({0, 0, 0, 0}));
+        ctrl_rt.OnRumbleWriteComplete(0);
+
+        // 5e. Held-state 33Hz input keepalive preserves pressed button & stick when idle, and stays silent during 15ms live input
+        g_writes.clear();
+        os::g_now_ms = 20000;
+        const u8 hold_a_pkt[10] = {0x08, 0x00, 0x20, 0x10, 0xF0, 0x80, 0x80, 0x00, 0x00, 0x00}; // A button + pushed left stick
+        assert(R_SUCCEEDED(ctrl_rt.HandleBleInputReport(hold_a_pkt, sizeof(hold_a_pkt))));
+        ctrl_rt.TestResetInjectCalls();
+
+        // Live input every 15ms -> 0 extra keepalives
+        os::g_now_ms += 15;
+        assert(R_SUCCEEDED(ctrl_rt.HandleBleInputReport(hold_a_pkt, sizeof(hold_a_pkt))));
+        ctrl_rt.ServiceBleTasks();
+        assert(ctrl_rt.TestInjectCalls() == 0);
+
+        os::g_now_ms += 15;
+        assert(R_SUCCEEDED(ctrl_rt.HandleBleInputReport(hold_a_pkt, sizeof(hold_a_pkt))));
+        ctrl_rt.ServiceBleTasks();
+        assert(ctrl_rt.TestInjectCalls() == 0);
+
+        // Idle for 30ms -> keepalive fires WITH held A button & non-centered stick preserved!
+        os::g_now_ms += 30;
+        ctrl_rt.ServiceBleTasks();
+        assert(ctrl_rt.TestInjectCalls() == 1);
+        assert(ctrl_rt.TestLastInjectedButtons() == stadia::ButtonBit::A);
+        assert(ctrl_rt.TestLastInjectedLeftX() == ctrl_rt.TestLeftX());
+        assert(ctrl_rt.TestLastInjectedLeftY() == ctrl_rt.TestLeftY());
+    }
+
+    std::cout << "StadiaBleController production framing/rumble/watchdog/keepalive regressions passed\n";
 }

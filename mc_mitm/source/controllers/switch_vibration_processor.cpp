@@ -24,8 +24,19 @@ namespace ams::controller {
             SwitchVibrationSamples decoded_samples;
             decoder->DecodeSamples(encoded_samples, &decoded_samples);
             if (decoded_samples.count > 0) {
-                // We will just take the first decoded sample and ignore the others
+                // Use peak amplitude per band across multi-sample packets so short pulses in later sub-samples are not dropped.
                 *out_sample = decoded_samples.samples[0];
+                for (u8 i = 1; i < decoded_samples.count; ++i) {
+                    const auto &s = decoded_samples.samples[i];
+                    if (s.low_band_amp > out_sample->low_band_amp) {
+                        out_sample->low_band_amp  = s.low_band_amp;
+                        out_sample->low_band_freq = s.low_band_freq;
+                    }
+                    if (s.high_band_amp > out_sample->high_band_amp) {
+                        out_sample->high_band_amp  = s.high_band_amp;
+                        out_sample->high_band_freq = s.high_band_freq;
+                    }
+                }
             } else {
                 // Repeat the current sample if no new samples were decoded
                 decoder->GetCurrentOutputValue(out_sample);

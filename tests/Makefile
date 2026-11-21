@@ -55,3 +55,8 @@ test:
 	cp events_shim/controllers/* $(BUILD_DIR)/events/controllers/
 	$(CXX) $(CXXFLAGS) -I$(BUILD_DIR)/events -I$(BUILD_DIR)/events/ble events_regression.cpp -o $(BUILD_DIR)/events_regression
 	$(BUILD_DIR)/events_regression
+
+	mkdir -p $(BUILD_DIR)/vib
+	cp ../mc_mitm/source/controllers/switch_hd_rumble_decoder.cpp ../mc_mitm/source/controllers/switch_hd_rumble_decoder.hpp ../mc_mitm/source/controllers/switch_hd_rumble_types.hpp ../mc_mitm/source/controllers/switch_vibration_processor.cpp ../mc_mitm/source/controllers/switch_vibration_processor.hpp vibration_shim/*.hpp $(BUILD_DIR)/vib/
+	$(CXX) $(CXXFLAGS) -Wno-invalid-constexpr -I$(BUILD_DIR)/vib $(BUILD_DIR)/vib/switch_hd_rumble_decoder.cpp $(BUILD_DIR)/vib/switch_vibration_processor.cpp vibration_regression.cpp -o $(BUILD_DIR)/vibration_regression
+	$(BUILD_DIR)/vibration_regression

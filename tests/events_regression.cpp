@@ -18,11 +18,17 @@ Result btdrvSetBleConnectionParameter(BtdrvAddress, const BtdrvBleConnectionPara
 class MockController : public controller::EmulatedSwitchController {
     public:
         u32 received_count = 0;
+        u32 rumble_acks = 0;
+        u32 last_rumble_result = 0xFFFFFFFFu;
         std::vector<u8> last_packet;
         Result HandleBleInputReport(const u8 *data, size_t size) override {
             ++received_count;
             last_packet.assign(data, data + size);
             return {0};
+        }
+        void OnRumbleWriteComplete(u32 result) override {
+            ++rumble_acks;
+            last_rumble_result = result;
         }
 };
 
@@ -98,12 +104,14 @@ int main() {
     for (int i = 0; i < 500; ++i) {
         assert(events::OnBleEvent(BtdrvBleEventType_ClientNotify, &wr_ack) == true);
     }
+    assert(ctrl0->rumble_acks == 500 && ctrl0->last_rumble_result == 0);
     assert(events::TakeRingDropped() == 0);
     assert(!events::Pop(&popped));
 
     // Non-zero rumble write ATT error is captured for Stadia auto-fallback without entering the control ring
     wr_ack.client_notify.result = 5;
     assert(events::OnBleEvent(BtdrvBleEventType_ClientNotify, &wr_ack) == true);
+    assert(ctrl0->rumble_acks == 501 && ctrl0->last_rumble_result == 5);
     assert(!events::Pop(&popped));
     u32 captured_rumble_err = 0;
     assert(events::TakeRumbleWriteError(259, &captured_rumble_err) && captured_rumble_err == 5);

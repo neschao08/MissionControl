@@ -334,6 +334,9 @@ namespace ams::ble::events {
     }
 
     void NoteRumbleWriteCompletion(u32 conn_id, u32 result) {
+        if (auto controller = GetActiveController(conn_id)) {
+            controller->OnRumbleWriteComplete(result);
+        }
         const u32 slot = FindSlotByConnId(conn_id);
         if (slot < MaxBleControllers) {
             if (result != 0) {
@@ -351,6 +354,11 @@ namespace ams::ble::events {
         } else if (result != 0 && log::IsEnabled()) {
             log::Write("ble rumble write err conn_id=%u result=%u", conn_id, result);
         }
+        g_ring_event.Signal();
+    }
+
+    void WakeHostLoop() {
+        g_ring_event.Signal();
     }
 
     bool TakeRumbleWriteError(u32 conn_id, u32 *out_result) {

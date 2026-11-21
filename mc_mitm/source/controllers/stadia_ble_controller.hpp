@@ -16,6 +16,7 @@
 #pragma once
 #include "emulated_switch_controller.hpp"
 #include "stadia_mapping.hpp"
+#include <atomic>
 
 namespace ams::controller {
 
@@ -50,6 +51,8 @@ namespace ams::controller {
             Result HandleBleInputReport(const u8 *data, size_t size) override;
             Result HandleOutputDataReport(const u8 *report_buffer, size_t size) override;
             Result SendConnectRumble(u16 strong, u16 weak) override;
+            void ServiceBleTasks() override;
+            void OnRumbleWriteComplete(u32 result) override;
             void DisconnectBle() override;
 
         protected:
@@ -58,6 +61,9 @@ namespace ams::controller {
             Result WriteDataReport(const void *report_buffer, size_t size) override;
 
         private:
+            Result TryWriteRumbleLocked(u16 strong, u16 weak, s64 now_tick);
+            s64 GetMinRumbleIntervalNs() const;
+
             os::SdkMutex m_report_mutex;
             os::SdkMutex m_rumble_mutex;
             u32 m_conn_id;
@@ -69,11 +75,23 @@ namespace ams::controller {
             u8 m_write_auth_req;
             bool m_connected = true;
 
-            u16 m_last_rumble_strong = 0;
-            u16 m_last_rumble_weak = 0;
+            s64 m_last_input_report_tick = 0;
+
+            u16 m_desired_rumble_strong = 0;
+            u16 m_desired_rumble_weak = 0;
+            u16 m_sent_rumble_strong = 0;
+            u16 m_sent_rumble_weak = 0;
             s64 m_last_rumble_tick = 0;
+            s64 m_rumble_min_stop_tick = 0;
+            s64 m_rumble_expire_tick = 0;
+            bool m_rumble_pending = false;
+            std::atomic<bool> m_rumble_in_flight{false};
+            std::atomic<s64> m_rumble_in_flight_tick{0};
+            std::atomic<u32> m_pending_att_error{0};
+
             u32 m_cmd_log_count = 0;
             u32 m_basic_out_log_count = 0;
+            u32 m_other_out_log_count = 0;
             u32 m_rumble_log_count = 0;
             u8  m_rumble_fallback_stage = 0;
 

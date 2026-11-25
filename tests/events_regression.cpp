@@ -163,6 +163,7 @@ int main() {
     // Dirty notification table flag: NOT set by single-link disconnects (avoids spurious Unregister=0x25a71),
     // set only on stack-wide teardown (InvalidConnId/InvalidClientIf) or radio disable (sleep), cleared by ClientRegistration.
     events::TakeNotifTableDirty();
+    events::TakeAddressCacheReset();
     events::SetRadioEnabled(true);
     events::SetSlotConnection(0, stadia_addr, 888);
     BtdrvBleEventInfo dirty_disc{};
@@ -174,8 +175,9 @@ int main() {
     dirty_disc.client_connection.reason = 0x0008;
     assert(events::OnBleEvent(BtdrvBleEventType_ClientConnection, &dirty_disc) == true);
     assert(events::TakeNotifTableDirty() == false);
+    assert(events::TakeAddressCacheReset() == false);
 
-    // Stack-wide teardown (conn_id=InvalidConnId, client_if=InvalidClientIf) marks notification table dirty.
+    // Stack-wide teardown (conn_id=InvalidConnId, client_if=InvalidClientIf) marks notification table dirty & resets address cache.
     BtdrvBleEventInfo stack_reset{};
     stack_reset.client_connection.result = 55;
     stack_reset.client_connection.status = BleConnectionStatus_Disconnected;
@@ -184,12 +186,40 @@ int main() {
     assert(events::OnBleEvent(BtdrvBleEventType_ClientConnection, &stack_reset) == true);
     assert(events::TakeNotifTableDirty() == true);
     assert(events::TakeNotifTableDirty() == false);
+    assert(events::TakeAddressCacheReset() == true);
+    assert(events::TakeAddressCacheReset() == false);
 
     events::SetRadioEnabled(false);
     assert(events::TakeNotifTableDirty() == true);
+    assert(events::TakeAddressCacheReset() == true);
+    assert(events::TakeAddressCacheReset() == false);
     events::SetRadioEnabled(true);
     EmitClientReg(6, 1);
     assert(events::TakeNotifTableDirty() == false);
+
+    assert(events::BeginSleep() == true);
+    events::EndSleep();
+    assert(events::TakeAddressCacheReset() == true);
+    assert(events::TakeAddressCacheReset() == false);
+    events::SetRadioEnabled(true);
+
+    // BluetoothCrash also marks address cache reset.
+    assert(events::OnCoreEvent(BtdrvEventType_BluetoothCrash, &crash) == false);
+    assert(events::TakeAddressCacheReset() == true);
+    assert(events::TakeAddressCacheReset() == false);
+
+    // Quiet probe logs do not interfere with event queueing/consumption.
+    DrainAll();
+    events::SetQuietProbeLogs(true);
+    EventRecord probe_evt{};
+    probe_evt.type = BtdrvBleEventType_ClientConnection;
+    probe_evt.info.client_connection.status = BleConnectionStatus_Disconnected;
+    probe_evt.info.client_connection.conn_id = 0;
+    probe_evt.info.client_connection.reason = 0;
+    events::PushRecord(probe_evt);
+    events::Log(probe_evt);
+    assert(events::Pop(&popped) && popped.type == BtdrvBleEventType_ClientConnection);
+    events::SetQuietProbeLogs(false);
 
     std::cout << "BLE production events (dual-path dispatch, rumble filter, descending client_if) regressions passed\n";
 }

@@ -20,6 +20,7 @@
 #include "ble_profile.hpp"
 #include "ble_results.hpp"
 #include "ble_recovery.hpp"
+#include "ble_reconnect_policy.hpp"
 #include "ble_pairing.hpp"
 #include "ble_advertising.hpp"
 #include "../mcmitm_config.hpp"
@@ -54,9 +55,6 @@ namespace ams::ble {
         constexpr s64 PairingRetryBackoffMs          = 5000;
         constexpr s64 StadiaRetryBackoffMs           = 1500;
         constexpr s64 BackgroundReconnectBackoffMs   = 6000;
-        constexpr s64 BackgroundTransientBackoffMs   = 1000;
-        constexpr s64 BackgroundScanIdlePeriodMs     = 2000;
-        constexpr s64 BackgroundScanBusyPeriodMs     = 4500;
         constexpr TimeSpan ClassicActivityHoldOff    = TimeSpan::FromSeconds(12);
         constexpr u8  StadiaStrategyCount            = 3;
 
@@ -79,6 +77,7 @@ namespace ams::ble {
         constinit os::SdkMutex g_known_stadia_lock;
         bluetooth::Address g_known_stadia[MaxBleControllers] = {};
         size_t g_known_stadia_count = 0;
+        reconnect::StadiaReconnectTracker<MaxBleControllers> g_stadia_reconnect;
 
         struct PairingFailure {
             bluetooth::Address address = {};
@@ -284,8 +283,15 @@ namespace ams::ble {
         }
 
         u32 FindSlotForAddress(const bluetooth::Address &address, u32 fallback) {
+            bool vacant[MaxBleControllers] = {};
+            {
+                std::scoped_lock lk(g_slots_lock);
+                for (u32 i = 0; i < MaxBleControllers; ++i) {
+                    vacant[i] = (g_host_slots[i].state == BleDeviceSlot::State::Vacant);
+                }
+            }
             for (u32 i = 0; i < MaxBleControllers; ++i) {
-                if ((g_host_slots[i].state == BleDeviceSlot::State::Vacant) && gatt::HasCachedAddress(i, address)) return i;
+                if (vacant[i] && gatt::HasCachedAddress(i, address)) return i;
             }
             return fallback;
         }
@@ -333,6 +339,66 @@ namespace ams::ble {
                 }
             }
             return false;
+        }
+
+        void QueryDisconnectedStadiaReconnectState(bool *out_has_direct_ready, bool *out_has_scan_needed, bool *out_first_scan_pending) {
+            bluetooth::Address snapshot[MaxBleControllers] = {};
+            bool needs_scan[MaxBleControllers] = {};
+            size_t count = 0;
+            bool first_pending = false;
+            {
+                std::scoped_lock lk(g_known_stadia_lock);
+                count = g_known_stadia_count;
+                for (size_t i = 0; i < count; ++i) {
+                    snapshot[i] = g_known_stadia[i];
+                    needs_scan[i] = g_stadia_reconnect.NeedsScanResolution(snapshot[i].address);
+                }
+                first_pending = g_stadia_reconnect.HasFirstScanPending();
+            }
+            bool has_direct = false;
+            bool has_scan = false;
+            for (size_t i = 0; i < count; ++i) {
+                if (!IsAddressConnected(snapshot[i]) && !PairingBackoffActive(snapshot[i])) {
+                    if (needs_scan[i]) {
+                        has_scan = true;
+                    } else {
+                        has_direct = true;
+                    }
+                }
+            }
+            *out_has_direct_ready = has_direct;
+            *out_has_scan_needed = has_scan;
+            *out_first_scan_pending = first_pending;
+        }
+
+        void OnKnownStadiaAddressCacheReset() {
+            std::scoped_lock lk(g_known_stadia_lock);
+            g_stadia_reconnect.OnAddressCacheReset();
+        }
+
+        void ConsumeFirstScanPending() {
+            std::scoped_lock lk(g_known_stadia_lock);
+            static_cast<void>(g_stadia_reconnect.ConsumeFirstScanPending());
+        }
+
+        void NoteKnownStadiaAdvertisementSeen(const bluetooth::Address &address) {
+            std::scoped_lock lk(g_known_stadia_lock);
+            g_stadia_reconnect.NoteAdvertisementSeen(address.address);
+        }
+
+        bool ShouldStadiaClearBond(const bluetooth::Address &address, u8 flags) {
+            std::scoped_lock lk(g_known_stadia_lock);
+            return g_stadia_reconnect.ShouldClearBondBeforeConnect(address.address, flags);
+        }
+
+        void NoteStadiaAuthFailure(const bluetooth::Address &address) {
+            std::scoped_lock lk(g_known_stadia_lock);
+            g_stadia_reconnect.NoteAuthFailure(address.address);
+        }
+
+        void NoteStadiaConnectSuccess(const bluetooth::Address &address) {
+            std::scoped_lock lk(g_known_stadia_lock);
+            g_stadia_reconnect.NoteConnectSuccess(address.address);
         }
 
         void SaveKnownStadiaLocked() {
@@ -383,6 +449,7 @@ namespace ams::ble {
                     SaveKnownStadiaLocked();
                     changed = true;
                 }
+                g_stadia_reconnect.RegisterKnown(address.address);
             }
             if (changed) {
                 events::LogAddress("remembered Stadia controller for auto-reconnect", address);
@@ -410,6 +477,7 @@ namespace ams::ble {
                 g_known_stadia_count = n;
                 for (size_t i = 0; i < n; ++i) {
                     g_known_stadia[i] = store.addresses[i];
+                    g_stadia_reconnect.RegisterKnown(store.addresses[i].address);
                 }
             }
             for (size_t i = 0; i < n; ++i) {
@@ -539,8 +607,15 @@ namespace ams::ble {
         void DismissSlot(u32 slot_index, bool close_transport = true);
 
         void DisconnectAll(bool close_transport = true) {
+            bool active_slots[MaxBleControllers] = {};
+            {
+                std::scoped_lock lk(g_slots_lock);
+                for (size_t i = 0; i < MaxBleControllers; ++i) {
+                    active_slots[i] = (g_host_slots[i].state != BleDeviceSlot::State::Vacant);
+                }
+            }
             for (size_t i = 0; i < MaxBleControllers; ++i) {
-                if (g_host_slots[i].state != BleDeviceSlot::State::Vacant) {
+                if (active_slots[i]) {
                     DismissSlot(static_cast<u32>(i), close_transport);
                 }
             }
@@ -550,15 +625,33 @@ namespace ams::ble {
         void CleanupSleepIfNeeded() {
             events::WaitForSleepPreparation();
             if (events::TakeSleepCleanup()) {
-                bool had_links = events::GetActiveConnectionCount() != 0;
+                struct SlotSnapshot {
+                    BleDeviceSlot::State state = BleDeviceSlot::State::Vacant;
+                    BleControllerType controller_type = BleControllerType::Unknown;
+                    bluetooth::Address address = {};
+                };
+                SlotSnapshot slot_snapshot[MaxBleControllers] = {};
                 {
                     std::scoped_lock lk(g_slots_lock);
-                    for (const auto &slot : g_host_slots) {
-                        had_links = had_links || (slot.state != BleDeviceSlot::State::Vacant);
+                    for (size_t i = 0; i < MaxBleControllers; ++i) {
+                        slot_snapshot[i] = { g_host_slots[i].state, g_host_slots[i].controller_type, g_host_slots[i].address };
                     }
                 }
+                bool had_non_stadia_links = false;
+                for (const auto &slot : slot_snapshot) {
+                    if ((slot.state != BleDeviceSlot::State::Vacant) &&
+                        (slot.controller_type != BleControllerType::Stadia) &&
+                        !IsKnownStadia(slot.address)) {
+                        had_non_stadia_links = true;
+                        break;
+                    }
+                }
+                const auto adopted = events::GetSleepLink(MaxBleControllers);
+                if (adopted.active && !IsKnownStadia(adopted.address)) {
+                    had_non_stadia_links = true;
+                }
                 DisconnectAll(false); // the PSC thread already closed the transport
-                g_radio_recovery.Sleep(had_links);
+                g_radio_recovery.Sleep(reconnect::ShouldArmSleepRecovery(had_non_stadia_links));
             }
         }
 
@@ -681,7 +774,7 @@ namespace ams::ble {
                     }
                     if ((slot.controller_type == BleControllerType::Stadia) && !slot.cccd_rearmed &&
                         (slot.presented_tick != 0) &&
-                        ((os::Tick(now) - os::Tick(slot.presented_tick)).ToTimeSpan() >= TimeSpan::FromMilliSeconds(900))) {
+                        ((os::Tick(now) - os::Tick(slot.presented_tick)).ToTimeSpan() >= TimeSpan::FromMilliSeconds(1500))) {
                         slot.cccd_rearmed = true;
                         if (events::GetSlotInputReportCount(static_cast<u32>(i)) == slot.attach_input_reports) {
                             rearm_tasks[rearm_count++] = { static_cast<u32>(i), slot.conn_id, slot.hid.write_auth_req };
@@ -865,6 +958,9 @@ namespace ams::ble {
                     }
                     if (scan.status != BleScanStatus_NewDevice) return false;
                     ++advertisements;
+                    if (scan.result == 0) {
+                        NoteKnownStadiaAdvertisementSeen(scan.address);
+                    }
                     const auto summary = ParseAdvertisements(scan.ad_list, scan.count);
                     BleControllerType candidate_type = BleControllerType::Unknown;
                     const char *decision = "candidate";
@@ -994,42 +1090,76 @@ namespace ams::ble {
                 return;
             }
 
-            for (size_t i = 0; i < MaxBleControllers; ++i) {
-                if (g_host_slots[i].state == BleDeviceSlot::State::Connected) {
-                    if (g_host_slots[i].negotiated_max_interval != target_max) {
-                        g_host_slots[i].negotiated_max_interval = events::RequestLowLatencyConnectionParameters(g_host_slots[i].address, connected_count);
+            struct RebalanceTarget {
+                u32 slot;
+                bluetooth::Address address;
+            };
+            RebalanceTarget targets[MaxBleControllers] = {};
+            size_t target_count = 0;
+            {
+                std::scoped_lock lk(g_slots_lock);
+                for (size_t i = 0; i < MaxBleControllers; ++i) {
+                    if ((g_host_slots[i].state == BleDeviceSlot::State::Connected) &&
+                        (g_host_slots[i].negotiated_max_interval != target_max)) {
+                        targets[target_count++] = { static_cast<u32>(i), g_host_slots[i].address };
                     }
+                }
+            }
+
+            for (size_t i = 0; i < target_count; ++i) {
+                const u16 negotiated = events::RequestLowLatencyConnectionParameters(targets[i].address, connected_count);
+                std::scoped_lock lk(g_slots_lock);
+                auto &slot = g_host_slots[targets[i].slot];
+                if ((slot.state == BleDeviceSlot::State::Connected) && AddressEqual(slot.address, targets[i].address)) {
+                    slot.negotiated_max_interval = negotiated;
                 }
             }
         }
 
         void PresentSlot(u32 slot_index) {
-            auto &slot = g_host_slots[slot_index];
-            if (!slot.hid.has_output_report) {
+            gatt::HidService hid = {};
+            BleControllerType initial_type = BleControllerType::Unknown;
+            bluetooth::Address address = {};
+            u32 conn_id = InvalidConnId;
+            {
+                std::scoped_lock lk(g_slots_lock);
+                const auto &slot = g_host_slots[slot_index];
+                hid = slot.hid;
+                initial_type = slot.controller_type;
+                address = slot.address;
+                conn_id = slot.conn_id;
+            }
+            if (!hid.has_output_report) {
                 log::Write("slot %u: no output Report characteristic, rumble unavailable", slot_index);
             }
 
-            const BleControllerType controller_type = ResolveControllerType(slot);
-            slot.controller_type = controller_type;
-            RememberControllerType(slot.address, controller_type);
+            BleDeviceSlot probe_meta = {};
+            probe_meta.controller_type = initial_type;
+            probe_meta.address = address;
+            probe_meta.hid = hid;
+            const BleControllerType controller_type = ResolveControllerType(probe_meta);
+            RememberControllerType(address, controller_type);
             if (controller_type == BleControllerType::Stadia) {
-                RememberKnownStadia(slot.address);
+                RememberKnownStadia(address);
+                NoteStadiaConnectSuccess(address);
             }
 
             std::shared_ptr<controller::EmulatedSwitchController> controller;
             if (controller_type == BleControllerType::Stadia) {
                 controller = std::make_shared<controller::StadiaBleController>(
-                    slot.address, slot.conn_id, slot.hid.service.id, slot.hid.service.is_primary,
-                    slot.hid.output_report.id, slot.hid.has_output_report, slot.hid.output_write_with_response,
-                    slot.hid.write_auth_req);
+                    address, conn_id, hid.service.id, hid.service.is_primary,
+                    hid.output_report.id, hid.has_output_report, hid.output_write_with_response,
+                    hid.write_auth_req);
             } else {
                 controller = std::make_shared<controller::XboxOneBleController>(
-                    slot.address, slot.conn_id, slot.hid.service.id, slot.hid.service.is_primary,
-                    slot.hid.output_report.id, slot.hid.has_output_report);
+                    address, conn_id, hid.service.id, hid.service.is_primary,
+                    hid.output_report.id, hid.has_output_report);
             }
 
             {
                 std::scoped_lock lk(g_slots_lock);
+                auto &slot = g_host_slots[slot_index];
+                slot.controller_type = controller_type;
                 slot.controller = controller;
                 slot.state = BleDeviceSlot::State::Connected;
                 slot.was_connected = true;
@@ -1039,31 +1169,32 @@ namespace ams::ble {
             controller::AttachVirtualController(controller);
             if (GetConnectedCount() == 1) profile::BeginSession();
             for (auto &failure : g_pairing_failures) {
-                if (AddressEqual(failure.address, slot.address)) failure = {};
+                if (AddressEqual(failure.address, address)) failure = {};
             }
 
             {
                 std::scoped_lock lk(g_slots_lock);
+                auto &slot = g_host_slots[slot_index];
                 slot.attach_input_reports = events::GetSlotInputReportCount(slot_index);
                 slot.cccd_rearmed = false;
                 slot.presented_tick = os::GetSystemTick().GetInt64Value();
                 ScheduleNeutralReportsLocked(slot);
                 slot.connect_rumble_state = BleDeviceSlot::ConnectRumbleState::None;
                 slot.connect_rumble_tick = 0;
+                slot.negotiated_max_interval = 0;
             }
-            events::RegisterSlotController(slot_index, slot.conn_id, controller);
+            events::RegisterSlotController(slot_index, conn_id, controller);
             ServiceNeutralReports();
             controller->ServiceBleTasks();
 
             // Request low-latency parameters and rebalance active BLE slots
-            slot.negotiated_max_interval = 0;
             RebalanceConnectionParameters();
             ServiceNeutralReports();
             g_last_controller_presented_tick = os::GetSystemTick().GetInt64Value();
 
             log::Write("slot %u: %s controller presented to system (conn_id=%u, write_auth=%u, total active=%zu)",
                 slot_index, controller_type == BleControllerType::Stadia ? "Stadia" : "Xbox",
-                slot.conn_id, slot.hid.write_auth_req, GetConnectedCount());
+                conn_id, hid.write_auth_req, GetConnectedCount());
         }
 
         void DismissSlot(u32 slot_index, bool close_transport) {
@@ -1071,6 +1202,8 @@ namespace ams::ble {
             std::shared_ptr<controller::EmulatedSwitchController> controller;
             bluetooth::Address address = {};
             u32 conn_id = InvalidConnId;
+            u8 client_if = InvalidClientIf;
+            BleControllerType slot_controller_type = BleControllerType::Unknown;
             bool already_disconnect_pending = false;
 
             {
@@ -1085,6 +1218,8 @@ namespace ams::ble {
                     slot.state = BleDeviceSlot::State::Disconnecting;
                 }
                 conn_id = slot.conn_id;
+                client_if = slot.client_if;
+                slot_controller_type = slot.controller_type;
                 address = slot.address;
 
                 if (!already_disconnect_pending) {
@@ -1117,18 +1252,16 @@ namespace ams::ble {
                         });
                     }
                 }
-                const u8 client_if = g_host_slots[slot_index].client_if;
                 if (client_if != InvalidClientIf) {
                     static_cast<void>(btdrvCancelConnectGattServer(client_if, address, true));
                 }
             }
 
             if (close_transport && events::IsRadioEnabled() && events::IsSlotDisconnected(slot_index)) {
-                const bool preserve_stadia_ltk =
-                    (g_host_slots[slot_index].controller_type == BleControllerType::Stadia) &&
-                    g_host_slots[slot_index].was_connected;
+                const bool is_stadia_peer = (slot_controller_type == BleControllerType::Stadia) || IsKnownStadia(address);
+                const bool preserve_stadia_ltk = is_stadia_peer && reconnect::ShouldPreserveStadiaBondOnDismiss();
                 if (preserve_stadia_ltk) {
-                    log::Write("slot %u: preserving Stadia BLE bond record after connected session disconnect", slot_index);
+                    log::Write("slot %u: preserving Stadia BLE bond record across disconnect", slot_index);
                 } else {
                     const Result rc = pairing::ClearPeer(slot_index, address);
                     if (R_FAILED(rc)) {
@@ -1172,13 +1305,22 @@ namespace ams::ble {
             bool any_disconnected = false;
             for (size_t i = 0; i < MaxBleControllers; ++i) {
                 const u32 slot_idx = static_cast<u32>(i);
+                BleDeviceSlot::State state = BleDeviceSlot::State::Vacant;
                 bool host_disconnect_requested = false;
+                u32 conn_id = InvalidConnId;
+                BleControllerType controller_type = BleControllerType::Unknown;
+                u8 write_auth_req = BtdrvGattAuthReqType_None;
                 {
                     std::scoped_lock lk(g_slots_lock);
-                    if ((g_host_slots[i].state != BleDeviceSlot::State::Vacant) && g_host_slots[i].disconnect_requested) {
-                        g_host_slots[i].disconnect_requested = false;
+                    auto &slot = g_host_slots[i];
+                    state = slot.state;
+                    if ((state != BleDeviceSlot::State::Vacant) && slot.disconnect_requested) {
+                        slot.disconnect_requested = false;
                         host_disconnect_requested = true;
                     }
+                    conn_id = slot.conn_id;
+                    controller_type = slot.controller_type;
+                    write_auth_req = slot.hid.write_auth_req;
                 }
                 if (host_disconnect_requested) {
                     log::Write("slot %u: disconnecting BLE controller on host request", slot_idx);
@@ -1186,13 +1328,13 @@ namespace ams::ble {
                     any_disconnected = true;
                     continue;
                 }
-                if (g_host_slots[i].state == BleDeviceSlot::State::Disconnecting) {
+                if (state == BleDeviceSlot::State::Disconnecting) {
                     if (events::IsSlotDisconnected(slot_idx)) {
                         log::Write("slot %u: disconnecting BLE link ended (reason=0x%04x)", slot_idx, events::GetSlotDisconnectReason(slot_idx));
                         DismissSlot(slot_idx);
                         any_disconnected = true;
                     }
-                } else if (g_host_slots[i].state == BleDeviceSlot::State::Connected) {
+                } else if (state == BleDeviceSlot::State::Connected) {
                     if (events::IsSlotDisconnected(slot_idx)) {
                         log::Write("slot %u: controller disconnected (reason=0x%04x)", slot_idx, events::GetSlotDisconnectReason(slot_idx));
                         DismissSlot(slot_idx);
@@ -1200,12 +1342,12 @@ namespace ams::ble {
                     } else if (gatt::TakeRediscovered(slot_idx)) {
                         log::Write("slot %u: services re-discovered, subscribing again", slot_idx);
                         gatt::HidService hid;
-                        const auto auth_mode = (g_host_slots[i].controller_type == BleControllerType::Stadia)
-                            ? ((g_host_slots[i].hid.write_auth_req == BtdrvGattAuthReqType_NoMitm)
+                        const auto auth_mode = (controller_type == BleControllerType::Stadia)
+                            ? ((write_auth_req == BtdrvGattAuthReqType_NoMitm)
                                 ? gatt::SubscribeAuthMode::NoMitmCccdOnly
                                 : gatt::SubscribeAuthMode::PlainOnlyAfterBond)
                             : gatt::SubscribeAuthMode::StandardNoMitm;
-                        static_cast<void>(gatt::Subscribe(slot_idx, g_host_slots[i].conn_id, &hid, auth_mode));
+                        static_cast<void>(gatt::Subscribe(slot_idx, conn_id, &hid, auth_mode));
                     }
                 }
             }
@@ -1219,6 +1361,7 @@ namespace ams::ble {
         bool TryDirectConnectKnownStadia(u32 *inout_slot, bluetooth::Address *out_address, u32 *out_conn_id, u8 *out_flags, bool background_reconnect) {
             (void)background_reconnect;
             bluetooth::Address candidates[MaxBleControllers] = {};
+            bool needs_scan[MaxBleControllers] = {};
             size_t candidate_count = 0;
             size_t start_idx = 0;
             {
@@ -1226,6 +1369,7 @@ namespace ams::ble {
                 candidate_count = g_known_stadia_count;
                 for (size_t i = 0; i < candidate_count; ++i) {
                     candidates[i] = g_known_stadia[i];
+                    needs_scan[i] = g_stadia_reconnect.NeedsScanResolution(candidates[i].address);
                 }
                 start_idx = candidate_count ? (g_next_known_probe_idx % candidate_count) : 0;
             }
@@ -1242,7 +1386,7 @@ namespace ams::ble {
             for (size_t offset = 0; offset < candidate_count; ++offset) {
                 const size_t idx = (start_idx + offset) % candidate_count;
                 const auto &addr = candidates[idx];
-                if (!IsAddressConnected(addr) && !PairingBackoffActive(addr)) {
+                if (!needs_scan[idx] && !IsAddressConnected(addr) && !PairingBackoffActive(addr)) {
                     target = addr;
                     have_target = true;
                     std::scoped_lock lk(g_known_stadia_lock);
@@ -1255,19 +1399,49 @@ namespace ams::ble {
             }
 
             const u32 slot = FindSlotForAddress(target, *inout_slot);
-            g_host_slots[slot].state = BleDeviceSlot::State::Connecting;
-            g_host_slots[slot].controller_type = BleControllerType::Stadia;
-            g_host_slots[slot].was_connected = false;
-            g_host_slots[slot].disconnect_requested = false;
-            g_host_slots[slot].address = target;
             const u8 client_if = events::GetClientIfForSlot(slot);
-            g_host_slots[slot].client_if = client_if;
+            {
+                std::scoped_lock lk(g_slots_lock);
+                g_host_slots[slot].state = BleDeviceSlot::State::Connecting;
+                g_host_slots[slot].controller_type = BleControllerType::Stadia;
+                g_host_slots[slot].was_connected = false;
+                g_host_slots[slot].disconnect_requested = false;
+                g_host_slots[slot].address = target;
+                g_host_slots[slot].client_if = client_if;
+            }
+
+            bool quiet_probe = false;
+            bool clear_bond = false;
+            {
+                std::scoped_lock lk(g_known_stadia_lock);
+                quiet_probe = g_stadia_reconnect.ShouldSilenceProbeLog(target.address);
+                clear_bond = g_stadia_reconnect.ShouldClearBondBeforeConnect(target.address, 0x06);
+            }
 
             const bool another_pad = (events::GetActiveConnectionCount() > 0) || (controller::GetConnectedControllerCount() > 0);
             const TimeSpan probe_timeout = TimeSpan::FromMilliSeconds(another_pad ? 1800 : 2500);
-            const bool preserve_bond = (FindOrAllocStadiaStrategy(target)->failures_in_cycle == 0);
-            const Result rc = pairing::Connect(slot, client_if, target, out_conn_id, probe_timeout, !preserve_bond, false);
+            bool immediate_refusal = false;
+            Result rc = ResultSuccess();
+            {
+                events::SetQuietProbeLogs(quiet_probe);
+                ON_SCOPE_EXIT { events::SetQuietProbeLogs(false); };
+                rc = pairing::Connect(slot, client_if, target, out_conn_id, probe_timeout, clear_bond, false, &immediate_refusal, quiet_probe);
+            }
+
+            const bool pairing_window_open = events::IsPairingWindowOpen();
+            bool switched_to_scan = false;
+            u32 probe_attempts = 0;
+            {
+                std::scoped_lock lk(g_known_stadia_lock);
+                switched_to_scan = g_stadia_reconnect.NoteProbeAttemptAndResult(
+                    target.address, R_SUCCEEDED(rc), immediate_refusal, pairing_window_open);
+                if (R_SUCCEEDED(rc)) {
+                    probe_attempts = g_stadia_reconnect.TakeQuietProbeCount(target.address);
+                }
+            }
+
             if (R_SUCCEEDED(rc)) {
+                log::Write("slot %u: direct reconnect probe connected Stadia (attempts=%u)", slot, probe_attempts);
                 events::LogAddress("direct reconnect probe connected Stadia", target);
                 *inout_slot = slot;
                 *out_address = target;
@@ -1275,8 +1449,10 @@ namespace ams::ble {
                 return true;
             }
 
-            if (events::GetSlotDisconnectReason(slot) == 0x003e) {
-                NotePairingFailure(target, BackgroundTransientBackoffMs);
+            if (switched_to_scan) {
+                log::Write("slot %u: direct probe refused immediately by stack; switching to on-demand background scan", slot);
+            } else if (events::GetSlotDisconnectReason(slot) == 0x003e) {
+                NotePairingFailure(target, reconnect::TransientDisconnectBackoffMs);
             } else if (!svc::ResultTimedOut::Includes(rc) && !ResultNoConnection::Includes(rc)) {
                 NotePairingFailure(target, 10000);
                 log::Write("slot %u: direct probe stack error rc=0x%x; backing off 10000ms", slot, rc.GetValue());
@@ -1290,7 +1466,10 @@ namespace ams::ble {
             return false;
         }
 
-        void ScanAndPairNextController(bool background_reconnect = false) {
+        void ScanAndPairNextController(bool background_reconnect = false, bool allow_bg_scan = false, bool *out_scan_completed_full_window = nullptr) {
+            if (out_scan_completed_full_window) {
+                *out_scan_completed_full_window = false;
+            }
             if (events::ConsumeControllerCountChanged()) {
                 RebalanceConnectionParameters();
             }
@@ -1310,24 +1489,29 @@ namespace ams::ble {
 
             if (connected) {
                 scanned_type = RecallControllerType(address);
-            } else if (HasDisconnectedKnownStadia() && !events::ClassicActivityWithin(ClassicActivityHoldOff) &&
-                       TryDirectConnectKnownStadia(&slot, &address, &conn_id, &scanned_flags, background_reconnect)) {
-                connected = true;
-                scanned_type = BleControllerType::Stadia;
-                session_generation = events::GetClientRegistrationGeneration();
-            } else if (background_reconnect) {
-                return;
+            } else if (background_reconnect && !allow_bg_scan) {
+                if (HasDisconnectedKnownStadia() && !events::ClassicActivityWithin(ClassicActivityHoldOff) &&
+                    TryDirectConnectKnownStadia(&slot, &address, &conn_id, &scanned_flags, background_reconnect)) {
+                    connected = true;
+                    scanned_type = BleControllerType::Stadia;
+                    session_generation = events::GetClientRegistrationGeneration();
+                } else {
+                    return;
+                }
             } else {
                 const bool another_controller_connected = (events::GetActiveConnectionCount() > 0) || (controller::GetConnectedControllerCount() > 0);
                 // Real Stadia flags=0x06 (white blink reconnect) advertisements can take ~4.3s to appear under
-                // bt_nso's default scan duty cycle; scan 4.5s when idle so white-blink reconnect catches reliably.
-                const TimeSpan scan_duration = background_reconnect
-                    ? TimeSpan::FromMilliSeconds(another_controller_connected ? 1500 : 4500)
-                    : TimeSpan::FromSeconds(another_controller_connected ? 2 : 5);
+                // bt_nso's default scan duty cycle; keep at least 4.5s even when other pads are connected.
+                const TimeSpan scan_duration = TimeSpan::FromMilliSeconds(background_reconnect
+                    ? reconnect::StadiaScanDurationMs
+                    : reconnect::ForegroundScanDurationMs(another_controller_connected));
                 u32 stale_slot = InvalidSlot;
                 Result rc = Scan(&address, &scanned_type, &scanned_flags, scan_duration, background_reconnect, &stale_slot);
                 if (events::ConsumeControllerCountChanged()) {
                     RebalanceConnectionParameters();
+                }
+                if (out_scan_completed_full_window && background_reconnect) {
+                    *out_scan_completed_full_window = R_SUCCEEDED(rc) || svc::ResultTimedOut::Includes(rc) || (stale_slot != InvalidSlot);
                 }
                 if (stale_slot != InvalidSlot) {
                     log::Write("slot %u: Stadia re-advertised in pairing mode (flags=0x05); dismissing stale slot immediately", stale_slot);
@@ -1342,26 +1526,32 @@ namespace ams::ble {
                         return;
                     }
                     slot = FindSlotForAddress(address, slot);
-                    g_host_slots[slot].state = BleDeviceSlot::State::Connecting;
-                    g_host_slots[slot].controller_type = scanned_type;
-                    g_host_slots[slot].was_connected = false;
-                    g_host_slots[slot].address = address;
                     const u8 client_if = events::GetClientIfForSlot(slot);
-                    g_host_slots[slot].client_if = client_if;
+                    {
+                        std::scoped_lock lk(g_slots_lock);
+                        g_host_slots[slot].state = BleDeviceSlot::State::Connecting;
+                        g_host_slots[slot].controller_type = scanned_type;
+                        g_host_slots[slot].was_connected = false;
+                        g_host_slots[slot].disconnect_requested = false;
+                        g_host_slots[slot].address = address;
+                        g_host_slots[slot].client_if = client_if;
+                    }
                     session_generation = events::GetClientRegistrationGeneration();
-                    // Preserve bt_nso's in-RAM LTK for Stadia general-discoverable reconnect (flags=0x06)
-                    // when not retrying a failure; clear old bond records for pairing mode (flags=0x05) or retries.
-                    const bool preserve_bond =
-                        (scanned_type == BleControllerType::Stadia) &&
-                        ((scanned_flags & 0x01) == 0) &&
-                        (FindOrAllocStadiaStrategy(address)->failures_in_cycle == 0);
-                    connected = R_SUCCEEDED(pairing::Connect(slot, client_if, address, &conn_id, TimeSpan::FromSeconds(15), !preserve_bond));
+                    // Preserve bt_nso's BLE LTK for general-discoverable reconnect (flags=0x06) unless
+                    // repeated authentication/subscription failures require wiping stale keys.
+                    const bool clear_existing_bond = (scanned_type == BleControllerType::Stadia)
+                        ? ShouldStadiaClearBond(address, scanned_flags)
+                        : true;
+                    const TimeSpan connect_timeout = TimeSpan::FromSeconds(background_reconnect ? 5 : 15);
+                    connected = R_SUCCEEDED(pairing::Connect(slot, client_if, address, &conn_id, connect_timeout, clear_existing_bond));
                     if (!connected) {
                         const bool transient_0x3e = (events::GetSlotDisconnectReason(slot) == 0x003e);
-                        const s64 backoff = background_reconnect
-                            ? (transient_0x3e ? BackgroundTransientBackoffMs : BackgroundReconnectBackoffMs)
-                            : PairingRetryBackoffMs;
-                        NotePairingFailure(address, backoff);
+                        if (!(background_reconnect && events::IsPairingWindowOpen())) {
+                            const s64 backoff = transient_0x3e
+                                ? reconnect::TransientDisconnectBackoffMs
+                                : (background_reconnect ? BackgroundReconnectBackoffMs : PairingRetryBackoffMs);
+                            NotePairingFailure(address, backoff);
+                        }
                         DismissSlot(slot);
                         return;
                     }
@@ -1383,11 +1573,19 @@ namespace ams::ble {
                 return;
             }
 
-            if (g_host_slots[slot].state == BleDeviceSlot::State::Vacant) slot = FindSlotForAddress(address, slot);
-            g_host_slots[slot].conn_id = conn_id;
-            g_host_slots[slot].controller_type = scanned_type;
-            g_host_slots[slot].address = address;
-            g_host_slots[slot].state = BleDeviceSlot::State::Discovering;
+            {
+                std::scoped_lock lk(g_slots_lock);
+                if (g_host_slots[slot].state == BleDeviceSlot::State::Vacant) {
+                    slot = FindSlotForAddress(address, slot);
+                }
+            }
+            {
+                std::scoped_lock lk(g_slots_lock);
+                g_host_slots[slot].conn_id = conn_id;
+                g_host_slots[slot].controller_type = scanned_type;
+                g_host_slots[slot].address = address;
+                g_host_slots[slot].state = BleDeviceSlot::State::Discovering;
+            }
             if (!events::IsAddressActive(address)) {
                 events::SetSlotConnecting(slot, address);
                 events::SetSlotConnection(slot, address, conn_id);
@@ -1413,13 +1611,18 @@ namespace ams::ble {
             if (R_FAILED(rc)) {
                 log::Write("slot %u: GATT setup failed before pairing rc=0x%x", slot, rc.GetValue());
                 const bool transient_0x3e = (events::GetSlotDisconnectReason(slot) == 0x003e);
-                const s64 backoff = (background_reconnect && transient_0x3e) ? BackgroundTransientBackoffMs : PairingRetryBackoffMs;
-                NotePairingFailure(address, backoff);
+                if (!(background_reconnect && events::IsPairingWindowOpen())) {
+                    const s64 backoff = transient_0x3e ? reconnect::TransientDisconnectBackoffMs : PairingRetryBackoffMs;
+                    NotePairingFailure(address, backoff);
+                }
                 DismissSlot(slot);
                 return;
             }
 
-            g_host_slots[slot].state = BleDeviceSlot::State::Pairing;
+            {
+                std::scoped_lock lk(g_slots_lock);
+                g_host_slots[slot].state = BleDeviceSlot::State::Pairing;
+            }
             if (session_generation != events::GetClientRegistrationGeneration()) {
                 log::Write("slot %u: native clients changed during setup; discarding old session", slot);
                 DismissSlot(slot, false);
@@ -1455,19 +1658,36 @@ namespace ams::ble {
 
             const auto handle_attempt_failure = [&](const char *phase) {
                 if (is_stadia) {
-                    if (background_reconnect) {
-                        NotePairingFailure(address, BackgroundReconnectBackoffMs);
-                        log::Write("slot %u: Stadia bg reconnect %s failed (flags=0x%02x backoff=%ldms)",
-                            slot, phase, scanned_flags, static_cast<long>(BackgroundReconnectBackoffMs));
-                    } else {
-                        const bool cycle_exhausted = AdvanceStadiaStrategy(address);
-                        const s64 backoff = cycle_exhausted ? PairingRetryBackoffMs : StadiaRetryBackoffMs;
-                        if (cycle_exhausted) {
-                            g_radio_recovery.Request();
+                    const u16 disc_reason = events::GetSlotDisconnectReason(slot);
+                    const bool transient_interference =
+                        (disc_reason == 0x003e) ||
+                        !events::IsRadioEnabled() ||
+                        (background_reconnect && events::IsPairingWindowOpen());
+                    if (transient_interference) {
+                        if (!(background_reconnect && events::IsPairingWindowOpen()) && events::IsRadioEnabled()) {
+                            const s64 backoff = (disc_reason == 0x003e)
+                                ? reconnect::TransientDisconnectBackoffMs
+                                : (background_reconnect ? BackgroundReconnectBackoffMs : StadiaRetryBackoffMs);
+                            NotePairingFailure(address, backoff);
                         }
-                        NotePairingFailure(address, backoff);
-                        log::Write("slot %u: Stadia %s failed (stage=%u next=%u cycle_exhausted=%u backoff=%ldms)",
-                            slot, phase, stadia_stage, GetStadiaStrategyStage(address), cycle_exhausted, static_cast<long>(backoff));
+                        log::Write("slot %u: Stadia %s interrupted transiently (bg=%u reason=0x%04x pairing_open=%u)",
+                            slot, phase, background_reconnect ? 1u : 0u, disc_reason, events::IsPairingWindowOpen() ? 1u : 0u);
+                    } else {
+                        NoteStadiaAuthFailure(address);
+                        if (background_reconnect) {
+                            NotePairingFailure(address, BackgroundReconnectBackoffMs);
+                            log::Write("slot %u: Stadia bg reconnect %s failed (flags=0x%02x backoff=%ldms)",
+                                slot, phase, scanned_flags, static_cast<long>(BackgroundReconnectBackoffMs));
+                        } else {
+                            const bool cycle_exhausted = AdvanceStadiaStrategy(address);
+                            const s64 backoff = cycle_exhausted ? PairingRetryBackoffMs : StadiaRetryBackoffMs;
+                            if (cycle_exhausted) {
+                                g_radio_recovery.Request();
+                            }
+                            NotePairingFailure(address, backoff);
+                            log::Write("slot %u: Stadia %s failed (stage=%u next=%u cycle_exhausted=%u backoff=%ldms)",
+                                slot, phase, stadia_stage, GetStadiaStrategyStage(address), cycle_exhausted, static_cast<long>(backoff));
+                        }
                     }
                 } else {
                     g_radio_recovery.Request();
@@ -1511,8 +1731,12 @@ namespace ams::ble {
             }
             if (is_stadia) {
                 NoteStadiaStrategySuccess(address, stadia_stage);
+                NoteStadiaConnectSuccess(address);
             }
-            g_host_slots[slot].hid = hid;
+            {
+                std::scoped_lock lk(g_slots_lock);
+                g_host_slots[slot].hid = hid;
+            }
             log::Write("slot %u: paired and subscribed (write_auth=%u)", slot, hid.write_auth_req);
             PresentSlot(slot);
         }
@@ -1576,7 +1800,7 @@ namespace ams::ble {
             bluetooth::ble::WaitInitialized();
 
             os::SleepThread(TimeSpan::FromSeconds(20));
-            log::Write("starting multi-device BLE host (stadia-ble-v16-hos2250, HOS=0x%x)", static_cast<u32>(hos::GetVersion()));
+            log::Write("starting multi-device BLE host (stadia-ble-v17-hos2250, HOS=0x%x)", static_cast<u32>(hos::GetVersion()));
             LoadKnownStadia();
 
             if (R_FAILED(PrepareClient())) {
@@ -1587,10 +1811,17 @@ namespace ams::ble {
             StartLeHidListener();
             events::SetSink(gatt::OnEvent);
             u32 pairing_window_generation = events::PairingWindowGeneration();
+            s64 last_bg_probe_ms = 0;
             s64 last_bg_scan_ms = 0;
 
             for (;;) {
                 WaitForRadio();
+                if (events::TakeAddressCacheReset()) {
+                    std::fill(std::begin(g_pairing_failures), std::end(g_pairing_failures), PairingFailure{});
+                    last_bg_probe_ms = 0;
+                    last_bg_scan_ms = 0;
+                    OnKnownStadiaAddressCacheReset();
+                }
                 ProcessPendingDisconnections();
                 ServiceNeutralReports();
                 ServiceConnectRumble();
@@ -1601,6 +1832,7 @@ namespace ams::ble {
                     for (auto &strategy : g_stadia_strategies) {
                         strategy.failures_in_cycle = 0;
                     }
+                    last_bg_probe_ms = 0;
                     if (GetConnectedCount() > 0) {
                         log::Write("BLE pairing window opened; disconnecting active BLE controllers for grip/order reset");
                         DisconnectAll(true);
@@ -1633,10 +1865,31 @@ namespace ams::ble {
                            events::IsRadioEnabled() && (FindFreeSlot() >= 0) && HasDisconnectedKnownStadia()) {
                     const s64 now_ms = os::GetSystemTick().ToTimeSpan().GetMilliSeconds();
                     const bool other_pads = (events::GetActiveConnectionCount() > 0) || (controller::GetConnectedControllerCount() > 0);
-                    const s64 period_ms = other_pads ? BackgroundScanBusyPeriodMs : BackgroundScanIdlePeriodMs;
-                    if ((last_bg_scan_ms == 0) || ((now_ms - last_bg_scan_ms) >= period_ms)) {
-                        ScanAndPairNextController(true);
-                        last_bg_scan_ms = os::GetSystemTick().ToTimeSpan().GetMilliSeconds();
+                    bool has_direct_ready = false;
+                    bool has_scan_needed = false;
+                    bool any_first_scan_pending = false;
+                    QueryDisconnectedStadiaReconnectState(&has_direct_ready, &has_scan_needed, &any_first_scan_pending);
+                    const auto action = reconnect::StadiaReconnectTracker<MaxBleControllers>::ChooseAction(
+                        has_direct_ready, has_scan_needed, any_first_scan_pending, other_pads,
+                        now_ms, last_bg_probe_ms, last_bg_scan_ms);
+                    if (action == reconnect::BgAction::DirectProbe) {
+                        ScanAndPairNextController(true, false);
+                        last_bg_probe_ms = os::GetSystemTick().ToTimeSpan().GetMilliSeconds();
+                    } else if (action == reconnect::BgAction::BackgroundScan) {
+                        ConsumeFirstScanPending();
+                        bool scan_completed = false;
+                        ScanAndPairNextController(true, true, &scan_completed);
+                        const s64 end_ms = os::GetSystemTick().ToTimeSpan().GetMilliSeconds();
+                        if (scan_completed) {
+                            last_bg_scan_ms = end_ms;
+                        } else {
+                            const s64 period_ms = other_pads ? reconnect::OnDemandScanBusyPeriodMs : reconnect::OnDemandScanIdlePeriodMs;
+                            s64 retry_ts = end_ms - period_ms + reconnect::OnDemandScanRetryPeriodMs;
+                            if (retry_ts == 0) {
+                                retry_ts = -1;
+                            }
+                            last_bg_scan_ms = retry_ts;
+                        }
                     } else {
                         events::Pump(ActiveIdleSlice(TimeSpan::FromMilliSeconds(100)));
                     }

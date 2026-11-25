@@ -28,7 +28,7 @@ namespace ams::ble::pairing {
     constexpr s64 ConnectRefusedMaxElapsedMs  = 800;
     constexpr s64 ConnectRefusedRetryDelayMs  = 500;
 
-    static Result WaitForConnection(u32 slot, u8 client_if, const bluetooth::Address &address, u32 *out_conn_id, TimeSpan timeout, bool *out_refused_by_stack = nullptr) {
+    static Result WaitForConnection(u32 slot, u8 client_if, const bluetooth::Address &address, u32 *out_conn_id, TimeSpan timeout, bool *out_refused_by_stack = nullptr, bool quiet_probe = false) {
         if (out_refused_by_stack) {
             *out_refused_by_stack = false;
         }
@@ -45,7 +45,9 @@ namespace ams::ble::pairing {
             if (out_refused_by_stack && (e.info.client_connection.result != 0)) {
                 *out_refused_by_stack = true;
             }
-            log::Write("slot %u: connection failed result=%u status=%u", slot, e.info.client_connection.result, e.info.client_connection.status);
+            if (!quiet_probe) {
+                log::Write("slot %u: connection failed result=%u status=%u", slot, e.info.client_connection.result, e.info.client_connection.status);
+            }
             R_THROW(ResultNoConnection());
         }
 
@@ -56,7 +58,10 @@ namespace ams::ble::pairing {
         R_SUCCEED();
     }
 
-    Result Connect(u32 slot, u8 client_if, const bluetooth::Address &address, u32 *out_conn_id, TimeSpan timeout, bool clear_existing_bond, bool allow_refusal_retry) {
+    Result Connect(u32 slot, u8 client_if, const bluetooth::Address &address, u32 *out_conn_id, TimeSpan timeout, bool clear_existing_bond, bool allow_refusal_retry, bool *out_immediate_refusal, bool quiet_probe) {
+        if (out_immediate_refusal) {
+            *out_immediate_refusal = false;
+        }
         events::SetSlotConnecting(slot, address);
         R_UNLESS(events::IsRadioEnabled(), ResultNoConnection());
 
@@ -89,7 +94,7 @@ namespace ams::ble::pairing {
             }
             // Arm the slot after any synchronous cleanup events.
             events::SetSlotConnecting(slot, address);
-        } else {
+        } else if (!quiet_probe) {
             log::Write("slot %u: preserving existing BLE bond record for reconnect", slot);
         }
 
@@ -102,11 +107,13 @@ namespace ams::ble::pairing {
         for (;;) {
             const s64 attempt_started_ms = events::NowMs();
             rc = btdrvConnectGattServer(client_if, address, true, 0);
-            log::Write("btdrvConnectGattServer slot=%u client_if=%u rc=0x%x", slot, client_if, rc.GetValue());
+            if (!quiet_probe || R_FAILED(rc)) {
+                log::Write("btdrvConnectGattServer slot=%u client_if=%u rc=0x%x", slot, client_if, rc.GetValue());
+            }
             R_TRY(rc);
 
             bool refused_by_stack = false;
-            rc = WaitForConnection(slot, client_if, address, out_conn_id, timeout, &refused_by_stack);
+            rc = WaitForConnection(slot, client_if, address, out_conn_id, timeout, &refused_by_stack, quiet_probe);
             if (R_SUCCEEDED(rc)) {
                 break;
             }
@@ -121,12 +128,15 @@ namespace ams::ble::pairing {
             }
 
             const s64 now_ms = events::NowMs();
-            const bool immediate_busy_refusal =
-                allow_refusal_retry &&
+            const bool stack_refused_immediately =
                 ResultNoConnection::Includes(rc) &&
                 refused_by_stack &&
                 ((now_ms - attempt_started_ms) < ConnectRefusedMaxElapsedMs) &&
                 (events::GetSlotDisconnectReason(slot) != 0x003e);
+            if (stack_refused_immediately && out_immediate_refusal) {
+                *out_immediate_refusal = true;
+            }
+            const bool immediate_busy_refusal = allow_refusal_retry && stack_refused_immediately;
             if (!immediate_busy_refusal || (now_ms >= deadline_ms) || !events::IsRadioEnabled()) {
                 break;
             }

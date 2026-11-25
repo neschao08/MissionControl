@@ -7,6 +7,7 @@ static unsigned removes, ext_removes, connects, cancels, bond_cancels, bonds, se
 static u64 connected_at;
 static bool remove_fails, ext_remove_fails, cancel_bond_fails, connect_fails, respond, late_connection, new_bond, bond_fails;
 static int fail_connect_event_once = 0;
+static u16 fail_connect_reason = 0x26;
 static u32 set_encryption_raw_rc;
 static bool set_encryption_emits_bond;
 static bool callback_on_bond_cancel, radio_off_on_bond_cancel;
@@ -43,7 +44,7 @@ Result btdrvConnectGattServer(u8 client, ams::bluetooth::Address addr, bool dire
         rej.info.client_connection.client_if = 3;
         rej.info.client_connection.conn_id = 0;
         rej.info.client_connection.address = Target;
-        rej.info.client_connection.reason = 0x26;
+        rej.info.client_connection.reason = fail_connect_reason;
         events::Schedule(BtdrvBleEventType_ClientConnection, 50, rej);
         return {connect_fails ? 6u : 0u};
     }
@@ -90,6 +91,7 @@ static void Reset() {
     set_encryption_emits_bond = false;
     callback_on_bond_cancel = radio_off_on_bond_cancel = false;
     fail_connect_event_once = 0;
+    fail_connect_reason = 0x26;
     respond = new_bond = true;
 }
 int main() {
@@ -257,12 +259,34 @@ int main() {
     assert(connects == 2 && removes == 1 && cancels == 1 && events::now_ms == 570);
 
     // Direct background probe with allow_refusal_retry=false fails immediately without retry storm
+    // and reports immediate_refusal=true for <800ms non-0x003e stack refusal.
     Reset();
     fail_connect_event_once = 1;
     {
         u32 cid = InvalidConnId;
-        assert(R_FAILED(pairing::Connect(0, 3, Target, &cid, TimeSpan::FromMilliSeconds(1800), false, false)));
-        assert(connects == 1 && cancels == 1 && removes == 0 && events::now_ms == 50);
+        bool immediate_refusal = false;
+        assert(R_FAILED(pairing::Connect(0, 3, Target, &cid, TimeSpan::FromMilliSeconds(1800), false, false, &immediate_refusal, true)));
+        assert(immediate_refusal && connects == 1 && cancels == 1 && removes == 0 && events::now_ms == 50);
+    }
+
+    // Immediate 0x003e disconnect and timeout must NOT be classified as immediate stack refusal.
+    Reset();
+    fail_connect_event_once = 1;
+    fail_connect_reason = 0x003e;
+    {
+        u32 cid = InvalidConnId;
+        bool immediate_refusal = true;
+        assert(R_FAILED(pairing::Connect(0, 3, Target, &cid, TimeSpan::FromMilliSeconds(1800), false, false, &immediate_refusal, true)));
+        assert(!immediate_refusal && connects == 1 && cancels == 1 && events::now_ms == 50);
+    }
+
+    Reset();
+    respond = false;
+    {
+        u32 cid = InvalidConnId;
+        bool immediate_refusal = true;
+        assert(R_FAILED(pairing::Connect(0, 3, Target, &cid, TimeSpan::FromMilliSeconds(1800), false, false, &immediate_refusal, true)));
+        assert(!immediate_refusal && connects == 1 && cancels == 1 && events::now_ms == 2300);
     }
 
     std::cout << "BLE production reconnect/pairing regressions passed\n";

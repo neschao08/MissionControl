@@ -46,6 +46,7 @@ namespace ams::ble::events {
         os::Event g_sleep_prepared_event(os::EventClearMode_ManualClear);
         std::atomic<bool> g_controller_count_changed{false};
         std::atomic<bool> g_quiet_scan_logs{false};
+        std::atomic<bool> g_quiet_probe_logs{false};
         std::atomic<s64> g_classic_activity_tick{0};
         std::atomic<u64> g_input_report_count{0};
         std::atomic<u64> g_slot_input_report_counts[MaxBleControllers] = {};
@@ -95,6 +96,7 @@ namespace ams::ble::events {
         constinit s64 g_inquiry_started_tick = 0;
         constinit u32 g_pairing_window_generation = 0;
         constinit std::atomic<bool> g_notif_table_dirty = false;
+        constinit std::atomic<bool> g_address_cache_reset = false;
 
         constinit Sink g_sink = nullptr;
 
@@ -454,6 +456,7 @@ namespace ams::ble::events {
                 if (!connected && (connection.conn_id == InvalidConnId) && (connection.client_if == InvalidClientIf)) {
                     // Stack-wide BLE teardown/reset (e.g. result=55 status=2 client_if=255 conn_id=0xFFFFFFFF)
                     g_notif_table_dirty.store(true, std::memory_order_release);
+                    g_address_cache_reset.store(true, std::memory_order_release);
                     for (size_t s = 0; s < MaxBleControllers; ++s) {
                         if (g_slots[s].active) {
                             g_slots[s].disconnected = true;
@@ -555,6 +558,7 @@ namespace ams::ble::events {
             if (type == BtdrvEventType_BluetoothCrash) {
                 // btm must receive this event so it performs its normal recovery.
                 // Discard handles from the old stack before accepting new clients.
+                g_address_cache_reset.store(true, std::memory_order_release);
                 g_client_if_count = 0;
                 g_spare_client_if = InvalidClientIf;
                 std::fill(std::begin(g_available_client_ifs), std::end(g_available_client_ifs), InvalidClientIf);
@@ -663,6 +667,10 @@ namespace ams::ble::events {
         g_quiet_scan_logs.store(quiet, std::memory_order_release);
     }
 
+    void SetQuietProbeLogs(bool quiet) {
+        g_quiet_probe_logs.store(quiet, std::memory_order_release);
+    }
+
     void ExpectFilterEvent() {
         std::scoped_lock lk(g_lock);
         ++g_expected_filter_events;
@@ -763,6 +771,10 @@ namespace ams::ble::events {
         return g_notif_table_dirty.exchange(false, std::memory_order_acq_rel);
     }
 
+    bool TakeAddressCacheReset() {
+        return g_address_cache_reset.exchange(false, std::memory_order_acq_rel);
+    }
+
     void SetRadioEnabled(bool enabled) {
         std::scoped_lock lk(g_lock);
         g_power_awake = enabled;
@@ -774,6 +786,7 @@ namespace ams::ble::events {
             g_radio_event.Signal();
         } else {
             g_notif_table_dirty.store(true, std::memory_order_release);
+            g_address_cache_reset.store(true, std::memory_order_release);
             g_radio_enabled = false;
             g_radio_event.Clear();
             g_ring_event.Signal();
@@ -788,6 +801,7 @@ namespace ams::ble::events {
     bool BeginSleep() {
         std::scoped_lock lk(g_lock);
         g_notif_table_dirty.store(true, std::memory_order_release);
+        g_address_cache_reset.store(true, std::memory_order_release);
         g_preparing_sleep = true;
         g_sleep_cleanup_pending = true;
         g_sleep_prepared_event.Clear();
@@ -940,6 +954,12 @@ namespace ams::ble::events {
                 break;
             }
             case BtdrvBleEventType_ClientConnection:
+                if (g_quiet_probe_logs.load(std::memory_order_acquire) &&
+                    (info.client_connection.status != BleConnectionStatus_Connected) &&
+                    ((info.client_connection.conn_id == 0) || (info.client_connection.conn_id == InvalidConnId)) &&
+                    (info.client_connection.reason == 0)) {
+                    break;
+                }
                 log::Write("evt ClientConnection result=%u status=%u client_if=%u conn_id=%u reason=0x%04x", info.client_connection.result, info.client_connection.status, info.client_connection.client_if, info.client_connection.conn_id, info.client_connection.reason);
                 LogAddress("  address", info.client_connection.address);
                 break;

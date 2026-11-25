@@ -1,6 +1,7 @@
 #include "../mc_mitm/source/ble/ble_controller_routes.hpp"
 #include "../mc_mitm/source/controllers/xbox_stick.hpp"
 #include "../mc_mitm/source/ble/ble_recovery.hpp"
+#include "../mc_mitm/source/ble/ble_reconnect_policy.hpp"
 #include <atomic>
 #include <cassert>
 #include <iostream>
@@ -133,8 +134,91 @@ static void TestRecovery() {
     assert(wake.Begin(true, true, true, 0, 274000));
 }
 
+static void TestStadiaReconnectPolicy() {
+    using namespace ams::ble::reconnect;
+    using Tracker = StadiaReconnectTracker<4>;
+    const uint8_t stadia1[6] = {0xcb, 0x4e, 0xc0, 0x96, 0x49, 0x67};
+    const uint8_t stadia2[6] = {0xcb, 0x4e, 0xc0, 0x96, 0x49, 0x68};
+
+    Tracker tracker;
+    tracker.RegisterKnown(stadia1);
+    assert(!tracker.NeedsScanResolution(stadia1));
+    assert(!tracker.ShouldSilenceProbeLog(stadia1));
+
+    // Normal timeout (immediate_stack_refusal=false) stays in quiet direct-probe mode without scan churn.
+    assert(!tracker.NoteProbeAttemptAndResult(stadia1, false, false, false));
+    assert(!tracker.NeedsScanResolution(stadia1));
+    assert(tracker.ShouldSilenceProbeLog(stadia1));
+
+    // Immediate stack refusal during pairing window must NOT trigger background scan resolution.
+    assert(!tracker.NoteProbeAttemptAndResult(stadia1, false, true, true));
+    assert(!tracker.NeedsScanResolution(stadia1));
+
+    // Immediate stack refusal outside pairing window (bt_nso forgot address type after sleep/reboot)
+    // transitions into on-demand background scan mode and schedules immediate first scan.
+    assert(tracker.NoteProbeAttemptAndResult(stadia1, false, true, false));
+    assert(tracker.NeedsScanResolution(stadia1));
+    assert(tracker.HasFirstScanPending());
+    assert(!tracker.ShouldSilenceProbeLog(stadia1));
+    assert(Tracker::ChooseAction(false, true, tracker.HasFirstScanPending(), false, 10000, 10000, 9900) == BgAction::BackgroundScan);
+    assert(tracker.ConsumeFirstScanPending());
+    assert(!tracker.HasFirstScanPending());
+
+    // After first scan completes without finding the pad, adhere to 8s idle / 25s busy scan intervals.
+    assert(Tracker::ChooseAction(false, true, false, false, 17999, 0, 10000) == BgAction::None);
+    assert(Tracker::ChooseAction(false, true, false, false, 18000, 0, 10000) == BgAction::BackgroundScan);
+    assert(Tracker::ChooseAction(false, true, false, true, 34999, 0, 10000) == BgAction::None);
+    assert(Tracker::ChooseAction(false, true, false, true, 35000, 0, 10000) == BgAction::BackgroundScan);
+
+    // Cache reset preserves needs_scan_resolution and arms first_scan_pending; advertisement clears it back to direct probe.
+    tracker.OnAddressCacheReset();
+    assert(tracker.HasFirstScanPending());
+    tracker.NoteAdvertisementSeen(stadia1);
+    assert(!tracker.NeedsScanResolution(stadia1));
+    assert(!tracker.HasFirstScanPending());
+    assert(Tracker::ChooseAction(true, false, false, false, 20000, 18000, 15000) == BgAction::DirectProbe);
+    assert(Tracker::ChooseAction(true, false, false, true, 22499, 18000, 15000) == BgAction::None);
+    assert(Tracker::ChooseAction(true, false, false, true, 22500, 18000, 15000) == BgAction::DirectProbe);
+
+    // Mixed dual-Stadia scheduling: neither scan-needed nor direct-ready controller starves.
+    tracker.RegisterKnown(stadia2);
+    assert(tracker.NoteProbeAttemptAndResult(stadia2, false, true, false));
+    assert(tracker.ConsumeFirstScanPending());
+    assert(Tracker::ChooseAction(true, true, false, false, 15000, 12000, 10000) == BgAction::DirectProbe);
+    assert(Tracker::ChooseAction(true, true, false, false, 18000, 17000, 10000) == BgAction::BackgroundScan);
+
+    // Log silencing counts probes and resets cleanly on connect.
+    assert(!tracker.ShouldSilenceProbeLog(stadia1));
+    assert(!tracker.NoteProbeAttemptAndResult(stadia1, false, false, false));
+    assert(tracker.ShouldSilenceProbeLog(stadia1));
+    assert(!tracker.NoteProbeAttemptAndResult(stadia1, true, false, false));
+    assert(tracker.TakeQuietProbeCount(stadia1) == 2);
+    assert(tracker.TakeQuietProbeCount(stadia1) == 0);
+
+    // Foreground scan stays >= 4300ms even when another controller is connected.
+    assert(ForegroundScanDurationMs(true) == 4500);
+    assert(ForegroundScanDurationMs(false) == 5000);
+    assert(ForegroundScanDurationMs(true) >= 4300);
+
+    // Bond preservation & failure-threshold clearing.
+    assert(ShouldPreserveStadiaBondOnDismiss());
+    assert(!tracker.ShouldClearBondBeforeConnect(stadia1, 0x06));
+    assert(tracker.ShouldClearBondBeforeConnect(stadia1, 0x05));
+    tracker.NoteAuthFailure(stadia1);
+    assert(!tracker.ShouldClearBondBeforeConnect(stadia1, 0x06));
+    tracker.NoteAuthFailure(stadia1);
+    assert(tracker.ShouldClearBondBeforeConnect(stadia1, 0x06));
+    tracker.NoteConnectSuccess(stadia1);
+    assert(!tracker.ShouldClearBondBeforeConnect(stadia1, 0x06));
+
+    // Sleep radio recovery should not arm when only Stadia is attached.
+    assert(!ShouldArmSleepRecovery(false));
+    assert(ShouldArmSleepRecovery(true));
+}
+
 int main() {
     TestRecovery();
+    TestStadiaReconnectPolicy();
     TestRoutes();
     TestSticks();
     std::cout << "BLE recovery, routing/lifetime and Xbox deadzone regressions passed\n";

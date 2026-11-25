@@ -24,7 +24,7 @@ namespace ams::ble::pairing {
         BleSecurityGrant,
     };
 
-    Result Connect(u32 slot, u8 client_if, const bluetooth::Address &address, u32 *out_conn_id, TimeSpan timeout, bool clear_existing_bond = true, bool allow_refusal_retry = true);
+    Result Connect(u32 slot, u8 client_if, const bluetooth::Address &address, u32 *out_conn_id, TimeSpan timeout, bool clear_existing_bond = true, bool allow_refusal_retry = true, bool *out_immediate_refusal = nullptr, bool quiet_probe = false);
     Result ClearPeer(u32 slot, const bluetooth::Address &address);
     // A fresh security indication only permits Subscribe to verify authenticated GATT access.
     bool PrepareSecurity(u32 slot, const bluetooth::Address &address);

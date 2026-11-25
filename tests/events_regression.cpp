@@ -160,11 +160,27 @@ int main() {
     os::g_tick_ms += 13000;
     assert(!events::ClassicActivityWithin(TimeSpan::FromSeconds(12)));
 
-    // Dirty notification table flag: NOT set by single-link disconnects (avoids spurious Unregister=0x25a71),
-    // set only on stack-wide teardown (InvalidConnId/InvalidClientIf) or radio disable (sleep), cleared by ClientRegistration.
+    // Dirty notification table flag:
+    // - Scenario A: failed unconnected probe (conn_id=InvalidConnId, result=26) -> NOT dirty
+    // - Scenario B: disconnect before NoteNotificationRegistered (e.g. Discover 0x003e) -> NOT dirty
+    // - Scenario C: clean disconnect (result=0) on subscribed slot -> NOT dirty
+    // - Scenario D: non-zero disconnect (result=26) on subscribed slot (real v18_live_ble.log L788 bug) -> DIRTY!
     events::TakeNotifTableDirty();
     events::TakeAddressCacheReset();
     events::SetRadioEnabled(true);
+
+    // Scenario A: unconnected probe failure
+    events::SetSlotConnecting(0, stadia_addr);
+    BtdrvBleEventInfo probe_fail{};
+    probe_fail.client_connection.result = 26;
+    probe_fail.client_connection.status = BleConnectionStatus_Disconnected;
+    probe_fail.client_connection.conn_id = InvalidConnId;
+    probe_fail.client_connection.client_if = 6;
+    probe_fail.client_connection.address = stadia_addr;
+    assert(events::OnBleEvent(BtdrvBleEventType_ClientConnection, &probe_fail) == true);
+    assert(events::TakeNotifTableDirty() == false);
+
+    // Scenario B: connected slot not yet subscribed (notif_registered == false)
     events::SetSlotConnection(0, stadia_addr, 888);
     BtdrvBleEventInfo dirty_disc{};
     dirty_disc.client_connection.result = 26;
@@ -172,8 +188,36 @@ int main() {
     dirty_disc.client_connection.conn_id = 888;
     dirty_disc.client_connection.client_if = 6;
     dirty_disc.client_connection.address = stadia_addr;
-    dirty_disc.client_connection.reason = 0x0008;
+    dirty_disc.client_connection.reason = 0x003e;
     assert(events::OnBleEvent(BtdrvBleEventType_ClientConnection, &dirty_disc) == true);
+    assert(events::TakeNotifTableDirty() == false);
+    assert(events::TakeAddressCacheReset() == false);
+
+    // Scenario C: subscribed slot with clean result=0 disconnect
+    events::SetSlotConnection(0, stadia_addr, 889);
+    events::NoteNotificationRegistered(0);
+    BtdrvBleEventInfo clean_disc{};
+    clean_disc.client_connection.result = 0;
+    clean_disc.client_connection.status = BleConnectionStatus_Disconnected;
+    clean_disc.client_connection.conn_id = 889;
+    clean_disc.client_connection.client_if = 6;
+    clean_disc.client_connection.address = stadia_addr;
+    clean_disc.client_connection.reason = 0x0008;
+    assert(events::OnBleEvent(BtdrvBleEventType_ClientConnection, &clean_disc) == true);
+    assert(events::TakeNotifTableDirty() == false);
+
+    // Scenario D: subscribed slot dropped with non-zero result=26 (idle timeout after subscription) -> must arm pre-clean!
+    events::SetSlotConnection(0, stadia_addr, 890);
+    events::NoteNotificationRegistered(0);
+    BtdrvBleEventInfo stale_disc{};
+    stale_disc.client_connection.result = 26;
+    stale_disc.client_connection.status = BleConnectionStatus_Disconnected;
+    stale_disc.client_connection.conn_id = 890;
+    stale_disc.client_connection.client_if = 6;
+    stale_disc.client_connection.address = stadia_addr;
+    stale_disc.client_connection.reason = 0x0008;
+    assert(events::OnBleEvent(BtdrvBleEventType_ClientConnection, &stale_disc) == true);
+    assert(events::TakeNotifTableDirty() == true);
     assert(events::TakeNotifTableDirty() == false);
     assert(events::TakeAddressCacheReset() == false);
 

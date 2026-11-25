@@ -201,4 +201,20 @@ namespace ams::controller::stadia {
         };
     }
 
+    constexpr int64_t MinRumblePulseMs    = 85;  // Light right ERM minimum startup hold (ms)
+    constexpr int64_t MinStrongPulseMs    = 95;  // Heavy 4x left ERM minimum startup hold (ms)
+    constexpr int64_t MaxTransientPulseMs = 135; // Full-strength single transient hold ceiling (ms)
+
+    inline constexpr int64_t ComputeTransientPulseMs(uint16_t strong, uint16_t weak) {
+        if ((strong == 0) && (weak == 0)) {
+            return 0;
+        }
+        const float strong_norm = static_cast<float>(strong) / 65535.0f;
+        const float weak_norm   = static_cast<float>(weak) / 65535.0f;
+        const float intensity   = std::clamp(std::max(strong_norm, weak_norm * 0.85f), 0.0f, 1.0f);
+        const float base_ms     = (strong > 0) ? static_cast<float>(MinStrongPulseMs) : static_cast<float>(MinRumblePulseMs);
+        const float span_ms     = static_cast<float>(MaxTransientPulseMs) - base_ms;
+        return static_cast<int64_t>(base_ms + intensity * span_ms + 0.5f);
+    }
+
 }

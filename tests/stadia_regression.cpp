@@ -120,6 +120,18 @@ int main() {
         const uint8_t norm_pkt[8] = {0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40};
         assert(IsFindControllerMotorBytes(find_pkt));
         assert(!IsFindControllerMotorBytes(norm_pkt));
+
+        // Intensity-scaled transient pulse duration (85..135ms)
+        assert(ComputeTransientPulseMs(0, 0) == 0);
+        const int64_t p_light_w = ComputeTransientPulseMs(0, 0x0800);
+        const int64_t p_light_s = ComputeTransientPulseMs(0x0800, 0);
+        const int64_t p_conn    = ComputeTransientPulseMs(0xAA93, 0);
+        const int64_t p_max     = ComputeTransientPulseMs(0xFFFF, 0xFFFF);
+        assert(p_light_w >= 85 && p_light_w <= 90);
+        assert(p_light_s >= 95 && p_light_s <= 98);
+        assert(p_conn >= 120 && p_conn <= 124);
+        assert(p_max == 135);
+        assert(p_light_w < p_light_s && p_light_s < p_conn && p_conn < p_max);
     }
 
     std::cout << "Stadia BLE input report mapping regressions passed\n";

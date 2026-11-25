@@ -244,7 +244,8 @@ namespace ams::controller {
             m_rumble_min_stop_tick = 0;
             m_rumble_expire_tick = 0;
         } else if (was_stopped) {
-            m_rumble_min_stop_tick = now_tick + os::ConvertToTick(TimeSpan::FromMilliSeconds(45)).GetInt64Value();
+            const s64 pulse_ms = stadia::ComputeTransientPulseMs(strong, weak);
+            m_rumble_min_stop_tick = now_tick + os::ConvertToTick(TimeSpan::FromMilliSeconds(pulse_ms)).GetInt64Value();
         }
 
         m_sent_rumble_strong = strong;
@@ -299,10 +300,11 @@ namespace ams::controller {
 
         // Single-packet transient kick (non-zero peak followed immediately by silent tail in the same packet).
         if ((sustained_strong == 0) && (sustained_weak == 0)) {
+            const s64 pulse_ms = stadia::ComputeTransientPulseMs(peak_strong, peak_weak);
             if (in_flight || (elapsed_time.GetNanoSeconds() < this->GetMinRumbleIntervalNs())) {
                 m_desired_rumble_strong = peak_strong;
                 m_desired_rumble_weak   = peak_weak;
-                m_rumble_expire_tick    = now_tick + os::ConvertToTick(TimeSpan::FromMilliSeconds(60)).GetInt64Value();
+                m_rumble_expire_tick    = now_tick + os::ConvertToTick(TimeSpan::FromMilliSeconds(pulse_ms + 40)).GetInt64Value();
                 m_rumble_pending        = true;
                 ble::events::WakeHostLoop();
                 R_SUCCEED();
@@ -312,14 +314,15 @@ namespace ams::controller {
             m_desired_rumble_weak   = peak_weak;
             const Result rc = this->TryWriteRumbleLocked(peak_strong, peak_weak, now_tick);
             if (R_FAILED(rc)) {
-                m_rumble_expire_tick = now_tick + os::ConvertToTick(TimeSpan::FromMilliSeconds(90)).GetInt64Value();
+                m_rumble_expire_tick = now_tick + os::ConvertToTick(TimeSpan::FromMilliSeconds(pulse_ms + 50)).GetInt64Value();
                 R_RETURN(rc);
             }
 
-            // Crisp cutoff: schedule zero stop right after the 45ms minimum kick window.
+            // Crisp cutoff: schedule zero stop after the intensity-scaled ERM pulse window (85..135ms).
+            const s64 stop_tick = now_tick + os::ConvertToTick(TimeSpan::FromMilliSeconds(pulse_ms)).GetInt64Value();
             m_desired_rumble_strong = 0;
             m_desired_rumble_weak   = 0;
-            m_rumble_min_stop_tick  = now_tick + os::ConvertToTick(TimeSpan::FromMilliSeconds(45)).GetInt64Value();
+            m_rumble_min_stop_tick  = std::max(m_rumble_min_stop_tick, stop_tick);
             m_rumble_expire_tick    = m_rumble_min_stop_tick;
             m_rumble_pending        = true;
             ble::events::WakeHostLoop();
@@ -416,7 +419,7 @@ namespace ams::controller {
             R_RETURN(this->ApplyRumbleTargetLocked(peak.strong, peak.weak, sustained.strong, sustained.weak, 600));
         }
 
-        // PacketType == 0: keep alive held rumble or flush scheduled 45ms transient cutoff.
+        // PacketType == 0: keep alive held rumble or flush scheduled 85..135ms transient cutoff.
         if (m_find_controller_active) {
             R_RETURN(this->ApplyRumbleTargetLocked(0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 800));
         }

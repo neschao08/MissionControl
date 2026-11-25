@@ -474,6 +474,7 @@ namespace ams::ble::gatt {
             Result rc = btdrvRegisterGattNotification(conn_id, service.is_primary, &service.id, &attr.id);
             log::Write("btdrvRegisterGattNotification slot=%u handle=0x%04x rc=0x%x", slot_index, attr.handle, rc.GetValue());
             R_TRY(rc);
+            events::NoteNotificationRegistered(slot_index);
 
             // NOTE: Never pre-write CCCD=0x0000 on Stadia! Real hardware (ble_v7_test1.log) proved
             // writing 0x0000 -> 0x0001 silences Stadia HID Input Report notifications completely;

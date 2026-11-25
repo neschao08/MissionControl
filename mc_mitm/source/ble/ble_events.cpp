@@ -75,6 +75,7 @@ namespace ams::ble::events {
             bool disconnected = false;
             u16 disconnect_reason = 0;
             bool bond_complete = false;
+            bool notif_registered = false;
             u32 gatt_failure = 0;
         };
 
@@ -209,6 +210,7 @@ namespace ams::ble::events {
         g_slots[slot].disconnected = false;
         g_slots[slot].disconnect_reason = 0;
         g_slots[slot].bond_complete = false;
+        g_slots[slot].notif_registered = false;
         g_slots[slot].gatt_failure = 0;
         g_slot_input_report_counts[slot].store(0, std::memory_order_release);
         g_slot_rumble_ack_logs[slot].store(0, std::memory_order_release);
@@ -473,6 +475,16 @@ namespace ams::ble::events {
 
                     if (slot != InvalidSlot) {
                         if (!connected && ((g_slots[slot].conn_id == InvalidConnId) || (connection.conn_id == g_slots[slot].conn_id))) {
+                            if ((g_slots[slot].conn_id != InvalidConnId) &&
+                                (connection.conn_id == g_slots[slot].conn_id) &&
+                                (connection.result != 0) &&
+                                g_slots[slot].notif_registered) {
+                                // Active subscribed link dropped with non-zero result (e.g. result=25/26 timeout on conn_id=6):
+                                // bt_nso (0x2c26c) skips BSA_GattcDeregisterNotification, leaving a stale g_gatt_manager entry
+                                // that turns the next btdrvRegisterGattNotification into a silent no-op unless pre-cleaned.
+                                g_notif_table_dirty.store(true, std::memory_order_release);
+                            }
+                            g_slots[slot].notif_registered = false;
                             g_slots[slot].disconnected = true;
                             g_slots[slot].disconnect_reason = connection.reason;
                             UnregisterSlotController(slot);
@@ -765,6 +777,13 @@ namespace ams::ble::events {
 
     s64 NowMs() {
         return os::GetSystemTick().ToTimeSpan().GetMilliSeconds();
+    }
+
+    void NoteNotificationRegistered(u32 slot_index) {
+        std::scoped_lock lk(g_lock);
+        if ((slot_index < MaxBleControllers) && g_slots[slot_index].active) {
+            g_slots[slot_index].notif_registered = true;
+        }
     }
 
     bool TakeNotifTableDirty() {

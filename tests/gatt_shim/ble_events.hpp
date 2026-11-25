@@ -15,6 +15,7 @@ inline void Schedule(const EventRecord &event, u64 delay_ms = 0) {
 }
 inline bool IsSlotDisconnected(u32) { return disconnected; }
 inline bool notif_dirty = false;
+inline void NoteNotificationRegistered(u32) {}
 inline bool TakeNotifTableDirty() { const bool v = notif_dirty; notif_dirty = false; return v; }
 inline bool IsRadioEnabled() { return radio; }
 inline u32 GetGattFailure(u32) { return failure; }

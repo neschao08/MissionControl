@@ -62,6 +62,7 @@ namespace ams::ble::events {
     inline s64 NowMs() { return static_cast<s64>(now_ms); }
     inline bool IsRadioEnabled() { return radio; }
     inline bool notif_dirty = false;
+    inline void NoteNotificationRegistered(u32) {}
     inline bool TakeNotifTableDirty() { const bool v = notif_dirty; notif_dirty = false; return v; }
     inline bool IsSlotDisconnected(u32 slot) { return slot >= MaxBleControllers || slots[slot].disconnected; }
     inline u32 GetSlotConnectionId(u32 slot) {

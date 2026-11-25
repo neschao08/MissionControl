@@ -111,7 +111,7 @@ int main() {
         ctrl_t.OnRumbleWriteComplete(0);
 
         // Transient GATT BUSY (0x2a671) on non-stop update backs off m_last_rumble_tick
-        os::g_now_ms += 60;
+        os::g_now_ms += 80;
         g_write_rc = 0x2a671;
         motor.left_motor.low_band_amp = 0.6f;
         assert(ctrl_t.TestSetVibration(&motor).value == 0x2a671);
@@ -228,7 +228,7 @@ int main() {
         assert(g_writes.size() == 1 && g_writes[0].payload == std::vector<u8>({0, 0, 0, 0}));
     }
 
-    // 5. Real-world v15/v18 HOS pairing rumble trace (6ms start->stop collision), MinPulse 45ms, 0x2a671 retry, 200ms watchdog, and 33Hz held-state heartbeat
+    // 5. Real-world v15/v19 HOS pairing rumble trace (6ms start->stop collision), dynamic MinPulse (122ms for 0.5572), 0x2a671 retry, 200ms watchdog, and 33Hz held-state heartbeat
     {
         g_writes.clear(); g_write_rc = 0;
         controller::g_connected_controllers = 1;
@@ -238,7 +238,7 @@ int main() {
 
         StadiaBleController ctrl_rt(addr, 6, svc_id, true, out_id, true, true, BtdrvGattAuthReqType_None);
 
-        // 5a. Connect pulse: t=0 start (low_band_amp ~0.5572) -> t=6ms STOP arrives while in-flight!
+        // 5a. Connect pulse: t=0 start (low_band_amp ~0.5572 -> ~122ms pulse) -> t=6ms STOP arrives while in-flight!
         SwitchMotorData motor_on{};
         motor_on.left_motor.low_band_amp = 0.5572f;
         SwitchMotorData motor_off{};
@@ -249,16 +249,16 @@ int main() {
         assert(R_SUCCEEDED(ctrl_rt.TestSetVibration(&motor_off)));
         assert(g_writes.size() == 1); // Did NOT collide with 0x2a671!
 
-        os::g_now_ms += 9; // t=10015: ATT ack #1 arrives, but < 45ms minimum pulse so motor stays running briefly
+        os::g_now_ms += 9; // t=10015: ATT ack #1 arrives, but < 122ms pulse so motor stays running briefly
         ctrl_rt.OnRumbleWriteComplete(0);
         ctrl_rt.ServiceBleTasks();
         assert(g_writes.size() == 1);
 
-        os::g_now_ms += 20; // t=10035 (< 45ms): still running
+        os::g_now_ms += 85; // t=10100 (< 122ms): still running
         ctrl_rt.ServiceBleTasks();
         assert(g_writes.size() == 1);
 
-        os::g_now_ms += 10; // t=10045 (== 45ms): minimum pulse elapsed -> ServiceBleTasks() delivers STOP!
+        os::g_now_ms += 22; // t=10122 (== 122ms): intensity-scaled pulse elapsed -> ServiceBleTasks() delivers STOP!
         ctrl_rt.ServiceBleTasks();
         assert(g_writes.size() == 2);
         assert(g_writes[1].payload == std::vector<u8>({0, 0, 0, 0}));
@@ -270,7 +270,7 @@ int main() {
         assert(R_SUCCEEDED(ctrl_rt.TestSetVibration(&motor_on)));
         assert(g_writes.size() == 1);
         ctrl_rt.OnRumbleWriteComplete(0);
-        os::g_now_ms += 80; // past 65ms
+        os::g_now_ms += 130; // past 122ms pulse
         g_write_rc = 0x2a671;
         assert(ctrl_rt.TestSetVibration(&motor_off).value == 0x2a671);
         assert(g_writes.size() == 2);
@@ -394,20 +394,42 @@ int main() {
         assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&game_enc, &mario_buzz, &mario_buzz, true)));
         assert(g_writes.empty());
 
-        // 6c. Single-packet transient kick (peak 0.5572, sustained 0) -> crisp 45ms auto-stop via PacketType=0
+        // 6c. Intensity-scaled transient kicks: light (~88ms) vs strong connect (~122ms)
+        g_writes.clear();
+        os::g_now_ms = 42000;
+        SwitchMotorData light_peak{};
+        light_peak.right_motor.high_band_amp = 0.12f;
+        SwitchMotorData silent{};
+        assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&game_enc, &light_peak, &silent, true)));
+        assert(g_writes.size() == 1);
+        assert(g_writes[0].payload[0] == 0 && g_writes[0].payload[1] == 0);
+        assert(g_writes[0].payload[2] != 0 || g_writes[0].payload[3] != 0);
+        ctrl_v18.OnRumbleWriteComplete(0);
+
+        os::g_now_ms += 75; // < ~88ms
+        assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&keepalive_enc, &silent, &silent, false)));
+        assert(g_writes.size() == 1);
+
+        os::g_now_ms += 15; // 90ms >= 88ms
+        assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&keepalive_enc, &silent, &silent, false)));
+        assert(g_writes.size() == 2);
+        assert(g_writes[1].payload == std::vector<u8>({0x00, 0x00, 0x00, 0x00}));
+        ctrl_v18.OnRumbleWriteComplete(0);
+
+        g_writes.clear();
+        os::g_now_ms = 44000;
         SwitchMotorData kick_peak{};
         kick_peak.left_motor.low_band_amp = 0.5572f;
-        SwitchMotorData silent{};
         assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&game_enc, &kick_peak, &silent, true)));
         assert(g_writes.size() == 1);
         assert(g_writes[0].payload[0] != 0 || g_writes[0].payload[1] != 0);
         ctrl_v18.OnRumbleWriteComplete(0);
 
-        os::g_now_ms += 30;
+        os::g_now_ms += 105; // < 122ms (stronger kick lasts longer than light tap!)
         assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&keepalive_enc, &silent, &silent, false)));
-        assert(g_writes.size() == 1); // < 45ms: kick still spinning
+        assert(g_writes.size() == 1);
 
-        os::g_now_ms += 15; // == 45ms
+        os::g_now_ms += 17; // == 122ms
         assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&keepalive_enc, &silent, &silent, false)));
         assert(g_writes.size() == 2);
         assert(g_writes[1].payload == std::vector<u8>({0x00, 0x00, 0x00, 0x00}));

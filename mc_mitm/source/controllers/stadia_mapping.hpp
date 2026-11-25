@@ -141,7 +141,7 @@ namespace ams::controller::stadia {
     // Stadia BLE firmware (bruce_pvt_a_prod_signed.bin) already applies minimum startup PWM
     // lifts (left ~60%, right ~50%) and battery-voltage compensation to any non-zero duty,
     // and drives asymmetric ERMs (left 4x heavy low-RPM, right light high-RPM).
-    constexpr float WeakNoiseGate        = 0.07f;  // Filter <7% HD rumble audio/texture micro-buzz
+    constexpr float WeakNoiseGate        = 0.035f; // Filter <3.5% HD rumble audio micro-buzz while keeping light game taps
     constexpr float WeakFullScaleAmp     = 0.85f;
     constexpr float StrongNoiseGate      = 0.16f;  // Engage heavy 4x left ERM only on real >=16% hits
     constexpr float StrongFullScaleAmp   = 0.80f;
@@ -166,8 +166,14 @@ namespace ams::controller::stadia {
             return 0;
         }
         const float t = std::clamp((clamped - gate) / (full - gate), 0.0f, 1.0f);
-        const float shaped = strong_motor ? std::pow(t, 0.85f) : t;
-        return static_cast<uint16_t>(1.0f + shaped * 65534.0f + 0.5f);
+        if (strong_motor) {
+            const float shaped = std::pow(t, 0.85f);
+            return static_cast<uint16_t>(1.0f + shaped * 65534.0f + 0.5f);
+        }
+        // Give light right ERM a tangible minimum kick (0x2800 ~= 15%) so light game taps are clearly felt.
+        constexpr float WeakMinKick = 0.15f;
+        const float shaped = WeakMinKick + (1.0f - WeakMinKick) * std::pow(t, 0.70f);
+        return static_cast<uint16_t>(shaped * 65535.0f + 0.5f);
     }
 
     inline StadiaRumbleMagnitudes MapSwitchRumbleToStadia(
@@ -201,9 +207,10 @@ namespace ams::controller::stadia {
         };
     }
 
-    constexpr int64_t MinRumblePulseMs    = 85;  // Light right ERM minimum startup hold (ms)
-    constexpr int64_t MinStrongPulseMs    = 95;  // Heavy 4x left ERM minimum startup hold (ms)
-    constexpr int64_t MaxTransientPulseMs = 135; // Full-strength single transient hold ceiling (ms)
+    constexpr int64_t ErmSpinUpOverheadMs = 40;  // Extra ERM rotor spin-up/spin-down compensation (ms)
+    constexpr int64_t MinRumblePulseMs    = 85 + ErmSpinUpOverheadMs;  // Light right ERM minimum hold (125ms)
+    constexpr int64_t MinStrongPulseMs    = 95 + ErmSpinUpOverheadMs;  // Heavy 4x left ERM minimum hold (135ms)
+    constexpr int64_t MaxTransientPulseMs = 135 + ErmSpinUpOverheadMs; // Full-strength single transient ceiling (175ms)
 
     inline constexpr int64_t ComputeTransientPulseMs(uint16_t strong, uint16_t weak) {
         if ((strong == 0) && (weak == 0)) {

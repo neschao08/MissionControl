@@ -83,11 +83,12 @@ int main() {
         assert(MapRumbleMagnitude(0.0f, false) == 0);
         assert(MapRumbleMagnitude(-0.5f, true) == 0);
 
-        // Mario Wonder tiny note/footstep vibrations (0.85%, 1.56%, 2.63%, 5%) must stay completely silent
+        // Mario Wonder tiny note/footstep vibrations (0.85%, 1.56%, 2.63%) must stay completely silent,
+        // while light 5% game taps now wake the right ERM with a tangible kick.
         assert(MapRumbleMagnitude(0.0085f, false) == 0);
         assert(MapRumbleMagnitude(0.0156f, false) == 0);
         assert(MapRumbleMagnitude(0.0263f, false) == 0);
-        assert(MapRumbleMagnitude(0.0500f, false) == 0);
+        assert(MapRumbleMagnitude(0.0500f, false) >= 0x2800);
         assert(MapRumbleMagnitude(0.1200f, true) == 0);
 
         const uint16_t s_low  = MapRumbleMagnitude(0.20f, true);
@@ -121,16 +122,16 @@ int main() {
         assert(IsFindControllerMotorBytes(find_pkt));
         assert(!IsFindControllerMotorBytes(norm_pkt));
 
-        // Intensity-scaled transient pulse duration (85..135ms)
+        // Intensity-scaled transient pulse duration (125..175ms including 40ms ERM spin-up overhead)
         assert(ComputeTransientPulseMs(0, 0) == 0);
         const int64_t p_light_w = ComputeTransientPulseMs(0, 0x0800);
         const int64_t p_light_s = ComputeTransientPulseMs(0x0800, 0);
         const int64_t p_conn    = ComputeTransientPulseMs(0xAA93, 0);
         const int64_t p_max     = ComputeTransientPulseMs(0xFFFF, 0xFFFF);
-        assert(p_light_w >= 85 && p_light_w <= 90);
-        assert(p_light_s >= 95 && p_light_s <= 98);
-        assert(p_conn >= 120 && p_conn <= 124);
-        assert(p_max == 135);
+        assert(p_light_w >= 125 && p_light_w <= 130);
+        assert(p_light_s >= 135 && p_light_s <= 138);
+        assert(p_conn >= 160 && p_conn <= 164);
+        assert(p_max == 175);
         assert(p_light_w < p_light_s && p_light_s < p_conn && p_conn < p_max);
     }
 

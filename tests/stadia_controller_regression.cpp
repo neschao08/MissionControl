@@ -111,7 +111,7 @@ int main() {
         ctrl_t.OnRumbleWriteComplete(0);
 
         // Transient GATT BUSY (0x2a671) on non-stop update backs off m_last_rumble_tick
-        os::g_now_ms += 80;
+        os::g_now_ms += 120;
         g_write_rc = 0x2a671;
         motor.left_motor.low_band_amp = 0.6f;
         assert(ctrl_t.TestSetVibration(&motor).value == 0x2a671);
@@ -254,11 +254,11 @@ int main() {
         ctrl_rt.ServiceBleTasks();
         assert(g_writes.size() == 1);
 
-        os::g_now_ms += 85; // t=10100 (< 122ms): still running
+        os::g_now_ms += 125; // t=10140 (< 162ms): still running
         ctrl_rt.ServiceBleTasks();
         assert(g_writes.size() == 1);
 
-        os::g_now_ms += 22; // t=10122 (== 122ms): intensity-scaled pulse elapsed -> ServiceBleTasks() delivers STOP!
+        os::g_now_ms += 22; // t=10162 (== 162ms): intensity-scaled pulse elapsed -> ServiceBleTasks() delivers STOP!
         ctrl_rt.ServiceBleTasks();
         assert(g_writes.size() == 2);
         assert(g_writes[1].payload == std::vector<u8>({0, 0, 0, 0}));
@@ -270,7 +270,7 @@ int main() {
         assert(R_SUCCEEDED(ctrl_rt.TestSetVibration(&motor_on)));
         assert(g_writes.size() == 1);
         ctrl_rt.OnRumbleWriteComplete(0);
-        os::g_now_ms += 130; // past 122ms pulse
+        os::g_now_ms += 170; // past 162ms pulse
         g_write_rc = 0x2a671;
         assert(ctrl_rt.TestSetVibration(&motor_off).value == 0x2a671);
         assert(g_writes.size() == 2);
@@ -406,11 +406,11 @@ int main() {
         assert(g_writes[0].payload[2] != 0 || g_writes[0].payload[3] != 0);
         ctrl_v18.OnRumbleWriteComplete(0);
 
-        os::g_now_ms += 75; // < ~88ms
+        os::g_now_ms += 115; // < ~134ms
         assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&keepalive_enc, &silent, &silent, false)));
         assert(g_writes.size() == 1);
 
-        os::g_now_ms += 15; // 90ms >= 88ms
+        os::g_now_ms += 25; // 140ms >= 134ms
         assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&keepalive_enc, &silent, &silent, false)));
         assert(g_writes.size() == 2);
         assert(g_writes[1].payload == std::vector<u8>({0x00, 0x00, 0x00, 0x00}));
@@ -425,11 +425,11 @@ int main() {
         assert(g_writes[0].payload[0] != 0 || g_writes[0].payload[1] != 0);
         ctrl_v18.OnRumbleWriteComplete(0);
 
-        os::g_now_ms += 105; // < 122ms (stronger kick lasts longer than light tap!)
+        os::g_now_ms += 145; // < 162ms (stronger kick lasts longer than light tap!)
         assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&keepalive_enc, &silent, &silent, false)));
         assert(g_writes.size() == 1);
 
-        os::g_now_ms += 17; // == 122ms
+        os::g_now_ms += 17; // == 162ms
         assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&keepalive_enc, &silent, &silent, false)));
         assert(g_writes.size() == 2);
         assert(g_writes[1].payload == std::vector<u8>({0x00, 0x00, 0x00, 0x00}));

@@ -141,10 +141,10 @@ namespace ams::controller::stadia {
     // Stadia BLE firmware (bruce_pvt_a_prod_signed.bin) already applies minimum startup PWM
     // lifts (left ~60%, right ~50%) and battery-voltage compensation to any non-zero duty,
     // and drives asymmetric ERMs (left 4x heavy low-RPM, right light high-RPM).
-    constexpr float WeakNoiseGate        = 0.035f; // Filter <3.5% HD rumble audio micro-buzz while keeping light game taps
-    constexpr float WeakFullScaleAmp     = 0.85f;
-    constexpr float StrongNoiseGate      = 0.16f;  // Engage heavy 4x left ERM only on real >=16% hits
-    constexpr float StrongFullScaleAmp   = 0.80f;
+    constexpr float WeakNoiseGate        = 0.018f; // Filter <1.8% audio/footstep buzz (0.5%~1.5%), keep real >=2.2% light taps
+    constexpr float WeakFullScaleAmp     = 0.50f;  // ~2x effective gain for nimble light right ERM
+    constexpr float StrongNoiseGate      = 0.12f;  // Engage heavy 4x left ERM on >=12% medium-heavy impacts, cut echo tail cleanly
+    constexpr float StrongFullScaleAmp   = 0.65f;  // ~1.5x effective gain for heavy left ERM
     constexpr float LowToWeakSplitFreqHz = 215.0f; // Route brisk >=215Hz low-band taps to nimble right ERM
     constexpr float StrongMaxFreqHz      = 240.0f; // Avoid spinning heavy left ERM above 240Hz
 
@@ -167,12 +167,13 @@ namespace ams::controller::stadia {
         }
         const float t = std::clamp((clamped - gate) / (full - gate), 0.0f, 1.0f);
         if (strong_motor) {
-            const float shaped = std::pow(t, 0.85f);
-            return static_cast<uint16_t>(1.0f + shaped * 65534.0f + 0.5f);
+            constexpr float StrongMinKick = 0.125f; // ~0x2000 (firmware ~65% PWM)
+            const float shaped = StrongMinKick + (1.0f - StrongMinKick) * std::pow(t, 0.65f);
+            return static_cast<uint16_t>(shaped * 65535.0f + 0.5f);
         }
-        // Give light right ERM a tangible minimum kick (0x2800 ~= 15%) so light game taps are clearly felt.
-        constexpr float WeakMinKick = 0.15f;
-        const float shaped = WeakMinKick + (1.0f - WeakMinKick) * std::pow(t, 0.70f);
+        // Light right ERM needs ~0.25 floor (0x4000, firmware 62.5% PWM) + sqrt curve so 2.2%~5% Switch taps feel crisp.
+        constexpr float WeakMinKick = 0.25f;
+        const float shaped = WeakMinKick + (1.0f - WeakMinKick) * std::sqrt(t);
         return static_cast<uint16_t>(shaped * 65535.0f + 0.5f);
     }
 
@@ -190,7 +191,7 @@ namespace ams::controller::stadia {
 
         float effective_weak = hi_amp;
         if ((lo_amp >= WeakNoiseGate) && ((lo_amp < StrongNoiseGate) || (lo_freq >= LowToWeakSplitFreqHz))) {
-            effective_weak = std::max(effective_weak, lo_amp * 0.85f);
+            effective_weak = std::max(effective_weak, lo_amp);
         }
 
         float effective_strong = 0.0f;
@@ -207,10 +208,10 @@ namespace ams::controller::stadia {
         };
     }
 
-    constexpr int64_t ErmSpinUpOverheadMs = 40;  // Extra ERM rotor spin-up/spin-down compensation (ms)
-    constexpr int64_t MinRumblePulseMs    = 85 + ErmSpinUpOverheadMs;  // Light right ERM minimum hold (125ms)
-    constexpr int64_t MinStrongPulseMs    = 95 + ErmSpinUpOverheadMs;  // Heavy 4x left ERM minimum hold (135ms)
-    constexpr int64_t MaxTransientPulseMs = 135 + ErmSpinUpOverheadMs; // Full-strength single transient ceiling (175ms)
+    constexpr int64_t ErmSpinUpOverheadMs = 25;  // Extra ERM rotor spin-up/spin-down compensation (ms)
+    constexpr int64_t MinRumblePulseMs    = 85 + ErmSpinUpOverheadMs;  // Light right ERM minimum hold (110ms)
+    constexpr int64_t MinStrongPulseMs    = 95 + ErmSpinUpOverheadMs;  // Heavy 4x left ERM minimum hold (120ms)
+    constexpr int64_t MaxTransientPulseMs = 135 + ErmSpinUpOverheadMs; // Full-strength single transient ceiling (160ms)
 
     inline constexpr int64_t ComputeTransientPulseMs(uint16_t strong, uint16_t weak) {
         if ((strong == 0) && (weak == 0)) {

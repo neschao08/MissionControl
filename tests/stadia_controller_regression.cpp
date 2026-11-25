@@ -84,7 +84,7 @@ int main() {
         // ATT error on rumble write auto-escalates auth None -> NoMitm, then WithRsp -> NoRsp
         ctrl.OnRumbleWriteComplete(5);
         os::g_now_ms += 60;
-        motor.left_motor.low_band_amp = 0.4f;
+        motor.left_motor.low_band_amp = 0.30f;
         assert(R_SUCCEEDED(ctrl.TestSetVibration(&motor)));
         assert(g_writes.size() == 2);
         assert(g_writes[1].auth_req == BtdrvGattAuthReqType_NoMitm && g_writes[1].with_response == true);
@@ -101,7 +101,7 @@ int main() {
 
         // Write-With-Response throttle: 24ms is throttled (< 36ms), 36ms passes!
         os::g_now_ms += 24;
-        motor.left_motor.low_band_amp = 0.5f;
+        motor.left_motor.low_band_amp = 0.30f;
         assert(R_SUCCEEDED(ctrl_t.TestSetVibration(&motor)));
         assert(g_writes.size() == 1); // Throttled!
 
@@ -113,7 +113,7 @@ int main() {
         // Transient GATT BUSY (0x2a671) on non-stop update backs off m_last_rumble_tick
         os::g_now_ms += 120;
         g_write_rc = 0x2a671;
-        motor.left_motor.low_band_amp = 0.6f;
+        motor.left_motor.low_band_amp = 0.40f;
         assert(ctrl_t.TestSetVibration(&motor).value == 0x2a671);
         assert(g_writes.size() == 3);
         // 16ms later: backed off, does NOT hammer GATT channel immediately
@@ -168,13 +168,13 @@ int main() {
         os::g_now_ms = 5000;
         StadiaBleController ctrl_nomitm(addr, 515, svc_id, true, out_id, true, false, BtdrvGattAuthReqType_NoMitm);
         SwitchMotorData motor{};
-        motor.left_motor.low_band_amp = 0.5f;
+        motor.left_motor.low_band_amp = 0.30f;
         assert(R_SUCCEEDED(ctrl_nomitm.TestSetVibration(&motor)));
         assert(g_writes.size() == 1 && g_writes[0].auth_req == BtdrvGattAuthReqType_NoMitm && g_writes[0].with_response == false);
 
         // WriteNoResponse uses 32ms interval
         os::g_now_ms += 32;
-        motor.left_motor.low_band_amp = 0.7f;
+        motor.left_motor.low_band_amp = 0.50f;
         assert(R_SUCCEEDED(ctrl_nomitm.TestSetVibration(&motor)));
         assert(g_writes.size() == 2);
 
@@ -249,16 +249,16 @@ int main() {
         assert(R_SUCCEEDED(ctrl_rt.TestSetVibration(&motor_off)));
         assert(g_writes.size() == 1); // Did NOT collide with 0x2a671!
 
-        os::g_now_ms += 9; // t=10015: ATT ack #1 arrives, but < 122ms pulse so motor stays running briefly
+        os::g_now_ms += 9; // t=10015: ATT ack #1 arrives, but < 156ms pulse so motor stays running briefly
         ctrl_rt.OnRumbleWriteComplete(0);
         ctrl_rt.ServiceBleTasks();
         assert(g_writes.size() == 1);
 
-        os::g_now_ms += 125; // t=10140 (< 162ms): still running
+        os::g_now_ms += 120; // t=10135 (< 156ms): still running
         ctrl_rt.ServiceBleTasks();
         assert(g_writes.size() == 1);
 
-        os::g_now_ms += 22; // t=10162 (== 162ms): intensity-scaled pulse elapsed -> ServiceBleTasks() delivers STOP!
+        os::g_now_ms += 21; // t=10156 (== 156ms): intensity-scaled pulse elapsed -> ServiceBleTasks() delivers STOP!
         ctrl_rt.ServiceBleTasks();
         assert(g_writes.size() == 2);
         assert(g_writes[1].payload == std::vector<u8>({0, 0, 0, 0}));
@@ -270,7 +270,7 @@ int main() {
         assert(R_SUCCEEDED(ctrl_rt.TestSetVibration(&motor_on)));
         assert(g_writes.size() == 1);
         ctrl_rt.OnRumbleWriteComplete(0);
-        os::g_now_ms += 170; // past 162ms pulse
+        os::g_now_ms += 170; // past 156ms pulse
         g_write_rc = 0x2a671;
         assert(ctrl_rt.TestSetVibration(&motor_off).value == 0x2a671);
         assert(g_writes.size() == 2);
@@ -384,33 +384,33 @@ int main() {
         assert(g_writes[3].payload == std::vector<u8>({0x00, 0x00, 0x00, 0x00}));
         ctrl_v18.OnRumbleWriteComplete(0);
 
-        // 6b. Mario Wonder micro-buzz (0.85% low, 2.63% high) -> completely gated (0 BLE writes)
+        // 6b. Mario Wonder footstep/ambient micro-buzz (0.85% low, 1.56% high < 1.8%) -> completely gated (0 BLE writes)
         g_writes.clear();
         os::g_now_ms = 40000;
         const SwitchEncodedMotorData game_enc = {{0x01, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00, 0x40}};
         SwitchMotorData mario_buzz{};
         mario_buzz.left_motor.low_band_amp = 0.0085f;
-        mario_buzz.right_motor.high_band_amp = 0.0263f;
+        mario_buzz.right_motor.high_band_amp = 0.0156f;
         assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&game_enc, &mario_buzz, &mario_buzz, true)));
         assert(g_writes.empty());
 
-        // 6c. Intensity-scaled transient kicks: light (~88ms) vs strong connect (~122ms)
+        // 6c. Intensity-scaled transient kicks: light 4% tap (~127ms) vs strong connect (~156ms)
         g_writes.clear();
         os::g_now_ms = 42000;
         SwitchMotorData light_peak{};
-        light_peak.right_motor.high_band_amp = 0.12f;
+        light_peak.right_motor.high_band_amp = 0.04f;
         SwitchMotorData silent{};
         assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&game_enc, &light_peak, &silent, true)));
         assert(g_writes.size() == 1);
         assert(g_writes[0].payload[0] == 0 && g_writes[0].payload[1] == 0);
-        assert(g_writes[0].payload[2] != 0 || g_writes[0].payload[3] != 0);
+        assert((g_writes[0].payload[2] | (g_writes[0].payload[3] << 8)) >= 0x6800);
         ctrl_v18.OnRumbleWriteComplete(0);
 
-        os::g_now_ms += 115; // < ~134ms
+        os::g_now_ms += 115; // < ~127ms
         assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&keepalive_enc, &silent, &silent, false)));
         assert(g_writes.size() == 1);
 
-        os::g_now_ms += 25; // 140ms >= 134ms
+        os::g_now_ms += 15; // 130ms >= 127ms
         assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&keepalive_enc, &silent, &silent, false)));
         assert(g_writes.size() == 2);
         assert(g_writes[1].payload == std::vector<u8>({0x00, 0x00, 0x00, 0x00}));
@@ -425,11 +425,11 @@ int main() {
         assert(g_writes[0].payload[0] != 0 || g_writes[0].payload[1] != 0);
         ctrl_v18.OnRumbleWriteComplete(0);
 
-        os::g_now_ms += 145; // < 162ms (stronger kick lasts longer than light tap!)
+        os::g_now_ms += 140; // < 156ms (stronger kick lasts longer than light tap!)
         assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&keepalive_enc, &silent, &silent, false)));
         assert(g_writes.size() == 1);
 
-        os::g_now_ms += 17; // == 162ms
+        os::g_now_ms += 16; // == 156ms
         assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&keepalive_enc, &silent, &silent, false)));
         assert(g_writes.size() == 2);
         assert(g_writes[1].payload == std::vector<u8>({0x00, 0x00, 0x00, 0x00}));

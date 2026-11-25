@@ -77,42 +77,42 @@ int main() {
         assert(clamped.right_x == 0 && clamped.right_y == 4095);
     }
 
-    // v18 Dual-motor rumble mapping (with >=7% / >=16% noise gates, frequency split, and Ace Attorney heavy boost)
+    // v21 Dual-motor rumble mapping (1.8% / 12% noise gates, 2x/1.5x gain, sqrt light curve, and 110..160ms pulses)
     {
         assert(MapRumbleMagnitude(0.0f, true) == 0);
         assert(MapRumbleMagnitude(0.0f, false) == 0);
         assert(MapRumbleMagnitude(-0.5f, true) == 0);
 
-        // Mario Wonder tiny note/footstep vibrations (0.85%, 1.56%, 2.63%) must stay completely silent,
-        // while light 5% game taps now wake the right ERM with a tangible kick.
+        // Mario Wonder tiny footstep/ambient vibrations (0.85%, 1.56% < 1.8%) must stay completely silent,
+        // while real light game taps (2.63%, 5%) drive the nimble right ERM clearly without waking heavy left ERM.
         assert(MapRumbleMagnitude(0.0085f, false) == 0);
         assert(MapRumbleMagnitude(0.0156f, false) == 0);
-        assert(MapRumbleMagnitude(0.0263f, false) == 0);
-        assert(MapRumbleMagnitude(0.0500f, false) >= 0x2800);
-        assert(MapRumbleMagnitude(0.1200f, true) == 0);
+        assert(MapRumbleMagnitude(0.0263f, false) >= 0x5500);
+        assert(MapRumbleMagnitude(0.0500f, false) >= 0x7000);
+        assert(MapRumbleMagnitude(0.1000f, true) == 0);
 
-        const uint16_t s_low  = MapRumbleMagnitude(0.20f, true);
-        const uint16_t s_mid  = MapRumbleMagnitude(0.50f, true);
-        const uint16_t s_full = MapRumbleMagnitude(0.80f, true);
-        const uint16_t w_low  = MapRumbleMagnitude(0.10f, false);
-        const uint16_t w_mid  = MapRumbleMagnitude(0.50f, false);
-        const uint16_t w_full = MapRumbleMagnitude(0.85f, false);
+        const uint16_t s_low  = MapRumbleMagnitude(0.15f, true);
+        const uint16_t s_mid  = MapRumbleMagnitude(0.40f, true);
+        const uint16_t s_full = MapRumbleMagnitude(0.65f, true);
+        const uint16_t w_low  = MapRumbleMagnitude(0.05f, false);
+        const uint16_t w_mid  = MapRumbleMagnitude(0.25f, false);
+        const uint16_t w_full = MapRumbleMagnitude(0.50f, false);
 
         assert(s_low > 0 && s_low < s_mid && s_mid < s_full && s_full == 0xFFFF);
         assert(w_low > 0 && w_low < w_mid && w_mid < w_full && w_full == 0xFFFF);
         assert(MapRumbleMagnitude(1.5f, true) == 0xFFFF);
         assert(MapRumbleMagnitude(1.5f, false) == 0xFFFF);
 
-        // Light low-band tap (12% @ 160Hz) and high-freq low-band rumble (25% @ 250Hz) route cleanly to nimble right ERM
-        const auto light_tap = MapSwitchRumbleToStadia(0.12f, 160.0f, 0.0f, 320.0f, 0.0f, 160.0f, 0.0f, 320.0f);
-        assert(light_tap.strong == 0 && light_tap.weak > 0);
+        // Light low-band tap (4% @ 160Hz) and high-freq low-band rumble (25% @ 250Hz) route cleanly to right ERM at 1.0x
+        const auto light_tap = MapSwitchRumbleToStadia(0.04f, 160.0f, 0.0f, 320.0f, 0.0f, 160.0f, 0.0f, 320.0f);
+        assert(light_tap.strong == 0 && light_tap.weak >= 0x6800);
         const auto hi_freq_low = MapSwitchRumbleToStadia(0.25f, 250.0f, 0.0f, 320.0f, 0.0f, 160.0f, 0.0f, 320.0f);
         assert(hi_freq_low.strong == 0 && hi_freq_low.weak > 0);
 
         // Ace Attorney Objection heavy composite burst boosts strong motor, then echo tail (1.8% low, 8% high) cuts left ERM off immediately
         const auto objection = MapSwitchRumbleToStadia(0.354f, 160.0f, 0.511f, 320.0f, 0.354f, 160.0f, 0.511f, 320.0f);
         assert(objection.strong > MapRumbleMagnitude(0.354f, true));
-        assert(objection.strong >= 0xA800 && objection.weak >= 0x8800);
+        assert(objection.strong >= 0xE000 && objection.weak == 0xFFFF);
         const auto echo_tail = MapSwitchRumbleToStadia(0.018f, 160.0f, 0.080f, 320.0f, 0.018f, 160.0f, 0.080f, 320.0f);
         assert(echo_tail.strong == 0 && echo_tail.weak > 0);
 
@@ -122,16 +122,16 @@ int main() {
         assert(IsFindControllerMotorBytes(find_pkt));
         assert(!IsFindControllerMotorBytes(norm_pkt));
 
-        // Intensity-scaled transient pulse duration (125..175ms including 40ms ERM spin-up overhead)
+        // Intensity-scaled transient pulse duration (110..160ms including 25ms ERM spin-up overhead)
         assert(ComputeTransientPulseMs(0, 0) == 0);
         const int64_t p_light_w = ComputeTransientPulseMs(0, 0x0800);
         const int64_t p_light_s = ComputeTransientPulseMs(0x0800, 0);
-        const int64_t p_conn    = ComputeTransientPulseMs(0xAA93, 0);
+        const int64_t p_conn    = ComputeTransientPulseMs(0xE5A7, 0);
         const int64_t p_max     = ComputeTransientPulseMs(0xFFFF, 0xFFFF);
-        assert(p_light_w >= 125 && p_light_w <= 130);
-        assert(p_light_s >= 135 && p_light_s <= 138);
-        assert(p_conn >= 160 && p_conn <= 164);
-        assert(p_max == 175);
+        assert(p_light_w >= 110 && p_light_w <= 115);
+        assert(p_light_s >= 120 && p_light_s <= 123);
+        assert(p_conn >= 154 && p_conn <= 158);
+        assert(p_max == 160);
         assert(p_light_w < p_light_s && p_light_s < p_conn && p_conn < p_max);
     }
 

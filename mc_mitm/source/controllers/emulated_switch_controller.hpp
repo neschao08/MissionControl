@@ -52,6 +52,13 @@ namespace ams::controller {
             Result WriteControllerColours(RGBColour body, RGBColour buttons, RGBColour left_grip, RGBColour right_grip);
             Result WriteSpiDeviceType(u8 device_type);
             virtual Result SetVibration(const SwitchMotorData *motor_data) { AMS_UNUSED(motor_data); R_SUCCEED(); }
+            virtual Result OnVibrationPacket(const SwitchEncodedMotorData *encoded_data, const SwitchMotorData *peak_data, const SwitchMotorData *sustained_data, bool samples_available) {
+                AMS_UNUSED(encoded_data, sustained_data);
+                if (samples_available) {
+                    R_RETURN(this->SetVibration(peak_data));
+                }
+                R_SUCCEED();
+            }
             virtual Result CancelVibration() { R_SUCCEED(); }
             virtual Result SetPlayerLed(SwitchPlayerNumber player_number) { AMS_UNUSED(player_number); R_SUCCEED(); }
 

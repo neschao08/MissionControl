@@ -145,6 +145,9 @@ namespace ams::controller {
         std::scoped_lock lk(m_report_mutex, m_rumble_mutex);
         m_connected = false;
         m_rumble_pending = false;
+        m_find_controller_active = false;
+        m_desired_rumble_strong = 0;
+        m_desired_rumble_weak = 0;
         m_rumble_expire_tick = 0;
         m_rumble_min_stop_tick = 0;
         m_rumble_in_flight.store(false, std::memory_order_release);
@@ -175,7 +178,7 @@ namespace ams::controller {
 
     s64 StadiaBleController::GetMinRumbleIntervalNs() const {
         const s64 min_single_interval_ns = m_output_write_with_response
-            ? TimeSpan::FromMilliSeconds(48).GetNanoSeconds()
+            ? TimeSpan::FromMilliSeconds(36).GetNanoSeconds()
             : TimeSpan::FromMilliSeconds(32).GetNanoSeconds();
         constexpr s64 MultiControllerMinRumbleIntervalNs   = TimeSpan::FromMilliSeconds(64).GetNanoSeconds();
         constexpr s64 HeavyMultiControllerRumbleIntervalNs = TimeSpan::FromMilliSeconds(96).GetNanoSeconds();
@@ -219,7 +222,7 @@ namespace ams::controller {
         }
 
         const Result rc = this->WriteDataReport(&report, sizeof(stadia::StadiaOutputReport0x05) + 1);
-        if ((m_rumble_log_count < 16) && ble::log::IsEnabled()) {
+        if ((m_rumble_log_count < 32) && ble::log::IsEnabled()) {
             ++m_rumble_log_count;
             ble::log::Write("stadia rumble #%u conn_id=%u strong=0x%04x weak=0x%04x auth=%u with_rsp=%u rc=0x%x",
                 m_rumble_log_count, m_conn_id, strong, weak, m_write_auth_req, m_output_write_with_response ? 1u : 0u, rc.GetValue());
@@ -241,7 +244,7 @@ namespace ams::controller {
             m_rumble_min_stop_tick = 0;
             m_rumble_expire_tick = 0;
         } else if (was_stopped) {
-            m_rumble_min_stop_tick = now_tick + os::ConvertToTick(TimeSpan::FromMilliSeconds(65)).GetInt64Value();
+            m_rumble_min_stop_tick = now_tick + os::ConvertToTick(TimeSpan::FromMilliSeconds(45)).GetInt64Value();
         }
 
         m_sent_rumble_strong = strong;
@@ -253,17 +256,16 @@ namespace ams::controller {
         R_SUCCEED();
     }
 
-    Result StadiaBleController::SetVibration(const SwitchMotorData *motor_data) {
-        if (!m_has_output_report) {
-            R_SUCCEED();
-        }
+    stadia::StadiaRumbleMagnitudes StadiaBleController::MapMotorData(const SwitchMotorData *motor_data) {
+        return stadia::MapSwitchRumbleToStadia(
+            motor_data->left_motor.low_band_amp,  motor_data->left_motor.low_band_freq,
+            motor_data->left_motor.high_band_amp, motor_data->left_motor.high_band_freq,
+            motor_data->right_motor.low_band_amp,  motor_data->right_motor.low_band_freq,
+            motor_data->right_motor.high_band_amp, motor_data->right_motor.high_band_freq
+        );
+    }
 
-        const float strong_amp = std::clamp(std::max(motor_data->left_motor.low_band_amp, motor_data->right_motor.low_band_amp), 0.0f, 1.0f);
-        const float weak_amp   = std::clamp(std::max(motor_data->left_motor.high_band_amp, motor_data->right_motor.high_band_amp), 0.0f, 1.0f);
-
-        const u16 strong = stadia::MapRumbleMagnitude(strong_amp, true);
-        const u16 weak   = stadia::MapRumbleMagnitude(weak_amp, false);
-
+    Result StadiaBleController::ApplyRumbleTargetLocked(u16 peak_strong, u16 peak_weak, u16 sustained_strong, u16 sustained_weak, s64 expire_ms) {
         const s64 now_tick = os::GetSystemTick().GetInt64Value();
         if (m_rumble_in_flight.load(std::memory_order_acquire)) {
             const s64 in_flight_tick = m_rumble_in_flight_tick.load(std::memory_order_acquire);
@@ -271,9 +273,8 @@ namespace ams::controller {
                 m_rumble_in_flight.store(false, std::memory_order_release);
             }
         }
-        const bool in_flight = m_rumble_in_flight.load(std::memory_order_acquire);
-
-        const bool is_stop     = (strong == 0) && (weak == 0);
+        const bool in_flight   = m_rumble_in_flight.load(std::memory_order_acquire);
+        const bool is_stop     = (peak_strong == 0) && (peak_weak == 0);
         const bool was_stopped = (m_sent_rumble_strong == 0) && (m_sent_rumble_weak == 0);
 
         if (is_stop) {
@@ -292,36 +293,165 @@ namespace ams::controller {
             R_RETURN(this->TryWriteRumbleLocked(0, 0, now_tick));
         }
 
-        m_desired_rumble_strong = strong;
-        m_desired_rumble_weak   = weak;
-        m_rumble_expire_tick    = now_tick + os::ConvertToTick(TimeSpan::FromMilliSeconds(200)).GetInt64Value();
-
         const TimeSpan elapsed_time = (m_last_rumble_tick > 0)
             ? os::Tick(now_tick - m_last_rumble_tick).ToTimeSpan()
             : TimeSpan::FromSeconds(1);
 
+        // Single-packet transient kick (non-zero peak followed immediately by silent tail in the same packet).
+        if ((sustained_strong == 0) && (sustained_weak == 0)) {
+            if (in_flight || (elapsed_time.GetNanoSeconds() < this->GetMinRumbleIntervalNs())) {
+                m_desired_rumble_strong = peak_strong;
+                m_desired_rumble_weak   = peak_weak;
+                m_rumble_expire_tick    = now_tick + os::ConvertToTick(TimeSpan::FromMilliSeconds(60)).GetInt64Value();
+                m_rumble_pending        = true;
+                ble::events::WakeHostLoop();
+                R_SUCCEED();
+            }
+
+            m_desired_rumble_strong = peak_strong;
+            m_desired_rumble_weak   = peak_weak;
+            const Result rc = this->TryWriteRumbleLocked(peak_strong, peak_weak, now_tick);
+            if (R_FAILED(rc)) {
+                m_rumble_expire_tick = now_tick + os::ConvertToTick(TimeSpan::FromMilliSeconds(90)).GetInt64Value();
+                R_RETURN(rc);
+            }
+
+            // Crisp cutoff: schedule zero stop right after the 45ms minimum kick window.
+            m_desired_rumble_strong = 0;
+            m_desired_rumble_weak   = 0;
+            m_rumble_min_stop_tick  = now_tick + os::ConvertToTick(TimeSpan::FromMilliSeconds(45)).GetInt64Value();
+            m_rumble_expire_tick    = m_rumble_min_stop_tick;
+            m_rumble_pending        = true;
+            ble::events::WakeHostLoop();
+            R_SUCCEED();
+        }
+
+        // Sustained rumble or active multi-packet vibration.
+        m_desired_rumble_strong = peak_strong;
+        m_desired_rumble_weak   = peak_weak;
+        m_rumble_expire_tick    = now_tick + os::ConvertToTick(TimeSpan::FromMilliSeconds(expire_ms)).GetInt64Value();
+
         if (in_flight) {
-            if ((strong != m_sent_rumble_strong) || (weak != m_sent_rumble_weak)) {
+            if ((peak_strong != m_sent_rumble_strong) || (peak_weak != m_sent_rumble_weak)) {
                 m_rumble_pending = true;
                 ble::events::WakeHostLoop();
             }
             R_SUCCEED();
         }
 
-        if ((strong == m_sent_rumble_strong) && (weak == m_sent_rumble_weak) && (elapsed_time.GetMilliSeconds() < 180)) {
+        if ((peak_strong == m_sent_rumble_strong) && (peak_weak == m_sent_rumble_weak) && (elapsed_time.GetMilliSeconds() < 1500)) {
             m_rumble_pending = false;
             R_SUCCEED();
         }
 
         if (elapsed_time.GetNanoSeconds() < this->GetMinRumbleIntervalNs()) {
-            if ((strong != m_sent_rumble_strong) || (weak != m_sent_rumble_weak)) {
+            if ((peak_strong != m_sent_rumble_strong) || (peak_weak != m_sent_rumble_weak)) {
                 m_rumble_pending = true;
                 ble::events::WakeHostLoop();
             }
             R_SUCCEED();
         }
 
-        R_RETURN(this->TryWriteRumbleLocked(strong, weak, now_tick));
+        R_RETURN(this->TryWriteRumbleLocked(peak_strong, peak_weak, now_tick));
+    }
+
+    Result StadiaBleController::CancelVibration() {
+        if (!m_has_output_report) {
+            R_SUCCEED();
+        }
+
+        m_find_controller_active = false;
+        m_desired_rumble_strong  = 0;
+        m_desired_rumble_weak    = 0;
+        m_rumble_expire_tick     = 0;
+        m_rumble_min_stop_tick   = 0;
+
+        const s64 now_tick = os::GetSystemTick().GetInt64Value();
+        if (m_rumble_in_flight.load(std::memory_order_acquire)) {
+            const s64 in_flight_tick = m_rumble_in_flight_tick.load(std::memory_order_acquire);
+            if ((in_flight_tick > 0) && (os::Tick(now_tick - in_flight_tick).ToTimeSpan().GetMilliSeconds() >= 150)) {
+                m_rumble_in_flight.store(false, std::memory_order_release);
+            }
+        }
+        const bool in_flight   = m_rumble_in_flight.load(std::memory_order_acquire);
+        const bool was_stopped = (m_sent_rumble_strong == 0) && (m_sent_rumble_weak == 0);
+
+        if (was_stopped && !in_flight) {
+            m_rumble_pending = false;
+            R_SUCCEED();
+        }
+        if (in_flight) {
+            m_rumble_pending = true;
+            ble::events::WakeHostLoop();
+            R_SUCCEED();
+        }
+        R_RETURN(this->TryWriteRumbleLocked(0, 0, now_tick));
+    }
+
+    Result StadiaBleController::OnVibrationPacket(const SwitchEncodedMotorData *encoded_data, const SwitchMotorData *peak_data, const SwitchMotorData *sustained_data, bool samples_available) {
+        if (!m_has_output_report) {
+            R_SUCCEED();
+        }
+
+        if (samples_available) {
+            if ((encoded_data != nullptr) && stadia::IsFindControllerMotorBytes(reinterpret_cast<const uint8_t *>(encoded_data))) {
+                if (!m_find_controller_active && (m_find_log_count < 16) && ble::log::IsEnabled()) {
+                    ++m_find_log_count;
+                    ble::log::Write("stadia find-controller start conn_id=%u", m_conn_id);
+                }
+                m_find_controller_active = true;
+                R_RETURN(this->ApplyRumbleTargetLocked(0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 800));
+            }
+
+            if (m_find_controller_active) {
+                if ((m_find_log_count < 16) && ble::log::IsEnabled()) {
+                    ++m_find_log_count;
+                    ble::log::Write("stadia find-controller stop conn_id=%u", m_conn_id);
+                }
+                m_find_controller_active = false;
+            }
+
+            const auto peak      = MapMotorData(peak_data);
+            const auto sustained = MapMotorData(sustained_data);
+            R_RETURN(this->ApplyRumbleTargetLocked(peak.strong, peak.weak, sustained.strong, sustained.weak, 600));
+        }
+
+        // PacketType == 0: keep alive held rumble or flush scheduled 45ms transient cutoff.
+        if (m_find_controller_active) {
+            R_RETURN(this->ApplyRumbleTargetLocked(0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 800));
+        }
+
+        const auto sustained = MapMotorData(sustained_data);
+        if ((sustained.strong != 0) || (sustained.weak != 0)) {
+            R_RETURN(this->ApplyRumbleTargetLocked(sustained.strong, sustained.weak, sustained.strong, sustained.weak, 600));
+        }
+
+        if (m_rumble_pending && (m_desired_rumble_strong == 0) && (m_desired_rumble_weak == 0)) {
+            const s64 now_tick = os::GetSystemTick().GetInt64Value();
+            if (m_rumble_in_flight.load(std::memory_order_acquire)) {
+                const s64 in_flight_tick = m_rumble_in_flight_tick.load(std::memory_order_acquire);
+                if ((in_flight_tick > 0) && (os::Tick(now_tick - in_flight_tick).ToTimeSpan().GetMilliSeconds() >= 150)) {
+                    m_rumble_in_flight.store(false, std::memory_order_release);
+                }
+            }
+            if (!m_rumble_in_flight.load(std::memory_order_acquire) && ((m_rumble_min_stop_tick == 0) || (now_tick >= m_rumble_min_stop_tick))) {
+                if ((m_sent_rumble_strong == 0) && (m_sent_rumble_weak == 0)) {
+                    m_rumble_pending = false;
+                    R_SUCCEED();
+                }
+                R_RETURN(this->TryWriteRumbleLocked(0, 0, now_tick));
+            }
+        }
+
+        R_SUCCEED();
+    }
+
+    Result StadiaBleController::SetVibration(const SwitchMotorData *motor_data) {
+        if (!m_has_output_report) {
+            R_SUCCEED();
+        }
+        const auto mapped = MapMotorData(motor_data);
+        R_RETURN(this->ApplyRumbleTargetLocked(mapped.strong, mapped.weak, mapped.strong, mapped.weak, 200));
     }
 
     void StadiaBleController::ServiceBleTasks() {
@@ -365,6 +495,7 @@ namespace ams::controller {
                 m_desired_rumble_strong = 0;
                 m_desired_rumble_weak   = 0;
                 m_rumble_expire_tick    = 0;
+                m_find_controller_active = false;
                 if ((m_sent_rumble_strong != 0) || (m_sent_rumble_weak != 0)) {
                     m_rumble_pending = true;
                 }

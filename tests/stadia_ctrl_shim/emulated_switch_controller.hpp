@@ -60,11 +60,16 @@ namespace ams::controller {
 
     struct SwitchMotorChannel {
         float low_band_amp = 0.0f;
+        float low_band_freq = 160.0f;
         float high_band_amp = 0.0f;
+        float high_band_freq = 320.0f;
     };
     struct SwitchMotorData {
         SwitchMotorChannel left_motor;
         SwitchMotorChannel right_motor;
+    };
+    struct SwitchEncodedMotorData {
+        u8 bytes[8];
     };
 
     class EmulatedSwitchController {
@@ -100,6 +105,10 @@ namespace ams::controller {
 
             // Public test hooks to drive protected methods directly
             Result TestSetVibration(const SwitchMotorData *m) { return this->SetVibration(m); }
+            Result TestOnVibrationPacket(const SwitchEncodedMotorData *enc, const SwitchMotorData *peak, const SwitchMotorData *sustained, bool samples_available) {
+                return this->OnVibrationPacket(enc, peak, sustained, samples_available);
+            }
+            Result TestCancelVibration() { return this->CancelVibration(); }
             SwitchControllerColours TestColours() const { return m_test_colours; }
             u32 TestColourWrites() const { return m_colour_writes; }
             u8 TestSpiDeviceType() const { return m_test_spi_device_type; }
@@ -150,6 +159,15 @@ namespace ams::controller {
             }
             virtual void ParseInputReport(const u8 *report_buffer, size_t size) = 0;
             virtual Result SetVibration(const SwitchMotorData *motor_data) = 0;
+            virtual Result OnVibrationPacket(const SwitchEncodedMotorData *encoded_data, const SwitchMotorData *peak_data, const SwitchMotorData *sustained_data, bool samples_available) {
+                (void)encoded_data;
+                (void)sustained_data;
+                if (samples_available) {
+                    return this->SetVibration(peak_data);
+                }
+                return {0};
+            }
+            virtual Result CancelVibration() { return {0}; }
             virtual Result WriteDataReport(const void *report_buffer, size_t size) = 0;
 
             bluetooth::Address m_address;

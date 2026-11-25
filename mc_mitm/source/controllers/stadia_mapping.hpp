@@ -138,20 +138,67 @@ namespace ams::controller::stadia {
         return out;
     }
 
-    // Stadia dual-motor rumble mapping:
-    //   Left strong motor (2100 RPM) <- Switch HD Rumble low-frequency band
-    //   Right weak motor  (3350 RPM) <- Switch HD Rumble high-frequency band
-    // Switch HD Rumble often emits small amplitudes (0.04..0.30) that fall below a DC
-    // eccentric motor's static friction deadzone when scaled linearly. Apply a gentle
-    // sqrt response curve above a small cutoff while preserving exact zero for stop.
+    // Stadia BLE firmware (bruce_pvt_a_prod_signed.bin) already applies minimum startup PWM
+    // lifts (left ~60%, right ~50%) and battery-voltage compensation to any non-zero duty,
+    // and drives asymmetric ERMs (left 4x heavy low-RPM, right light high-RPM).
+    constexpr float WeakNoiseGate        = 0.07f;  // Filter <7% HD rumble audio/texture micro-buzz
+    constexpr float WeakFullScaleAmp     = 0.85f;
+    constexpr float StrongNoiseGate      = 0.16f;  // Engage heavy 4x left ERM only on real >=16% hits
+    constexpr float StrongFullScaleAmp   = 0.80f;
+    constexpr float LowToWeakSplitFreqHz = 215.0f; // Route brisk >=215Hz low-band taps to nimble right ERM
+    constexpr float StrongMaxFreqHz      = 240.0f; // Avoid spinning heavy left ERM above 240Hz
+
+    struct StadiaRumbleMagnitudes {
+        uint16_t strong = 0;
+        uint16_t weak   = 0;
+    };
+
+    inline constexpr bool IsFindControllerMotorBytes(const uint8_t raw[8]) {
+        return (raw[0] == 0x04) && (raw[1] == 0xbf) && (raw[2] == 0x40) && (raw[3] == 0x40) &&
+               (raw[4] == 0x04) && (raw[5] == 0xbf) && (raw[6] == 0x40) && (raw[7] == 0x40);
+    }
+
     inline uint16_t MapRumbleMagnitude(float amp, bool strong_motor) {
         const float clamped = std::clamp(amp, 0.0f, 1.0f);
-        if (clamped <= 0.005f) {
+        const float gate = strong_motor ? StrongNoiseGate : WeakNoiseGate;
+        const float full = strong_motor ? StrongFullScaleAmp : WeakFullScaleAmp;
+        if (clamped < gate) {
             return 0;
         }
-        const float floor_level = strong_motor ? 0.28f : 0.22f;
-        const float shaped = std::clamp(floor_level + (1.0f - floor_level) * std::sqrt(clamped), 0.0f, 1.0f);
-        return static_cast<uint16_t>(shaped * 65535.0f + 0.5f);
+        const float t = std::clamp((clamped - gate) / (full - gate), 0.0f, 1.0f);
+        const float shaped = strong_motor ? std::pow(t, 0.85f) : t;
+        return static_cast<uint16_t>(1.0f + shaped * 65534.0f + 0.5f);
+    }
+
+    inline StadiaRumbleMagnitudes MapSwitchRumbleToStadia(
+        float left_lo_amp, float left_lo_freq, float left_hi_amp, float left_hi_freq,
+        float right_lo_amp, float right_lo_freq, float right_hi_amp, float right_hi_freq)
+    {
+        (void)left_hi_freq;
+        (void)right_hi_freq;
+        const bool use_left_lo = (left_lo_amp >= right_lo_amp);
+        const float lo_amp  = std::clamp(use_left_lo ? left_lo_amp : right_lo_amp, 0.0f, 1.0f);
+        const float raw_lo_freq = use_left_lo ? left_lo_freq : right_lo_freq;
+        const float lo_freq = (raw_lo_freq > 0.0f) ? raw_lo_freq : 160.0f;
+        const float hi_amp  = std::clamp(std::max(left_hi_amp, right_hi_amp), 0.0f, 1.0f);
+
+        float effective_weak = hi_amp;
+        if ((lo_amp >= WeakNoiseGate) && ((lo_amp < StrongNoiseGate) || (lo_freq >= LowToWeakSplitFreqHz))) {
+            effective_weak = std::max(effective_weak, lo_amp * 0.85f);
+        }
+
+        float effective_strong = 0.0f;
+        if ((lo_amp >= StrongNoiseGate) && (lo_freq < StrongMaxFreqHz)) {
+            effective_strong = lo_amp;
+            if (hi_amp >= 0.20f) {
+                effective_strong = std::min(1.0f, lo_amp + 0.45f * hi_amp);
+            }
+        }
+
+        return {
+            MapRumbleMagnitude(effective_strong, true),
+            MapRumbleMagnitude(effective_weak, false),
+        };
     }
 
 }

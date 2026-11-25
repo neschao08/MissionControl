@@ -34,6 +34,7 @@ namespace ams::controller {
         public:
             constexpr void SetEnabled(bool enabled) { m_enabled = enabled; }
             constexpr bool GetEnabled() const { return m_enabled; }
+            void Reset() { m_decoder_left.Reset(); m_decoder_right.Reset(); }
 
             void ProcessMotorData(const SwitchEncodedMotorData *encoded_motor_data);
     };

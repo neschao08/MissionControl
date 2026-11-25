@@ -287,8 +287,13 @@ namespace ams::controller {
 
     void SwitchHidCommandProcessor::ProcessMotorEnable(const SwitchHidCommand *command, SwitchHidCommandResponse *response) {
         auto config = mitm::GetGlobalConfig();
+        const bool enabled = config->general.enable_rumble && command->motor_enable.enable;
 
-        m_controller->m_vibration_processor.SetEnabled(config->general.enable_rumble && command->motor_enable.enable);
+        m_controller->m_vibration_processor.SetEnabled(enabled);
+        if (!enabled) {
+            m_controller->m_vibration_processor.Reset();
+            R_DISCARD(m_controller->CancelVibration());
+        }
 
         response->response_id = SwitchHidCommandId::Ack;
         response->request_id  = SwitchHidCommandId::MotorEnable;

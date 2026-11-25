@@ -23,6 +23,7 @@ namespace ams::controller {
         public:
             SwitchHdRumbleDecoder();
 
+            void Reset();
             void DecodeSamples(const SwitchEncodedVibrationSamples *encoded, SwitchVibrationSamples *decoded);
             void GetCurrentOutputValue(SwitchVibrationValues *output);
 

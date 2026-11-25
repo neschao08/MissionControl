@@ -77,25 +77,49 @@ int main() {
         assert(clamped.right_x == 0 && clamped.right_y == 4095);
     }
 
-    // Dual-motor rumble curve (left strong 2100 RPM / right weak 3350 RPM)
+    // v18 Dual-motor rumble mapping (with >=7% / >=16% noise gates, frequency split, and Ace Attorney heavy boost)
     {
         assert(MapRumbleMagnitude(0.0f, true) == 0);
         assert(MapRumbleMagnitude(0.0f, false) == 0);
-        assert(MapRumbleMagnitude(0.005f, true) == 0);
-        assert(MapRumbleMagnitude(0.005f, false) == 0);
         assert(MapRumbleMagnitude(-0.5f, true) == 0);
 
-        const uint16_t s_low  = MapRumbleMagnitude(0.05f, true);
-        const uint16_t s_mid  = MapRumbleMagnitude(0.50f, true);
-        const uint16_t s_full = MapRumbleMagnitude(1.00f, true);
-        const uint16_t w_low  = MapRumbleMagnitude(0.05f, false);
-        const uint16_t w_mid  = MapRumbleMagnitude(0.50f, false);
-        const uint16_t w_full = MapRumbleMagnitude(1.00f, false);
+        // Mario Wonder tiny note/footstep vibrations (0.85%, 1.56%, 2.63%, 5%) must stay completely silent
+        assert(MapRumbleMagnitude(0.0085f, false) == 0);
+        assert(MapRumbleMagnitude(0.0156f, false) == 0);
+        assert(MapRumbleMagnitude(0.0263f, false) == 0);
+        assert(MapRumbleMagnitude(0.0500f, false) == 0);
+        assert(MapRumbleMagnitude(0.1200f, true) == 0);
 
-        assert(s_low >= 0x4700 && s_low < s_mid && s_mid < s_full && s_full == 0xFFFF);
-        assert(w_low >= 0x3800 && w_low < w_mid && w_mid < w_full && w_full == 0xFFFF);
-        assert(s_low > w_low); // Strong eccentric motor needs higher startup floor than weak motor
+        const uint16_t s_low  = MapRumbleMagnitude(0.20f, true);
+        const uint16_t s_mid  = MapRumbleMagnitude(0.50f, true);
+        const uint16_t s_full = MapRumbleMagnitude(0.80f, true);
+        const uint16_t w_low  = MapRumbleMagnitude(0.10f, false);
+        const uint16_t w_mid  = MapRumbleMagnitude(0.50f, false);
+        const uint16_t w_full = MapRumbleMagnitude(0.85f, false);
+
+        assert(s_low > 0 && s_low < s_mid && s_mid < s_full && s_full == 0xFFFF);
+        assert(w_low > 0 && w_low < w_mid && w_mid < w_full && w_full == 0xFFFF);
         assert(MapRumbleMagnitude(1.5f, true) == 0xFFFF);
+        assert(MapRumbleMagnitude(1.5f, false) == 0xFFFF);
+
+        // Light low-band tap (12% @ 160Hz) and high-freq low-band rumble (25% @ 250Hz) route cleanly to nimble right ERM
+        const auto light_tap = MapSwitchRumbleToStadia(0.12f, 160.0f, 0.0f, 320.0f, 0.0f, 160.0f, 0.0f, 320.0f);
+        assert(light_tap.strong == 0 && light_tap.weak > 0);
+        const auto hi_freq_low = MapSwitchRumbleToStadia(0.25f, 250.0f, 0.0f, 320.0f, 0.0f, 160.0f, 0.0f, 320.0f);
+        assert(hi_freq_low.strong == 0 && hi_freq_low.weak > 0);
+
+        // Ace Attorney Objection heavy composite burst boosts strong motor, then echo tail (1.8% low, 8% high) cuts left ERM off immediately
+        const auto objection = MapSwitchRumbleToStadia(0.354f, 160.0f, 0.511f, 320.0f, 0.354f, 160.0f, 0.511f, 320.0f);
+        assert(objection.strong > MapRumbleMagnitude(0.354f, true));
+        assert(objection.strong >= 0xA800 && objection.weak >= 0x8800);
+        const auto echo_tail = MapSwitchRumbleToStadia(0.018f, 160.0f, 0.080f, 320.0f, 0.018f, 160.0f, 0.080f, 320.0f);
+        assert(echo_tail.strong == 0 && echo_tail.weak > 0);
+
+        // Find-Controllers packet signature check
+        const uint8_t find_pkt[8] = {0x04, 0xbf, 0x40, 0x40, 0x04, 0xbf, 0x40, 0x40};
+        const uint8_t norm_pkt[8] = {0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40};
+        assert(IsFindControllerMotorBytes(find_pkt));
+        assert(!IsFindControllerMotorBytes(norm_pkt));
     }
 
     std::cout << "Stadia BLE input report mapping regressions passed\n";

@@ -58,9 +58,13 @@ namespace ams::controller {
         protected:
             void ParseInputReport(const u8 *report_buffer, size_t size) override;
             Result SetVibration(const SwitchMotorData *motor_data) override;
+            Result OnVibrationPacket(const SwitchEncodedMotorData *encoded_data, const SwitchMotorData *peak_data, const SwitchMotorData *sustained_data, bool samples_available) override;
+            Result CancelVibration() override;
             Result WriteDataReport(const void *report_buffer, size_t size) override;
 
         private:
+            static stadia::StadiaRumbleMagnitudes MapMotorData(const SwitchMotorData *motor_data);
+            Result ApplyRumbleTargetLocked(u16 peak_strong, u16 peak_weak, u16 sustained_strong, u16 sustained_weak, s64 expire_ms);
             Result TryWriteRumbleLocked(u16 strong, u16 weak, s64 now_tick);
             s64 GetMinRumbleIntervalNs() const;
 
@@ -85,6 +89,7 @@ namespace ams::controller {
             s64 m_rumble_min_stop_tick = 0;
             s64 m_rumble_expire_tick = 0;
             bool m_rumble_pending = false;
+            bool m_find_controller_active = false;
             std::atomic<bool> m_rumble_in_flight{false};
             std::atomic<s64> m_rumble_in_flight_tick{0};
             std::atomic<u32> m_pending_att_error{0};
@@ -93,6 +98,7 @@ namespace ams::controller {
             u32 m_basic_out_log_count = 0;
             u32 m_other_out_log_count = 0;
             u32 m_rumble_log_count = 0;
+            u32 m_find_log_count = 0;
             u8  m_rumble_fallback_stage = 0;
 
             bluetooth::HidReportEventInfo m_event_info = {};

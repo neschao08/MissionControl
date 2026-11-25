@@ -29,22 +29,28 @@ int main() {
         PackLe32(&pkt.right_motor, 0x00000000u);
         proc.ProcessMotorData(&pkt);
         assert(ctrl.vibration_calls == 1);
+        assert(ctrl.last_samples_available);
         assert(ctrl.last_motor.left_motor.low_band_amp > 0.55f);
         assert(ctrl.last_motor.left_motor.low_band_amp < 0.57f);
         assert(ctrl.last_motor.right_motor.low_band_amp == 0.0f);
+        // Post-packet sustained tail dropped back to 0!
+        assert(ctrl.last_sustained.left_motor.low_band_amp == 0.0f);
+        assert(ctrl.last_sustained.left_motor.high_band_amp == 0.0f);
     }
 
-    // 2. Real HOS 22.5.0 Find-Controllers / short pulse packet: m=00000000_02786040
+    // 2. Real HOS 22.5.0 short pulse packet: m=00000000_02786040
     //    sample[0] = 0.0, sample[1] high_band_amp = 0.5000, sample[2] = 0.0
-    //    Peak decoding MUST extract high_band_amp == 0.5f instead of dropping it!
+    //    Peak decoding MUST extract high_band_amp == 0.5f while sustained reflects silent sample[2]!
     {
         SwitchEncodedMotorData pkt{};
         PackLe32(&pkt.left_motor,  0x00000000u);
         PackLe32(&pkt.right_motor, 0x40607802u); // bytes: 02 78 60 40
         proc.ProcessMotorData(&pkt);
         assert(ctrl.vibration_calls == 2);
+        assert(ctrl.last_samples_available);
         assert(std::fabs(ctrl.last_motor.right_motor.high_band_amp - 0.5f) < 0.001f);
         assert(ctrl.last_motor.right_motor.low_band_amp == 0.0f);
+        assert(ctrl.last_sustained.right_motor.high_band_amp == 0.0f);
     }
 
     // 3. Neutral stop packet: m=00014040_00014040 -> all zero amplitudes
@@ -60,5 +66,29 @@ int main() {
         assert(ctrl.last_motor.right_motor.high_band_amp == 0.0f);
     }
 
-    std::cout << "SwitchVibrationProcessor peak multi-sample decoding regressions passed\n";
+    // 4. Find-Controllers packet m=04bf4040_04bf4040 followed by PacketType=0 keepalive frames (00000000_00000000)
+    //    Sustained high_band_amp MUST remain 0.5f during PacketType=0 until neutral/Reset() clears it!
+    {
+        SwitchEncodedMotorData find_pkt{};
+        PackLe32(&find_pkt.left_motor,  0x4040bf04u); // bytes: 04 bf 40 40
+        PackLe32(&find_pkt.right_motor, 0x4040bf04u);
+        proc.ProcessMotorData(&find_pkt);
+        assert(ctrl.last_samples_available);
+        assert(std::fabs(ctrl.last_sustained.left_motor.high_band_amp - 0.5f) < 0.001f);
+        assert(std::fabs(ctrl.last_sustained.right_motor.high_band_amp - 0.5f) < 0.001f);
+
+        SwitchEncodedMotorData keepalive_pkt{};
+        proc.ProcessMotorData(&keepalive_pkt);
+        assert(!ctrl.last_samples_available);
+        assert(std::fabs(ctrl.last_sustained.left_motor.high_band_amp - 0.5f) < 0.001f);
+        assert(std::fabs(ctrl.last_sustained.right_motor.high_band_amp - 0.5f) < 0.001f);
+
+        proc.Reset();
+        proc.ProcessMotorData(&keepalive_pkt);
+        assert(!ctrl.last_samples_available);
+        assert(ctrl.last_sustained.left_motor.high_band_amp == 0.0f);
+        assert(ctrl.last_sustained.right_motor.high_band_amp == 0.0f);
+    }
+
+    std::cout << "SwitchVibrationProcessor peak + sustained decoding regressions passed\n";
 }

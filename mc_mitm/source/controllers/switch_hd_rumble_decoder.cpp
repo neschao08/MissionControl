@@ -151,6 +151,10 @@ namespace ams::controller {
     }
 
     SwitchHdRumbleDecoder::SwitchHdRumbleDecoder() {
+        this->Reset();
+    }
+
+    void SwitchHdRumbleDecoder::Reset() {
         m_state = {
             .lo_amp_linear  = DefaultAmplitude,
             .lo_freq_linear = DefaultFrequency,

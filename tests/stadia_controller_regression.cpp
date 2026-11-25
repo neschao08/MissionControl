@@ -84,7 +84,7 @@ int main() {
         // ATT error on rumble write auto-escalates auth None -> NoMitm, then WithRsp -> NoRsp
         ctrl.OnRumbleWriteComplete(5);
         os::g_now_ms += 60;
-        motor.left_motor.low_band_amp = 0.7f;
+        motor.left_motor.low_band_amp = 0.4f;
         assert(R_SUCCEEDED(ctrl.TestSetVibration(&motor)));
         assert(g_writes.size() == 2);
         assert(g_writes[1].auth_req == BtdrvGattAuthReqType_NoMitm && g_writes[1].with_response == true);
@@ -99,13 +99,13 @@ int main() {
         assert(g_writes.size() == 1);
         ctrl_t.OnRumbleWriteComplete(0);
 
-        // Write-With-Response throttle: 32ms is throttled (< 48ms), 48ms passes!
-        os::g_now_ms += 32;
-        motor.left_motor.low_band_amp = 0.8f;
+        // Write-With-Response throttle: 24ms is throttled (< 36ms), 36ms passes!
+        os::g_now_ms += 24;
+        motor.left_motor.low_band_amp = 0.5f;
         assert(R_SUCCEEDED(ctrl_t.TestSetVibration(&motor)));
         assert(g_writes.size() == 1); // Throttled!
 
-        os::g_now_ms += 16; // total 48ms
+        os::g_now_ms += 12; // total 36ms
         assert(R_SUCCEEDED(ctrl_t.TestSetVibration(&motor)));
         assert(g_writes.size() == 2);
         ctrl_t.OnRumbleWriteComplete(0);
@@ -228,7 +228,7 @@ int main() {
         assert(g_writes.size() == 1 && g_writes[0].payload == std::vector<u8>({0, 0, 0, 0}));
     }
 
-    // 5. Real-world v15 HOS pairing rumble trace (6ms start->stop collision), MinPulse 65ms, 0x2a671 retry, 200ms watchdog, and 33Hz held-state heartbeat
+    // 5. Real-world v15/v18 HOS pairing rumble trace (6ms start->stop collision), MinPulse 45ms, 0x2a671 retry, 200ms watchdog, and 33Hz held-state heartbeat
     {
         g_writes.clear(); g_write_rc = 0;
         controller::g_connected_controllers = 1;
@@ -238,7 +238,7 @@ int main() {
 
         StadiaBleController ctrl_rt(addr, 6, svc_id, true, out_id, true, true, BtdrvGattAuthReqType_None);
 
-        // 5a. Connect pulse: t=0 start 0xd143 (low_band_amp ~0.5572) -> t=6ms STOP arrives while in-flight!
+        // 5a. Connect pulse: t=0 start (low_band_amp ~0.5572) -> t=6ms STOP arrives while in-flight!
         SwitchMotorData motor_on{};
         motor_on.left_motor.low_band_amp = 0.5572f;
         SwitchMotorData motor_off{};
@@ -249,16 +249,16 @@ int main() {
         assert(R_SUCCEEDED(ctrl_rt.TestSetVibration(&motor_off)));
         assert(g_writes.size() == 1); // Did NOT collide with 0x2a671!
 
-        os::g_now_ms += 9; // t=10015: ATT ack #1 arrives, but < 65ms minimum pulse so motor stays running briefly
+        os::g_now_ms += 9; // t=10015: ATT ack #1 arrives, but < 45ms minimum pulse so motor stays running briefly
         ctrl_rt.OnRumbleWriteComplete(0);
         ctrl_rt.ServiceBleTasks();
         assert(g_writes.size() == 1);
 
-        os::g_now_ms += 30; // t=10045 (< 65ms): still running
+        os::g_now_ms += 20; // t=10035 (< 45ms): still running
         ctrl_rt.ServiceBleTasks();
         assert(g_writes.size() == 1);
 
-        os::g_now_ms += 20; // t=10065 (== 65ms): minimum pulse elapsed -> ServiceBleTasks() delivers STOP!
+        os::g_now_ms += 10; // t=10045 (== 45ms): minimum pulse elapsed -> ServiceBleTasks() delivers STOP!
         ctrl_rt.ServiceBleTasks();
         assert(g_writes.size() == 2);
         assert(g_writes[1].payload == std::vector<u8>({0, 0, 0, 0}));
@@ -300,22 +300,22 @@ int main() {
         assert(g_writes.size() == 2 && g_writes[1].payload == std::vector<u8>({0, 0, 0, 0}));
         ctrl_rt.OnRumbleWriteComplete(0);
 
-        // 5d. Continuous stream (every 60ms) extends 200ms watchdog without premature cutoff, then stops cleanly 200ms after last frame
+        // 5d. Continuous stream (every 60ms) extends watchdog without premature cutoff, refreshes at 1500ms, then stops cleanly 200ms after last frame
         g_writes.clear();
         os::g_now_ms = 16000;
-        for (int step = 0; step < 5; ++step) {
+        for (int step = 0; step < 28; ++step) {
             const size_t before = g_writes.size();
             assert(R_SUCCEEDED(ctrl_rt.TestSetVibration(&motor_on)));
             if (g_writes.size() > before) {
-                // Only non-zero motor_on refresh writes (every >=180ms) may occur, never a stop!
+                // Only non-zero motor_on refresh writes (every >=1500ms) may occur, never a stop!
                 assert(g_writes.back().payload != std::vector<u8>({0, 0, 0, 0}));
                 ctrl_rt.OnRumbleWriteComplete(0);
             }
             os::g_now_ms += 60;
             ctrl_rt.ServiceBleTasks();
         }
-        assert(g_writes.size() == 2); // Initial write at t=16000 + one 180ms refresh at t=16180, zero premature stops!
-        os::g_now_ms += 140; // 200ms since last motor_on (step=4 was at 16240 -> 16300+140=16440)
+        assert(g_writes.size() == 2); // Initial write at t=16000 + one 1500ms keepalive refresh at t=17500, zero premature stops!
+        os::g_now_ms += 140; // 200ms since last motor_on (step=27 was at 17620 -> 17680+140=17820)
         ctrl_rt.ServiceBleTasks();
         assert(g_writes.size() == 3 && g_writes[2].payload == std::vector<u8>({0, 0, 0, 0}));
         ctrl_rt.OnRumbleWriteComplete(0);
@@ -345,6 +345,98 @@ int main() {
         assert(ctrl_rt.TestLastInjectedButtons() == stadia::ButtonBit::A);
         assert(ctrl_rt.TestLastInjectedLeftX() == ctrl_rt.TestLeftX());
         assert(ctrl_rt.TestLastInjectedLeftY() == ctrl_rt.TestLeftY());
+    }
+
+    // 6. v18 Real-world scenarios: Find-Controllers max continuous hold, Mario Wonder micro-buzz gating,
+    //    45ms crisp transient kick, and Ace Attorney heavy boost + echo left-motor cutoff
+    {
+        g_writes.clear(); g_write_rc = 0;
+        controller::g_connected_controllers = 1;
+        ble::events::g_radio_enabled = true;
+        os::g_now_ms = 30000;
+        StadiaBleController ctrl_v18(addr, 7, svc_id, true, out_id, true, true, BtdrvGattAuthReqType_None);
+
+        // 6a. Find-Controllers: 04bf4040_04bf4040 -> continuous 0xFFFF/0xFFFF across 3s of PacketType=0, instant CancelVibration()
+        const SwitchEncodedMotorData find_enc = {{0x04, 0xbf, 0x40, 0x40, 0x04, 0xbf, 0x40, 0x40}};
+        SwitchMotorData find_val{};
+        find_val.left_motor.high_band_amp = 0.5f;
+        find_val.right_motor.high_band_amp = 0.5f;
+        assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&find_enc, &find_val, &find_val, true)));
+        assert(g_writes.size() == 1);
+        assert(g_writes[0].payload == std::vector<u8>({0xFF, 0xFF, 0xFF, 0xFF}));
+        ctrl_v18.OnRumbleWriteComplete(0);
+
+        const SwitchEncodedMotorData keepalive_enc = {{0, 0, 0, 0, 0, 0, 0, 0}};
+        for (int step = 1; step <= 200; ++step) { // 200 * 15ms = 3000ms continuous
+            os::g_now_ms += 15;
+            const size_t before = g_writes.size();
+            assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&keepalive_enc, &find_val, &find_val, false)));
+            if (g_writes.size() > before) {
+                assert(g_writes.back().payload == std::vector<u8>({0xFF, 0xFF, 0xFF, 0xFF}));
+                ctrl_v18.OnRumbleWriteComplete(0);
+            }
+            ctrl_v18.ServiceBleTasks();
+        }
+        assert(g_writes.size() == 3); // t=0 + t=1500ms + t=3000ms watchdog refresh, zero drops!
+
+        assert(R_SUCCEEDED(ctrl_v18.TestCancelVibration()));
+        assert(g_writes.size() == 4);
+        assert(g_writes[3].payload == std::vector<u8>({0x00, 0x00, 0x00, 0x00}));
+        ctrl_v18.OnRumbleWriteComplete(0);
+
+        // 6b. Mario Wonder micro-buzz (0.85% low, 2.63% high) -> completely gated (0 BLE writes)
+        g_writes.clear();
+        os::g_now_ms = 40000;
+        const SwitchEncodedMotorData game_enc = {{0x01, 0x00, 0x00, 0x40, 0x01, 0x00, 0x00, 0x40}};
+        SwitchMotorData mario_buzz{};
+        mario_buzz.left_motor.low_band_amp = 0.0085f;
+        mario_buzz.right_motor.high_band_amp = 0.0263f;
+        assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&game_enc, &mario_buzz, &mario_buzz, true)));
+        assert(g_writes.empty());
+
+        // 6c. Single-packet transient kick (peak 0.5572, sustained 0) -> crisp 45ms auto-stop via PacketType=0
+        SwitchMotorData kick_peak{};
+        kick_peak.left_motor.low_band_amp = 0.5572f;
+        SwitchMotorData silent{};
+        assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&game_enc, &kick_peak, &silent, true)));
+        assert(g_writes.size() == 1);
+        assert(g_writes[0].payload[0] != 0 || g_writes[0].payload[1] != 0);
+        ctrl_v18.OnRumbleWriteComplete(0);
+
+        os::g_now_ms += 30;
+        assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&keepalive_enc, &silent, &silent, false)));
+        assert(g_writes.size() == 1); // < 45ms: kick still spinning
+
+        os::g_now_ms += 15; // == 45ms
+        assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&keepalive_enc, &silent, &silent, false)));
+        assert(g_writes.size() == 2);
+        assert(g_writes[1].payload == std::vector<u8>({0x00, 0x00, 0x00, 0x00}));
+        ctrl_v18.OnRumbleWriteComplete(0);
+
+        // 6d. Ace Attorney heavy burst (lo=0.354, hi=0.511) -> dual heavy drive, then echo (lo=0.018, hi=0.10) cuts left ERM immediately
+        g_writes.clear();
+        os::g_now_ms = 50000;
+        SwitchMotorData objection_data{};
+        objection_data.left_motor.low_band_amp = 0.354f;
+        objection_data.left_motor.high_band_amp = 0.511f;
+        objection_data.right_motor = objection_data.left_motor;
+        assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&game_enc, &objection_data, &objection_data, true)));
+        assert(g_writes.size() == 1);
+        const u16 strong_val = static_cast<u16>(g_writes[0].payload[0] | (g_writes[0].payload[1] << 8));
+        const u16 weak_val   = static_cast<u16>(g_writes[0].payload[2] | (g_writes[0].payload[3] << 8));
+        assert(strong_val >= 0xA800 && weak_val >= 0x8800);
+        ctrl_v18.OnRumbleWriteComplete(0);
+
+        os::g_now_ms += 165;
+        SwitchMotorData echo_data{};
+        echo_data.left_motor.low_band_amp = 0.018f;
+        echo_data.left_motor.high_band_amp = 0.10f;
+        echo_data.right_motor = echo_data.left_motor;
+        assert(R_SUCCEEDED(ctrl_v18.TestOnVibrationPacket(&game_enc, &echo_data, &echo_data, true)));
+        assert(g_writes.size() == 2);
+        assert(g_writes[1].payload[0] == 0x00 && g_writes[1].payload[1] == 0x00); // Heavy left ERM off immediately!
+        assert(g_writes[1].payload[2] != 0x00 || g_writes[1].payload[3] != 0x00); // Light right ERM carries faint echo cleanly
+        ctrl_v18.OnRumbleWriteComplete(0);
     }
 
     std::cout << "StadiaBleController production framing/rumble/watchdog/keepalive regressions passed\n";
